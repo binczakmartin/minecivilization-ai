@@ -14,8 +14,12 @@ public final class CitizenIdentity {
             "Alex", "Marie", "Sam", "Noor", "Kai", "Lena", "Tomas", "Ines",
             "Ravi", "Zoe", "Hugo", "Mila", "Omar", "Elsa", "Jonas", "Aya"
     };
-    private static final String[] PROFESSIONS = {
-            "FARMER", "MINER", "BUILDER", "CRAFTER", "LOGISTICS", "UNASSIGNED"
+    /**
+     * The role rotation. Citizens self-organize by joining this list in spawn
+     * order: lumberjack, miner, farmer, builder, crafter, then it repeats.
+     */
+    private static final String[] ROLES = {
+            "LUMBERJACK", "MINER", "FARMER", "BUILDER", "CRAFTER"
     };
 
     public UUID citizenId;
@@ -27,12 +31,22 @@ public final class CitizenIdentity {
     public String homePosition = null;      // "x,y,z"
     public String workplacePosition = null; // "x,y,z"
 
-    /** Fresh identity for a newly spawned citizen. */
+    /** Round-robin role for the citizen that is about to become number N+1. */
+    public static String professionForPopulation(int population) {
+        return ROLES[Math.floorMod(population, ROLES.length)];
+    }
+
+    /** A fresh random display name (role assignment stays deterministic). */
+    public static String randomName(net.minecraft.util.RandomSource random) {
+        return NAMES[random.nextInt(NAMES.length)];
+    }
+
+    /** Fresh identity for a newly spawned citizen (role left UNASSIGNED:
+     *  {@link #professionForPopulation} assigns it in spawn order at spawn). */
     public static CitizenIdentity random(UUID uuid, net.minecraft.util.RandomSource random) {
         CitizenIdentity identity = new CitizenIdentity();
         identity.citizenId = uuid;
-        identity.name = NAMES[random.nextInt(NAMES.length)];
-        identity.profession = PROFESSIONS[random.nextInt(PROFESSIONS.length)];
+        identity.name = randomName(random);
         return identity;
     }
 

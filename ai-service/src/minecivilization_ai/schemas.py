@@ -40,6 +40,7 @@ class TaskType(str, Enum):
     DELIVER = "DELIVER"      # move inventory to a registered storage / project site
     WITHDRAW = "WITHDRAW"
     BUILD = "BUILD"          # advance a construction project blueprint
+    PLACE = "PLACE"          # set down a carried block (e.g. the crafting table)
     CRAFT = "CRAFT"
     SMELT = "SMELT"
     MOVE = "MOVE"

@@ -211,10 +211,10 @@ for the AI service:
 
 runs, in order:
 
-1. **Gradle** compile + **57 JUnit tests** of the mod (plan parsing, decision schema,
-   blueprints/BOM, starter warehouse, construction projects, skill registry,
+1. **Gradle** compile + **70 JUnit tests** of the mod (plan parsing, decision schema,
+   blueprints/BOM, starter warehouse, starter house, construction projects, skill registry,
    combat/reflex policy, block reachability & approach-search geometry),
-2. **pytest** — **55 tests** covering schemas, API routes, memory, ledger, scheduler,
+2. **pytest** — **67 tests** covering schemas, API routes, memory, ledger, scheduler,
    mock provider (incl. CRAFT policy and the failure loop-breaker), and integration
    flows (in-memory SQLite, forced offline mock),
 3. **smoke test** ([`scripts/smoke-test.sh`](scripts/smoke-test.sh)) — boots the real
@@ -251,7 +251,7 @@ minecivilization-ai/
 │       ├── network/AiBridge.java          # HTTP client, circuit breaker, main-thread queue
 │       ├── commands/McivCommands.java     # /mciv …
 │       └── registry/                      # entities, items, blocks, sounds
-│   └── src/test/java/…                    # 57 JUnit tests (plain, no MC bootstrap)
+│   └── src/test/java/…                    # 70 JUnit tests (plain, no MC bootstrap)
 ├── ai-service/                # local AI service (Python, FastAPI)
 │   ├── src/minecivilization_ai/
 │   │   ├── main.py                         # app factory
@@ -261,7 +261,7 @@ minecivilization-ai/
 │   │   ├── cognition/                      # decision engine, prompts, providers
 │   │   ├── providers/                      # mock (offline) & ollama adapters
 │   │   └── db/                             # SQLAlchemy + SQLite
-│   └── tests/                              # 55 pytest tests
+│   └── tests/                              # 67 pytest tests
 └── docs/IMPLEMENTATION_PLAN.md # phased roadmap & status
 ```
 

@@ -67,6 +67,7 @@ public final class MineBlockSkill implements CitizenSkill {
         float hardness = state.getDestroySpeed(context.level, pos);
         float speed = (float) (1.0 / (Math.max(hardness, 0.05) * 30.0 + 1.0));
         speed *= (1.0f + context.citizen.getSkills().mining * 0.005f); // competence, not magic
+        speed *= toolSpeedBonus(context, state);                      // real tools mine faster
         float progress = context.get("progress", 0f) + speed;
         context.put("progress", progress);
 
@@ -82,6 +83,22 @@ public final class MineBlockSkill implements CitizenSkill {
             return SkillResult.COMPLETED;
         }
         return SkillResult.RUNNING;
+    }
+
+    /**
+     * Best correct tool the citizen carries for this block (1.0 bare-handed):
+     * a stone pickaxe mines stone several times faster than fists, but the
+     * hardness-based progress model still keeps mining physical over time.
+     */
+    private static float toolSpeedBonus(SkillContext context, BlockState state) {
+        var inventory = context.citizen.getInventory();
+        float best = 1.0f;
+        for (int i = 0; i < inventory.getContainerSize(); i++) {
+            var stack = inventory.getItem(i);
+            if (stack.isEmpty() || !stack.isCorrectToolForDrops(state)) continue;
+            best = Math.max(best, stack.getDestroySpeed(state));
+        }
+        return best;
     }
 
     @Override

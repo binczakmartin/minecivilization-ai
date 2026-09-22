@@ -124,6 +124,7 @@ public final class BuildBlueprintSkill implements CitizenSkill {
         context.level.setBlock(next.pos, state, 3);
         project.placed.add(project.key(next.pos.getX(), next.pos.getY(), next.pos.getZ()));
         context.citizen.getSkills().addXp("building", 0.05f);
+        context.citizen.onBlockPlaced(itemId);
         manager.setDirty();
         // each placed block resets the per-attempt timeout window: a long build
         // is a sequence of healthy steps, not a hung skill

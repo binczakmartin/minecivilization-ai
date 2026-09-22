@@ -69,6 +69,31 @@ class CitizenPlanParseTest {
     }
 
     @Test
+    void parsesPlaceTask() {
+        CitizenPlan plan = parse("""
+                {"reasoning_summary": "set the workstation up on the ground",
+                 "goal": {"type": "CRAFT_ITEM", "resource": "minecraft:crafting_table",
+                          "target_quantity": 1},
+                 "tasks": [{"type": "PLACE", "block": "minecraft:crafting_table"}]}""");
+        assertNotNull(plan);
+        assertEquals(TaskType.PLACE, plan.tasks.get(0).type);
+        assertEquals("minecraft:crafting_table", plan.tasks.get(0).block);
+        assertNull(plan.tasks.get(0).position); // executor picks a reachable spot
+    }
+
+    @Test
+    void rejectsPlaceWithoutBlock() {
+        CitizenPlan plan = parse("""
+                {"reasoning_summary": "nowhere to put it",
+                 "goal": {"type": "IDLE"},
+                 "tasks": [{"type": "PLACE"}]}""");
+        // PLACE without a block is still a valid *shape* — the executor fails it
+        // with INVALID_TASK rather than guessing what to place.
+        assertNotNull(plan);
+        assertNull(plan.tasks.get(0).block);
+    }
+
+    @Test
     void rejectsUnknownGoalType() {
         assertNull(parse("""
                 {"reasoning_summary": "x", "goal": {"type": "OBLITERATE_EVERYTHING"},

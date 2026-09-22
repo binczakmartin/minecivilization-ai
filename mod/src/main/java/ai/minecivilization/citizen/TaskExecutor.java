@@ -143,6 +143,7 @@ public final class TaskExecutor {
             }
             case BUILD -> single(level, SkillType.BUILD_BLUEPRINT, p -> {
             });
+            case PLACE -> place(level, self);
             case GATHER -> gather(level, self);
             case HARVEST -> harvest(level, self);
             case PLANT -> plant(level, self);
@@ -210,6 +211,58 @@ public final class TaskExecutor {
         ctx.startGameTime = ctx.level.getGameTime();
         activeSkill.start(ctx);
         return activeSkill;
+    }
+
+    // ------------------------------------------------------------------ PLACE
+
+    /**
+     * PLACE one carried block: pick the nearest reachable open spot around the
+     * citizen (replaceable target, survivable support below, within arm's
+     * reach), then run the PLACE_BLOCK skill on it. The search is deterministic
+     * (fixed scan order, strict distance improvement) so retries are stable.
+     */
+    private Outcome place(ServerLevel level, CitizenEntity self) {
+        if (params.block == null) {
+            return Outcome.failed(new SkillFailure("INVALID_TASK",
+                    "PLACE without block", false));
+        }
+        if (params.position == null) {
+            int[] spot = findPlacementSpot(level, self, params.block);
+            if (spot == null) {
+                return Outcome.failed(SkillFailure.notFound(
+                        "no open spot near the citizen for " + params.block));
+            }
+            params.position = spot;
+        }
+        return single(level, SkillType.PLACE_BLOCK, p -> {
+        });
+    }
+
+    private static int[] findPlacementSpot(ServerLevel level, CitizenEntity self,
+                                           String blockId) {
+        net.minecraft.world.level.block.state.BlockState state =
+                ai.minecivilization.construction.ConstructionManager.parseState(level, blockId);
+        if (state == null) return null;
+        net.minecraft.core.BlockPos base = self.blockPosition();
+        int[] best = null;
+        double bestDist = Double.MAX_VALUE;
+        for (int dy = -1; dy <= 1; dy++) {
+            for (int dx = -4; dx <= 4; dx++) {
+                for (int dz = -4; dz <= 4; dz++) {
+                    if (dx == 0 && dz == 0) continue; // never inside the citizen's own column
+                    double d = dx * dx + dy * dy + dz * dz;
+                    if (d > 16.0 || d >= bestDist) continue; // stay within PLACE_BLOCK reach
+                    net.minecraft.core.BlockPos pos = base.offset(dx, dy, dz);
+                    if (pos.getY() < level.getMinBuildHeight()
+                            || pos.getY() >= level.getMaxBuildHeight()) continue;
+                    if (!level.getBlockState(pos).canBeReplaced()) continue;
+                    if (!state.canSurvive(level, pos)) continue;
+                    bestDist = d;
+                    best = new int[]{pos.getX(), pos.getY(), pos.getZ()};
+                }
+            }
+        }
+        return best;
     }
 
     // ------------------------------------------------------------------ GATHER

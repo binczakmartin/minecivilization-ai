@@ -282,7 +282,7 @@ public final class CitizenBrain {
         return switch (currentTask.type) {
             case GATHER -> "mining";
             case HARVEST, PLANT -> "farming";
-            case BUILD -> "building";
+            case BUILD, PLACE -> "building";
             case DELIVER, WITHDRAW -> "logistics";
             default -> "research";
         };

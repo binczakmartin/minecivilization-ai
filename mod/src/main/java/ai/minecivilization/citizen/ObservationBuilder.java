@@ -124,9 +124,36 @@ public final class ObservationBuilder {
         }
         root.add("recent_events", events);
 
+        // Milestone memory keys (e.g. "placed:minecraft:crafting_table") so the
+        // brain knows what infrastructure it already set up. Per-item noise is
+        // filtered out and the list is sorted + bounded for token efficiency.
+        JsonArray memories = new JsonArray();
+        for (String key : memoryKeysForBrain(self)) {
+            memories.add(key);
+        }
+        root.add("known_memories", memories);
+
         // NOTE: no "reason" key here — the Python Observation schema is
         // extra="forbid"; the reason travels in the DecisionRequest instead.
         return root.toString();
+    }
+
+    private static java.util.List<String> memoryKeysForBrain(CitizenEntity self) {
+        java.util.List<String> keys = new java.util.ArrayList<>();
+        for (String key : self.getMemory().keySet()) {
+            if (isBookkeepingMemory(key)) continue;
+            keys.add(key);
+        }
+        java.util.Collections.sort(keys);
+        return keys.size() > 24 ? keys.subList(0, 24) : keys;
+    }
+
+    private static boolean isBookkeepingMemory(String key) {
+        return key.startsWith("found:") || key.startsWith("took:")
+                || key.startsWith("deposited:") || key.startsWith("fail:")
+                || key.startsWith("done:") || key.startsWith("disabled:")
+                || key.startsWith("completedProject:") || key.startsWith("last")
+                || "taskFailures".equals(key);
     }
 
     private static String goalLabel(CitizenPlan.Goal goal) {

@@ -22,7 +22,7 @@ public final class CitizenPlan {
 
     public enum TaskType {
         IDLE, REST, GATHER, HARVEST, PLANT, DELIVER, WITHDRAW,
-        BUILD, CRAFT, SMELT, MOVE, INSPECT
+        BUILD, PLACE, CRAFT, SMELT, MOVE, INSPECT
     }
 
     public static final class Goal {

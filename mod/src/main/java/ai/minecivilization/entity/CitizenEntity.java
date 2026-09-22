@@ -328,6 +328,20 @@ public class CitizenEntity extends PathfinderMob {
         this.changed = true;
     }
 
+    /**
+     * Workstation/build milestone, e.g. "placed:minecraft:crafting_table".
+     * The brain reads these keys (known_memories) so it never crafts a second
+     * crafting table for a workstation that is already standing.
+     */
+    public void onBlockPlaced(String blockId) {
+        if (blockId == null || blockId.isEmpty()) return;
+        int bracket = blockId.indexOf('[');
+        String id = bracket > 0 ? blockId.substring(0, bracket) : blockId;
+        if (id.isEmpty()) return;
+        this.memory.put("placed:" + id, (float) this.level().getGameTime());
+        this.changed = true;
+    }
+
     public void onItemDeposited(net.minecraft.world.item.Item item, int count) {
         String key = net.minecraft.core.registries.BuiltInRegistries.ITEM.getKey(item).toString();
         this.memory.merge("deposited:" + key, (float) count, Float::sum);
@@ -478,9 +492,23 @@ public class CitizenEntity extends PathfinderMob {
     @Nullable
     public SpawnGroupData finalizeSpawn(ServerLevelAccessor level, DifficultyInstance difficulty,
                                         MobSpawnType spawnType, @Nullable SpawnGroupData groupData) {
-        if (this.identity.name == null || this.identity.name.isBlank()) {
-            this.identity = CitizenIdentity.random(this.getUUID(), level.getRandom());
+        if (this.identity.citizenId == null) {
+            this.identity.citizenId = this.getUUID();
+        }
+        if (this.identity.name == null || this.identity.name.isBlank()
+                || "Citizen".equals(this.identity.name)) {
+            this.identity.name = CitizenIdentity.randomName(level.getRandom());
+        }
+        if (this.identity.createdAt == 0L) {
             this.identity.createdAt = this.level().getGameTime();
+        }
+        // Fresh citizens (UNASSIGNED) join the role rotation in spawn order —
+        // the settlement self-organizes: lumberjack, miner, farmer, builder,
+        // crafter, then it repeats. The role persists in NBT, so a loaded
+        // citizen never loses or changes its profession.
+        if ("UNASSIGNED".equals(this.identity.profession)) {
+            this.identity.profession =
+                    CitizenIdentity.professionForPopulation(CitizenIndex.population());
             // Deterministic personality: same (seed, citizenId) always yields the same traits.
             this.personality = CitizenPersonality.derived(ModConfig.SIMULATION_SEED.get(),
                     this.identity.citizenId);

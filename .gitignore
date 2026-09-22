@@ -1,0 +1,32 @@
+# --- Java / Gradle ---
+mod/build/
+mod/run/
+mod/run-data/
+mod/.gradle/
+mod/out/
+mod/logs/
+*.class
+
+# --- Python ---
+ai-service/.venv/
+ai-service/data/
+/data/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+
+# --- Node / dashboard ---
+dashboard/node_modules/
+dashboard/dist/
+
+# --- secrets & local config ---
+.env
+ai-service.log
+
+# --- model weights / worlds / OS ---
+*.minecraft-world
+ollama-models/
+.DS_Store
+.idea/
+.vscode/

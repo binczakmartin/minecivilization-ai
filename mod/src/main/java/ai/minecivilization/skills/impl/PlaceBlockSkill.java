@@ -88,6 +88,7 @@ public final class PlaceBlockSkill implements CitizenSkill {
         context.citizen.getInventory().extract(itemId, 1);
         context.level.setBlock(pos, state, 3);
         context.citizen.getSkills().addXp("building", 0.05f);
+        context.citizen.onBlockPlaced(context.params.block);
         return SkillResult.COMPLETED;
     }
 

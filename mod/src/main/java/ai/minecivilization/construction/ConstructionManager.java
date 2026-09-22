@@ -29,6 +29,7 @@ public final class ConstructionManager extends SavedData {
 
     static {
         registerBlueprint(StarterWarehouse.create());
+        registerBlueprint(StarterHouse.create());
     }
 
     public static void registerBlueprint(Blueprint blueprint) {
