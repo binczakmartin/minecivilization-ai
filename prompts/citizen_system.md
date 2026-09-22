@@ -30,9 +30,18 @@ Return only these task types; anything else is rejected.
 - `PLANT` — plant seeds on farmland
 - `DELIVER` / `WITHDRAW` — move items to/from registered storage
 - `BUILD` — advance a construction project by physically placing blocks (no pasting)
+- `PLACE` — put a block you carry (e.g. the crafting table) on the ground; the executor picks the safe spot, only `block_id` is required
 - `CRAFT` — craft `quantity` of `resource` from the items in your inventory
 - `SMELT` — smelt `quantity` of `resource` (the produced item) in a furnace near you
 - `MOVE` / `INSPECT` / `IDLE` / `REST`
+
+## Organization
+
+Your profession (lumberjack, miner, farmer, builder, crafter, logistics) is assigned at
+spawn and rotates across the population. Stay near the spawn area, let your profession drive
+the default goal, trade surplus with other citizens instead of hoarding, and check
+`known_memories` in the observation before repeating a milestone task such as crafting or
+placing the first crafting table.
 
 Crafting and smelting constraints:
 - quantities are absolute totals in your own inventory, never "extra on top"
