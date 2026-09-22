@@ -1,0 +1,42 @@
+# See https://docs.minecraftforge.net/en/1.21.x/gettingstarted/modfiles/#modstoml
+# modId here MUST match the value in the @Mod annotation (ai.minecivilization.MineCivilization).
+
+modLoader="javafml"
+loaderVersion="[0,)"
+license="All Rights Reserved"
+#issueTrackerURL="https://github.com/MyOrganization/MyMod/" #optional
+#clientSideOnly=true #optional, default=false
+
+[[mods]]
+modId="minecivilization"
+version="1.0.0"
+displayName="MineCivilization AI"
+#updateJSONURL="https://example.com/updates.json" #optional
+#displayURL="https://example.com/" #optional
+#logoFile="minecivilization.png" #optional
+#credits="" #optional
+authors="MineCivilization AI"
+#displayTest="MATCH_VERSION" #optional, default=MATCH_VERSION when not clientSideOnly else IGNORE_ALL_VERSION
+
+# Access Transformers
+# Optional, if not specified Forge will attempt to find the default META-INF/accesstransformer.cfg and silently continue if not found. May default to an empty list in a future MC.
+# If you specify AT path strings in this list, Forge will attempt to load each of them and throw errors for any that aren't found.
+# Specifying an empty list when your mod has no ATs is recommended to opt-out of the default for slightly better loading performance.
+accessTransformers = []
+
+description='''Local AI civilization simulation inside Minecraft: a local cognition
+service picks high-level goals, deterministic Minecraft skills execute them.'''
+
+[[dependencies.minecivilization]] #recommended
+    modId="forge"
+    mandatory=true
+    versionRange="[52,)"
+    ordering="NONE"
+    side="BOTH"
+
+[[dependencies.minecivilization]] #recommended
+    modId="minecraft"
+    mandatory=true
+    versionRange="[1.21.1,1.22,)"
+    ordering="NONE"
+    side="BOTH"

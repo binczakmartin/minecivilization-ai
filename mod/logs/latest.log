@@ -1,0 +1,6 @@
+[22Sep2026 02:05:22.428] [Test worker/WARN] [ai.minecivilization.network.AiBridge/]: [Cognition] unparseable decision response: com.google.gson.stream.MalformedJsonException: Use JsonReader.setLenient(true) to accept malformed JSON at line 1 column 7 path $
+[22Sep2026 02:05:22.430] [Test worker/WARN] [ai.minecivilization.network.AiBridge/]: [Cognition] unparseable decision response: Not a JSON Object: null
+[22Sep2026 02:05:22.430] [Test worker/WARN] [ai.minecivilization.network.AiBridge/]: [Cognition] response missing decision object
+[22Sep2026 02:05:22.431] [Test worker/WARN] [ai.minecivilization.network.AiBridge/]: [Cognition] response missing decision object
+[22Sep2026 02:05:22.432] [Test worker/WARN] [ai.minecivilization.network.AiBridge/]: [Cognition] decision rejected by service: validator said no
+[22Sep2026 02:05:22.433] [Test worker/WARN] [ai.minecivilization.network.AiBridge/]: [Cognition] malformed decision rejected (schema violation)
