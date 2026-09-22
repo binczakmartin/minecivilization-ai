@@ -158,6 +158,7 @@ Permission level 2+ (cheats / op):
 /mciv citizen stop <name|id>           stop current work (re-enable with think)
 /mciv ai status                        AI bridge status, base URL, pending tasks
 /mciv ai reconnect                     reset the circuit breaker & re-probe the service
+/mciv camp                             camp anchor (the player's bed) + house projects
 /mciv debug on|off                     toggle verbose mod logging
 ```
 
@@ -211,8 +212,8 @@ for the AI service:
 
 runs, in order:
 
-1. **Gradle** compile + **70 JUnit tests** of the mod (plan parsing, decision schema,
-   blueprints/BOM, starter warehouse, starter house, construction projects, skill registry,
+1. **Gradle** compile + **75 JUnit tests** of the mod (plan parsing, decision schema,
+   blueprints/BOM, starter warehouse, starter house, camp row geometry, construction projects, skill registry,
    combat/reflex policy, block reachability & approach-search geometry),
 2. **pytest** — **67 tests** covering schemas, API routes, memory, ledger, scheduler,
    mock provider (incl. CRAFT policy and the failure loop-breaker), and integration
@@ -251,7 +252,7 @@ minecivilization-ai/
 │       ├── network/AiBridge.java          # HTTP client, circuit breaker, main-thread queue
 │       ├── commands/McivCommands.java     # /mciv …
 │       └── registry/                      # entities, items, blocks, sounds
-│   └── src/test/java/…                    # 70 JUnit tests (plain, no MC bootstrap)
+│   └── src/test/java/…                    # 75 JUnit tests (plain, no MC bootstrap)
 ├── ai-service/                # local AI service (Python, FastAPI)
 │   ├── src/minecivilization_ai/
 │   │   ├── main.py                         # app factory

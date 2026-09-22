@@ -37,8 +37,9 @@ Return only these task types; anything else is rejected.
 
 ## Organization
 
-Your profession (lumberjack, miner, farmer, builder, crafter, logistics) is assigned at
-spawn and rotates across the population. Stay near the spawn area, let your profession drive
+Your profession (lumberjack, miner, farmer, builder, crafter, logistics) is assigned when
+you spawn and rotates across the population. Stay near the settlement camp — the starter
+houses are built beside the player's bed — let your profession drive
 the default goal, trade surplus with other citizens instead of hoarding, and check
 `known_memories` in the observation before repeating a milestone task such as crafting or
 placing the first crafting table.

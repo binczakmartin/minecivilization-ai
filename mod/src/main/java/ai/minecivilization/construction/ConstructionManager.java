@@ -13,11 +13,15 @@ import net.minecraft.nbt.ListTag;
 import net.minecraft.nbt.StringTag;
 import net.minecraft.nbt.Tag;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.level.block.BedBlock;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.saveddata.SavedData;
+import org.jetbrains.annotations.Nullable;
 
 /**
- * World-saved construction projects + blueprint catalog access.
+ * World-saved construction projects + blueprint catalog access, plus the camp
+ * anchor (the player's bed) that auto-planned house rows grow from.
  * V1 ships the built-in Starter Warehouse blueprint; imported schematics
  * register additional blueprints here (memory only, cataloged in the AI DB).
  */
@@ -26,6 +30,10 @@ public final class ConstructionManager extends SavedData {
 
     private final Map<String, ConstructionProject> projects = new LinkedHashMap<>();
     private static final Map<String, Blueprint> BLUEPRINTS = new LinkedHashMap<>();
+
+    /** Where the camp is anchored — the player's bed — until one is found. */
+    @Nullable
+    private BlockPos campAnchor;
 
     static {
         registerBlueprint(StarterWarehouse.create());
@@ -71,6 +79,89 @@ public final class ConstructionManager extends SavedData {
 
     public List<ConstructionProject> all() {
         return new ArrayList<>(projects.values());
+    }
+
+    /**
+     * The camp anchor — normally the player's bed — remembered in save data so
+     * the house row still resolves while no player is online. Null until a bed
+     * has been seen; the world spawn is used before that.
+     */
+    @Nullable
+    public BlockPos campAnchor() {
+        return campAnchor;
+    }
+
+    /** Remember the camp anchor (called whenever a valid bed is found). */
+    public void recordCampAnchor(BlockPos pos) {
+        if (pos.equals(campAnchor)) return;
+        campAnchor = pos;
+        setDirty();
+    }
+
+    /**
+     * Move a project that owns no placed blocks yet — the camp re-homes when
+     * its anchor moves (spawn row → player's bed). Projects with progress are
+     * never moved: their blocks would be left behind.
+     */
+    public void relocate(ConstructionProject project, int originX, int originY, int originZ) {
+        if (!project.placed.isEmpty()) return;
+        if (project.originX == originX && project.originY == originY
+                && project.originZ == originZ) return;
+        project.originX = originX;
+        project.originY = originY;
+        project.originZ = originZ;
+        setDirty();
+    }
+
+    /**
+     * Where the settlement camp grows: the player's bed while one still
+     * stands, otherwise the last bed remembered (covers the player being
+     * offline), otherwise the world spawn for a world without a bed yet.
+     * Every house row is planned against this anchor.
+     */
+    public BlockPos resolveAnchor(ServerLevel level) {
+        if (campAnchor != null && isBedAt(level, campAnchor)) return campAnchor;
+
+        BlockPos bed = findPlayerBed(level);
+        if (bed != null) {
+            recordCampAnchor(bed);
+            return bed;
+        }
+        return campAnchor != null ? campAnchor : level.getSharedSpawnPos();
+    }
+
+    /**
+     * The respawn point of an online player in this level, but only while a
+     * real bed block is still under it — /spawnpoint marks, destroyed beds and
+     * respawn anchors in other dimensions are ignored. Stops at the first hit:
+     * one bed anchors the whole camp.
+     */
+    @Nullable
+    private static BlockPos findPlayerBed(ServerLevel level) {
+        var server = level.getServer();
+        if (server == null) return null;
+        for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+            if (!level.dimension().equals(player.getRespawnDimension())) continue;
+            BlockPos respawn = player.getRespawnPosition();
+            if (respawn != null && isBedAt(level, respawn)) return respawn;
+        }
+        return null;
+    }
+
+    /** A respawn point names one half of the bed; the other half counts too. */
+    private static boolean isBedAt(ServerLevel level, BlockPos pos) {
+        return isBed(level, pos)
+                || isBed(level, pos.offset(1, 0, 0))
+                || isBed(level, pos.offset(-1, 0, 0))
+                || isBed(level, pos.offset(0, 0, 1))
+                || isBed(level, pos.offset(0, 0, -1));
+    }
+
+    private static boolean isBed(ServerLevel level, BlockPos pos) {
+        // Never force-load the bed's chunk just to look at it: an unloaded
+        // anchor reads as "no bed here", so the caller keeps its fallback.
+        return level.isLoaded(pos)
+                && level.getBlockState(pos).getBlock() instanceof BedBlock;
     }
 
     /** Nearest project that still needs building. */
@@ -183,6 +274,9 @@ public final class ConstructionManager extends SavedData {
             list.add(t);
         }
         tag.put("projects", list);
+        if (campAnchor != null) {
+            tag.putLong("campAnchor", campAnchor.asLong());
+        }
         return tag;
     }
 
@@ -205,6 +299,9 @@ public final class ConstructionManager extends SavedData {
                 p.placed.add(placedList.getString(j));
             }
             manager.projects.put(p.id, p);
+        }
+        if (tag.contains("campAnchor")) {
+            manager.campAnchor = BlockPos.of(tag.getLong("campAnchor"));
         }
         return manager;
     }

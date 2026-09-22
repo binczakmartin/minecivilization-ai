@@ -17,9 +17,16 @@ public final class ConstructionProject {
     public final String id;
     public final String name;
     public final String blueprintId;
-    public final int originX;
-    public final int originY;
-    public final int originZ;
+    /**
+     * Blueprint origin in world coordinates. Mutable only so a project that
+     * owns no placed blocks yet can be re-homed when the camp anchor moves
+     * ({@link ConstructionManager#relocate(ConstructionProject, int, int, int)}).
+     * Once a single block stands there the origin is frozen: moving it would
+     * strand that block.
+     */
+    public int originX;
+    public int originY;
+    public int originZ;
     public Status status = Status.PROPOSED;
 
     /** Absolute positions ("x,y,z") of blocks already physically placed. */

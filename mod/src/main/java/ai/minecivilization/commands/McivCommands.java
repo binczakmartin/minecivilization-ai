@@ -11,6 +11,10 @@ import com.mojang.brigadier.suggestion.Suggestions;
 import com.mojang.brigadier.suggestion.SuggestionsBuilder;
 
 import ai.minecivilization.config.ModConfig;
+import ai.minecivilization.construction.Blueprint;
+import ai.minecivilization.construction.ConstructionManager;
+import ai.minecivilization.construction.ConstructionProject;
+import ai.minecivilization.construction.StarterHouse;
 import ai.minecivilization.entity.CitizenEntity;
 import ai.minecivilization.entity.CitizenIndex;
 import ai.minecivilization.network.AiBridge;
@@ -28,6 +32,7 @@ import net.minecraftforge.event.RegisterCommandsEvent;
  * /mciv — the operator interface into the simulation:
  *   /mciv citizen spawn|list|inspect &lt;citizen&gt;|think &lt;citizen&gt;|stop &lt;citizen&gt;
  *   /mciv ai status|reconnect
+ *   /mciv camp
  *   /mciv debug on|off
  */
 public final class McivCommands {
@@ -55,6 +60,8 @@ public final class McivCommands {
                                 .executes(ctx -> aiStatus(ctx.getSource())))
                         .then(Commands.literal("reconnect")
                                 .executes(ctx -> aiReconnect(ctx.getSource()))))
+                .then(Commands.literal("camp")
+                        .executes(McivCommands::camp))
                 .then(Commands.literal("debug")
                         .then(Commands.literal("on").executes(ctx -> debug(ctx.getSource(), true)))
                         .then(Commands.literal("off").executes(ctx -> debug(ctx.getSource(), false)))));
@@ -205,6 +212,35 @@ public final class McivCommands {
         source.sendSuccess(() -> Component.literal(
                 citizen.getIdentity().name + " stopped (work re-enabled by /mciv citizen think)."), true);
         return 1;
+    }
+
+    // ------------------------------------------------------------------ camp
+
+    /** The settlement camp: its anchor (the player's bed) and its houses. */
+    private static int camp(CommandContext<CommandSourceStack> ctx) {
+        CommandSourceStack source = ctx.getSource();
+        ServerLevel level = source.getLevel();
+        ConstructionManager manager = ConstructionManager.get(level);
+        BlockPos anchor = manager.resolveAnchor(level);
+        BlockPos bed = manager.campAnchor();
+        String origin = bed == null ? "world spawn — no player bed yet" : "player's bed";
+        source.sendSuccess(() -> Component.literal(String.format(
+                "camp anchor=%d,%d,%d (%s)",
+                anchor.getX(), anchor.getY(), anchor.getZ(), origin)), false);
+
+        int houses = 0;
+        for (ConstructionProject p : manager.all()) {
+            if (!StarterHouse.ID.equals(p.blueprintId)) continue;
+            houses++;
+            Blueprint bp = ConstructionManager.blueprint(p.blueprintId);
+            String progress = bp == null ? "" : String.format(" %.0f%%", p.progress(bp) * 100);
+            String line = String.format("  %s [%s] origin=%d,%d,%d%s",
+                    p.name, p.status, p.originX, p.originY, p.originZ, progress);
+            source.sendSuccess(() -> Component.literal(line), false);
+        }
+        int count = houses;
+        source.sendSuccess(() -> Component.literal(count + " house project(s)."), false);
+        return houses;
     }
 
     // ------------------------------------------------------------------ ai / debug

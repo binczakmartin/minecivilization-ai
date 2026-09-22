@@ -14,8 +14,8 @@ Target: Apple Silicon (M2, 16 GB), macOS, Minecraft Java 1.21.1, Forge 52.1.16, 
 | Phase 4 — Local AI service | **done** (FastAPI + SQLite, all `/v1` routes, 67 pytest tests) |
 | Phase 5 — Forge ↔ AI bridge | **done** (`AiBridge`: async HTTP, circuit breaker, main-thread queue; HTTP/1.1 forced — the default h2c upgrade was rejected by uvicorn and tripped the breaker, fixed 2026-09-22) |
 | Combat & navigation | **done** — local self-defence reflex (`CombatPolicy`: personality-scaled radius, attacker retaliation, cooldown, bounded chase), reachability-aware block search + approach-fallback navigation (fixed the stuck-in-trees `TARGET_UNREACHABLE` loop), `nearby.hostiles` in observations, mock loop-breaker hardened |
-| Testing | **done** — 70 Java JUnit tests (plain, no MC bootstrap) + 67 Python tests + `scripts/smoke-test.sh` |
-| Phases 6–8 — Vertical slice | partial (construction/storage plumbing present; auto-planned **Starter House** row near spawn + `PLACE` task landed 2026-09-22; end-to-end gather→deposit loop to validate in-game) |
+| Testing | **done** — 75 Java JUnit tests (plain, no MC bootstrap) + 67 Python tests + `scripts/smoke-test.sh` |
+| Phases 6–8 — Vertical slice | partial (construction/storage plumbing present; auto-planned **Starter House** camp row anchored on the player's bed — world spawn only before the first bed — + `PLACE` task landed 2026-09-22; end-to-end gather→deposit loop to validate in-game) |
 | Phases 9–11+ — Ollama multi-citizen, schematics, dashboard, economy, R&D | pending |
 | Tooling | **done** — one-command launcher `./run.sh` (client/server/build/test/service/help), `scripts/smoke-test.sh`, root `README.md` |
 
@@ -94,9 +94,9 @@ Everything runs offline by default (`MINECIV_LLM_PROVIDER=mock`); Ollama is opt-
 - Python: 67 pytest tests for schemas, API routes, ledger, scheduler, memory retrieval, mock
   provider (incl. CRAFT continuation/planking policy and the task-failure loop-breaker),
   malformed LLM output, integration flows.
-- Java: 70 plain JUnit tests (no Minecraft bootstrap) for decision-schema parsing
+- Java: 75 plain JUnit tests (no Minecraft bootstrap) for decision-schema parsing
   (`CitizenPlan`, `AiBridge` responses), blueprint BOM/placement order, starter warehouse,
-  starter house, citizen identity/role rotation, construction project lifecycle, skill registry completeness,
+  starter house, camp row geometry (slots/overlap), citizen identity/role rotation, construction project lifecycle, skill registry completeness,
   the combat/reflex policy
   (`CombatPolicy`), and block reachability / approach-search geometry — run by `./gradlew test`.
 - Integration smoke test: `scripts/smoke-test.sh` boots the real service on an isolated scratch
