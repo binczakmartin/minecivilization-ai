@@ -5,6 +5,8 @@
 #   ./run.sh            # start AI service + Minecraft client (default)
 #   ./run.sh client     # same as default
 #   ./run.sh server     # start AI service + dedicated Minecraft server
+#                       (keeps running while you do something else — a
+#                        single-player world pauses the moment Esc is pressed)
 #   ./run.sh build      # build the mod jar (no game)
 #   ./run.sh test       # build + Java tests + Python tests + service smoke test
 #   ./run.sh service    # only start the AI service (foreground, Ctrl+C stops it)
@@ -65,6 +67,65 @@ find_java21() {
     return 0
   fi
   return 1
+}
+
+# --------------------------------------------------- dedicated server setup --
+# A dedicated server never pauses. The single-player integrated server stops
+# the moment the Esc menu opens, so a colony only advances while you sit and
+# watch it — which is the opposite of what a settlement simulation is for.
+SERVER_DIR_NAME="run-server"
+
+bootstrap_server_dir() {
+  local dir="$ROOT/mod/$SERVER_DIR_NAME"
+  mkdir -p "$dir"
+
+  # The Minecraft EULA is a legal agreement between you and Mojang. This script
+  # will not accept it on your behalf: it asks, once.
+  if [[ ! -f "$dir/eula.txt" ]] || ! grep -q '^eula=true' "$dir/eula.txt"; then
+    echo
+    warn "A dedicated server requires accepting the Minecraft EULA:"
+    warn "  https://aka.ms/MinecraftEULA"
+    read -r -p "Do you accept it? [y/N] " reply
+    if [[ ! "$reply" =~ ^[Yy]$ ]]; then
+      die "EULA not accepted — cannot start a dedicated server."
+    fi
+    printf 'eula=true\n' > "$dir/eula.txt"
+    info "EULA accepted (recorded in mod/$SERVER_DIR_NAME/eula.txt)"
+  fi
+
+  if [[ ! -f "$dir/server.properties" ]]; then
+    cat > "$dir/server.properties" <<'PROPS'
+# MineCivilization development server.
+# online-mode=false because the Gradle dev client logs in as the offline user
+# "Dev"; a genuine Mojang login would be rejected here.
+online-mode=false
+motd=MineCivilization colony
+# Citizens build near spawn, and so will you: protection there only gets in the way.
+spawn-protection=0
+difficulty=normal
+gamemode=survival
+max-players=4
+view-distance=10
+simulation-distance=10
+PROPS
+    info "wrote mod/$SERVER_DIR_NAME/server.properties (online-mode=false for the dev client)"
+  fi
+
+  # Op the dev client so /mciv works the moment you connect. The UUID is the
+  # standard offline-mode derivation for the name "Dev".
+  if [[ ! -f "$dir/ops.json" ]]; then
+    cat > "$dir/ops.json" <<'OPS'
+[
+  {
+    "uuid": "380df991-f603-344c-a090-369bad2a924a",
+    "name": "Dev",
+    "level": 4,
+    "bypassesPlayerLimit": false
+  }
+]
+OPS
+    info "opped the dev player 'Dev' so /mciv is available"
+  fi
 }
 
 # ----------------------------------------------------------- .env bootstrap --
@@ -216,7 +277,9 @@ case "$MODE" in
       info "launching Minecraft client (first run downloads vanilla assets)…"
       gradlew "$JAVA21" runClient
     else
+      bootstrap_server_dir
       info "launching Minecraft dedicated server…"
+      info "connect from another terminal with: ./run.sh client  →  Multiplayer → localhost"
       gradlew "$JAVA21" runServer
     fi
     ;;

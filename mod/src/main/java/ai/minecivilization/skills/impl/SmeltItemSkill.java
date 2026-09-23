@@ -89,12 +89,11 @@ public final class SmeltItemSkill implements CitizenSkill {
             context.put("phase", Phase.FIND);
             return SkillResult.RUNNING;
         }
-        context.navigator.tick();
-        if (context.navigator.hasFailed()) {
-            context.fail(context.navigator.failure());
-            return SkillResult.FAILED;
-        }
-        if (inReach(context, pos)) {
+        // Same stubbornness as everywhere else: walk, and make a way if walking
+        // will not do. A furnace behind a step is not an unreachable furnace.
+        SkillResult arrival = SkillNavigation.approach(context, pos, REACH_SQR, "smelt.walk");
+        if (arrival == SkillResult.FAILED) return SkillResult.FAILED;
+        if (arrival == SkillResult.COMPLETED || inReach(context, pos)) {
             context.navigator.stop();
             context.put("phase", Phase.WORK);
         }
@@ -227,9 +226,20 @@ public final class SmeltItemSkill implements CitizenSkill {
     }
 
     private static int loadFuel(SkillContext context, Container furnace, int limit) {
-        return transfer(context, furnace, SLOT_FUEL, limit,
-                stack -> net.minecraftforge.common.ForgeHooks.getBurnTime(
-                        stack, RecipeType.SMELTING) > 0);
+        // Load one fuel at a time. Bulk-loading consumed the sticks reserved
+        // for torches and left most of the batch unused inside the furnace.
+        int moved = transfer(context, furnace, SLOT_FUEL, 1,
+                stack -> stack.is(net.minecraft.tags.ItemTags.PLANKS)
+                    && net.minecraftforge.common.ForgeHooks.getBurnTime(stack, RecipeType.SMELTING) > 0);
+        if (moved > 0) return moved;
+        return transfer(context, furnace, SLOT_FUEL, 1,
+                stack -> !stack.isDamageableItem()
+                    && !CitizenInventory.idOf(stack).equals(context.params.resource)
+                    && !CitizenInventory.idOf(stack).equals("minecraft:stick")
+                    && (stack.is(net.minecraft.tags.ItemTags.LOGS)
+                        || stack.is(net.minecraft.world.item.Items.COAL)
+                        || stack.is(net.minecraft.world.item.Items.CHARCOAL))
+                    && net.minecraftforge.common.ForgeHooks.getBurnTime(stack, RecipeType.SMELTING) > 0);
     }
 
     private static int transfer(SkillContext context, Container furnace, int slot,
@@ -246,6 +256,7 @@ public final class SmeltItemSkill implements CitizenSkill {
             ItemStack stack = inventory.get(i);
             if (stack.isEmpty() || !matches.test(stack)) continue;
             dest = furnace.getItem(slot);
+            if (!dest.isEmpty() && !ItemStack.isSameItemSameComponents(stack, dest)) continue;
             int room = dest.isEmpty()
                     ? stack.getMaxStackSize()
                     : dest.getMaxStackSize() - dest.getCount();

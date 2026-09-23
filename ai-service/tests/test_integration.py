@@ -26,7 +26,8 @@ def test_vertical_slice_round_trip(client):
     obs = {
         "observation": {
             "citizen": {"name": "Alex", "profession": "UNASSIGNED",
-                        "health": 20.0, "hunger": 20.0, "energy": 1.0},
+                        # hunger is 0..100 (100 = full), not the 0..20 food bar
+                        "health": 20.0, "hunger": 95.0, "energy": 1.0},
             "position": [0, 64, 0],
             "current_goal": None,
             "inventory": {},

@@ -19,6 +19,19 @@ import ai.minecivilization.entity.CitizenEntity;
 import ai.minecivilization.entity.CitizenIndex;
 import ai.minecivilization.network.AiBridge;
 import ai.minecivilization.registry.ModEntities;
+import ai.minecivilization.colony.CitizenMarkers;
+import ai.minecivilization.colony.ColonyCensus;
+import ai.minecivilization.colony.LandmarkKind;
+import ai.minecivilization.colony.LandmarkRegistry;
+import ai.minecivilization.colony.ColonyData;
+import ai.minecivilization.colony.ColonyLife;
+import ai.minecivilization.colony.Population;
+import ai.minecivilization.colony.Zone;
+import ai.minecivilization.colony.ZoneManager;
+import ai.minecivilization.storage.ItemCategory;
+import ai.minecivilization.storage.SettlementStock;
+import ai.minecivilization.storage.StorageManager;
+import ai.minecivilization.storage.StorageNode;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
 import net.minecraft.commands.SharedSuggestionProvider;
@@ -33,6 +46,10 @@ import net.minecraftforge.event.RegisterCommandsEvent;
  *   /mciv citizen spawn|list|inspect &lt;citizen&gt;|think &lt;citizen&gt;|stop &lt;citizen&gt;
  *   /mciv ai status|reconnect
  *   /mciv camp
+ *   /mciv storage
+ *   /mciv colony
+ *   /mciv places
+ *   /mciv highlight on|off
  *   /mciv debug on|off
  */
 public final class McivCommands {
@@ -62,6 +79,17 @@ public final class McivCommands {
                                 .executes(ctx -> aiReconnect(ctx.getSource()))))
                 .then(Commands.literal("camp")
                         .executes(McivCommands::camp))
+                .then(Commands.literal("storage")
+                        .executes(McivCommands::storage))
+                .then(Commands.literal("colony")
+                        .executes(McivCommands::colony))
+                .then(Commands.literal("places")
+                        .executes(McivCommands::places))
+                .then(Commands.literal("highlight")
+                        .then(Commands.literal("on")
+                                .executes(ctx -> highlight(ctx.getSource(), true)))
+                        .then(Commands.literal("off")
+                                .executes(ctx -> highlight(ctx.getSource(), false))))
                 .then(Commands.literal("debug")
                         .then(Commands.literal("on").executes(ctx -> debug(ctx.getSource(), true)))
                         .then(Commands.literal("off").executes(ctx -> debug(ctx.getSource(), false)))));
@@ -102,6 +130,174 @@ public final class McivCommands {
         return null;
     }
 
+    // ------------------------------------------------------------------ what the colony knows
+
+    /**
+     * Everywhere the colony remembers. Answers "do they know there is a furnace
+     * over there?" — which used to be unanswerable, because they did not.
+     */
+    private static int places(CommandContext<CommandSourceStack> ctx) {
+        CommandSourceStack source = ctx.getSource();
+        ServerLevel level = source.getLevel();
+        BlockPos from = BlockPos.containing(source.getPosition());
+        LandmarkRegistry registry = LandmarkRegistry.get(level);
+
+        var census = registry.census();
+        if (census.isEmpty()) {
+            source.sendSuccess(() -> Component.literal(
+                    "The colony knows of no workshops or machinery yet."), false);
+            return 0;
+        }
+
+        source.sendSuccess(() -> Component.literal("Known places:"), false);
+        int total = 0;
+        for (LandmarkKind kind : LandmarkKind.values()) {
+            Integer count = census.get(kind);
+            if (count == null || count == 0) continue;
+            total += count;
+            BlockPos nearest = registry.nearest(kind, from);
+            String where = nearest == null ? "" : String.format("   nearest %dm at %d,%d,%d",
+                    (int) Math.sqrt(nearest.distSqr(from)),
+                    nearest.getX(), nearest.getY(), nearest.getZ());
+            String line = String.format("  %-18s %3d%s", kind.label(), count, where);
+            source.sendSuccess(() -> Component.literal(line), false);
+        }
+        int shown = total;
+        source.sendSuccess(() -> Component.literal("  " + shown + " place(s) remembered"), false);
+        return shown;
+    }
+
+    // ------------------------------------------------------------------ finding people
+
+    /**
+     * Outline every citizen through terrain. Name tags work at close range;
+     * this is what finds someone at the bottom of a shaft.
+     */
+    private static int highlight(CommandSourceStack source, boolean enabled) {
+        CitizenMarkers.setHighlighted(enabled);
+        int count = CitizenIndex.population();
+        source.sendSuccess(() -> Component.literal(enabled
+                ? "Citizens are now outlined through walls (" + count + ")."
+                : "Citizen outlines off."), true);
+        return count;
+    }
+
+    // ------------------------------------------------------------------ colony
+
+    /**
+     * The settlement at a glance: how big, how old, what land it has laid out,
+     * and — the question that is otherwise pure guesswork — why it is or is not
+     * growing right now.
+     */
+    private static int colony(CommandContext<CommandSourceStack> ctx) {
+        CommandSourceStack source = ctx.getSource();
+        ServerLevel level = source.getLevel();
+        ZoneManager zones = ZoneManager.get(level);
+        ColonyData data = ColonyData.get(level);
+        BlockPos center = zones.townCenter(level);
+        int population = CitizenIndex.population();
+
+        source.sendSuccess(() -> Component.literal(String.format(
+                "Colony — %d citizen(s), day %d, centre %d,%d,%d (radius %d)",
+                population, data.ageInDays(level.getGameTime()),
+                center.getX(), center.getY(), center.getZ(), zones.radius())), false);
+        source.sendSuccess(() -> Component.literal(String.format(
+                "  %d born, %d lost   %d chunk(s) held open",
+                data.births(), data.deaths(),
+                ai.minecivilization.colony.ColonyChunkLoader.loadedChunkCount())), false);
+
+        int food = ColonyLife.foodInStore(level, center);
+        int beds = ColonyCensus.beds();
+        source.sendSuccess(() -> Component.literal(String.format(
+                "  food in store %d/%d   beds %d/%d",
+                food, Population.foodNeededFor(population),
+                beds, Population.bedsNeededFor(population))), false);
+
+        String blocker = ColonyLife.growthBlocker(level);
+        source.sendSuccess(() -> Component.literal(blocker == null
+                ? "  growth: ready — the next citizen is due"
+                : "  growth: held back — " + blocker), false);
+
+        List<Zone> districts = zones.all();
+        if (districts.isEmpty()) {
+            source.sendSuccess(() -> Component.literal(
+                    "  no districts laid out yet (they appear as the colony grows)"), false);
+            return population;
+        }
+        source.sendSuccess(() -> Component.literal("Districts:"), false);
+        districts.sort(java.util.Comparator.comparing(z -> z.type.ordinal()));
+        for (Zone zone : districts) {
+            StringBuilder line = new StringBuilder(String.format(
+                    "  %-12s %-22s at %d,%d", zone.type.name(), zone.name,
+                    zone.centerX(), zone.centerZ()));
+            if (!zone.species.isEmpty()) {
+                line.append("  growing: ").append(String.join(", ", zone.species));
+            }
+            String text = line.toString();
+            source.sendSuccess(() -> Component.literal(text), false);
+        }
+        return population;
+    }
+
+    // ------------------------------------------------------------------ storage
+
+    /**
+     * The warehouse as the citizens see it: which container holds which
+     * category, and what the settlement collectively owns. Useful for telling
+     * "nobody has registered a chest yet" apart from "the chests are empty".
+     */
+    private static int storage(CommandContext<CommandSourceStack> ctx) {
+        CommandSourceStack source = ctx.getSource();
+        ServerLevel level = source.getLevel();
+        BlockPos from = BlockPos.containing(source.getPosition());
+
+        List<StorageNode> nodes = StorageManager.get(level).all();
+        if (nodes.isEmpty()) {
+            source.sendSuccess(() -> Component.literal(
+                    "No containers registered yet. Place a chest near the camp — "
+                    + "citizens register it on sight."), false);
+            return 0;
+        }
+
+        source.sendSuccess(() -> Component.literal(
+                "Warehouse — " + nodes.size() + " container(s):"), false);
+        nodes.sort(java.util.Comparator.comparingDouble(n -> n.containerPos().distSqr(from)));
+        for (StorageNode node : nodes) {
+            BlockPos pos = node.containerPos();
+            String shelf = node.category == null ? "unassigned" : node.category.label();
+            int items = 0;
+            var container = SettlementStock.containerAt(level, node);
+            if (container != null) {
+                for (int i = 0; i < container.getContainerSize(); i++) {
+                    items += container.getItem(i).getCount();
+                }
+            }
+            String line = String.format("  %s  [%s]  %d item(s)  at %d,%d,%d",
+                    node.storageId, shelf, items, pos.getX(), pos.getY(), pos.getZ());
+            source.sendSuccess(() -> Component.literal(line), false);
+        }
+
+        var totals = SettlementStock.totals(level, from);
+        if (totals.isEmpty()) {
+            source.sendSuccess(() -> Component.literal("  (all empty)"), false);
+            return nodes.size();
+        }
+
+        // Biggest stocks first: that is what a planner actually cares about.
+        var top = totals.entrySet().stream()
+                .sorted(java.util.Map.Entry.<String, Integer>comparingByValue().reversed())
+                .limit(12)
+                .toList();
+        source.sendSuccess(() -> Component.literal("Settlement stock (top "
+                + top.size() + " of " + totals.size() + "):"), false);
+        for (var entry : top) {
+            String line = String.format("  %-34s %5d   [%s]", entry.getKey(), entry.getValue(),
+                    ItemCategory.of(entry.getKey()).label());
+            source.sendSuccess(() -> Component.literal(line), false);
+        }
+        return nodes.size();
+    }
+
     // ------------------------------------------------------------------ citizen
 
     private static int spawn(CommandSourceStack source) {
@@ -131,16 +327,22 @@ public final class McivCommands {
             source.sendSuccess(() -> Component.literal("No citizens in this world."), false);
             return 0;
         }
+        var from = source.getPosition();
+        citizens.sort(java.util.Comparator.comparingDouble(
+                c -> c.distanceToSqr(from.x, from.y, from.z)));
         for (CitizenEntity citizen : citizens) {
             var id = citizen.getIdentity();
+            double dx = citizen.getX() - from.x;
+            double dz = citizen.getZ() - from.z;
+            int distance = (int) Math.sqrt(dx * dx + dz * dz);
             source.sendSuccess(() -> Component.literal(String.format(
-                    "%s [%s] pos=%d,%d,%d hunger=%.0f status=%s goal=%s",
-                    id.name, id.profession,
+                    "%-12s %-11s %4dm %-2s  at %d,%d,%d  hunger %.0f  %s: %s",
+                    id.name, id.profession, distance, CitizenMarkers.bearing(dx, dz),
                     (int) citizen.getX(), (int) citizen.getY(), (int) citizen.getZ(),
                     citizen.getHunger(),
                     citizen.getStatusName(),
                     citizen.getCitizenBrain().currentGoal() == null
-                            ? "-" : citizen.getCitizenBrain().currentGoal().type.name())), false);
+                            ? "idle" : citizen.getCitizenBrain().currentGoal().type.name())), false);
         }
         int count = citizens.size();
         source.sendSuccess(() -> Component.literal(count + " citizen(s)."), false);

@@ -50,3 +50,10 @@ Crafting and smelting constraints:
 - 2x2 recipes can be crafted anywhere; 3x3 recipes need a crafting table within sight
 - a furnace must exist within sight; if none exists, ask for one to be built instead of guessing
 - a failed task is information: change the plan instead of repeating the same impossible task
+
+Colony maintenance and livestock:
+- Keep housing, storage, workshops, fields and mine passages lit. DECORATE with resource minecraft:torch uses local light measurements and safe placement; CRAFT can resolve torches through charcoal and wood fuel. Prepare and place missing workstations first.
+- Herd only into a physically enclosed animal pen, using HERD. Breed same-species adult pairs with BREED and real feed. Local execution enforces the configured colony-wide cap (default 10 per farm species, including juveniles and pending births).
+- TEND_LIVESTOCK accepts target SHEAR, MILK, EGGS or SURPLUS, and an optional species resource. SURPLUS preserves babies and the last adult breeding pair. Local FOOD maintenance can harvest a full herd when food is scarce, then breed replacements without exceeding the cap.
+- TAME_WOLF uses actual bones on wild wolves, never player pets. The default colony-wide limit is 50, persisted across chunks and dimensions. Colony wolves escort and defend citizens.
+- PREPARE_PEN with project_id prepares a shallow natural-soil site before BUILD; all fill and construction use inventory materials. COLLECT picks up nearby dropped items.

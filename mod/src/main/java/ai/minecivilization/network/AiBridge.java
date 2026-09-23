@@ -6,8 +6,10 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 
 import com.google.gson.JsonObject;
@@ -46,11 +48,12 @@ public final class AiBridge {
     private static final int FAILURE_THRESHOLD = 3;
     private static final long COOLDOWN_MS = 30_000;
     private static final long REGISTER_MIN_INTERVAL_MS = 5_000;
-    private static int consecutiveFailures = 0;
+    private static final AtomicInteger consecutiveFailures = new AtomicInteger();
     private static volatile long openUntil = 0;
     private static volatile boolean everSucceeded = false;
     private static volatile long lastLatencyMs = -1;
-    private static volatile long lastRegisterAttempt = 0;
+    /** Per citizen, never colony-wide: one citizen must not hold up every other. */
+    private static final Map<UUID, Long> lastRegisterAttempt = new ConcurrentHashMap<>();
     private static volatile String lastError = "";
     private static final Map<String, Boolean> loggedOnce = new ConcurrentHashMap<>();
 
@@ -77,9 +80,10 @@ public final class AiBridge {
     }
 
     public static void reconnect() {
-        consecutiveFailures = 0;
+        consecutiveFailures.set(0);
         openUntil = 0;
         lastError = "";
+        lastRegisterAttempt.clear();
         loggedOnce.clear();
         LOGGER.info("[Circuit] reset — will retry AI service immediately");
         healthProbe();
@@ -126,14 +130,14 @@ public final class AiBridge {
     }
 
     private static void onFailure(String what, Throwable error, long startNanos) {
-        consecutiveFailures++;
+        int failures = consecutiveFailures.incrementAndGet();
         lastError = what + ": " + (error == null ? "?" : error.getMessage());
-        if (consecutiveFailures >= FAILURE_THRESHOLD) {
+        if (failures >= FAILURE_THRESHOLD) {
             openUntil = System.currentTimeMillis() + COOLDOWN_MS;
             if (loggedOnce.putIfAbsent("open", Boolean.TRUE) == null) {
                 LOGGER.warn("[Circuit] AI service unavailable ({} consecutive failures) — "
                         + "degraded mode for {}s. Citizens continue deterministically.",
-                        consecutiveFailures, COOLDOWN_MS / 1000);
+                        failures, COOLDOWN_MS / 1000);
             }
         } else if (ModConfig.debug()) {
             LOGGER.debug("[Cognition] {} failed: {}", what, lastError);
@@ -142,10 +146,10 @@ public final class AiBridge {
 
     private static void onSuccess(long startNanos) {
         lastLatencyMs = (System.nanoTime() - startNanos) / 1_000_000;
-        if (consecutiveFailures > 0 || openUntil > 0) {
+        if (consecutiveFailures.get() > 0 || openUntil > 0) {
             LOGGER.info("[Circuit] AI service reachable again ({}ms)", lastLatencyMs);
         }
-        consecutiveFailures = 0;
+        consecutiveFailures.set(0);
         openUntil = 0;
         everSucceeded = true;
         loggedOnce.remove("open");
@@ -169,10 +173,12 @@ public final class AiBridge {
     public static void registerCitizen(CitizenEntity citizen) {
         if (shouldSkip()) return;
         long now = System.currentTimeMillis();
-        if (now - lastRegisterAttempt < REGISTER_MIN_INTERVAL_MS) {
-            return; // never spam registration (the brain may ask every tick)
+        UUID citizenId = citizen.getIdentity().citizenId;
+        Long lastAttempt = lastRegisterAttempt.get(citizenId);
+        if (lastAttempt != null && now - lastAttempt < REGISTER_MIN_INTERVAL_MS) {
+            return; // throttle this citizen, never the whole colony
         }
-        lastRegisterAttempt = now;
+        lastRegisterAttempt.put(citizenId, now);
         JsonObject body = new JsonObject();
         body.addProperty("citizen_id", citizen.getIdentity().citizenId.toString());
         body.addProperty("name", citizen.getIdentity().name);
@@ -210,6 +216,7 @@ public final class AiBridge {
                 .thenAccept(resp -> {
                     if (resp.statusCode() >= 200 && resp.statusCode() < 300) {
                         onSuccess(start);
+                        lastRegisterAttempt.remove(citizenId);
                         // flag flips on the server thread — HTTP threads never touch world state
                         enqueue(() -> citizen.setRegisteredWithService(true));
                         LOGGER.debug("[Cognition] citizen registered: {}",
@@ -250,9 +257,28 @@ public final class AiBridge {
                         .build(),
                 HttpResponse.BodyHandlers.ofString())
                 .thenAccept(resp -> {
-                    if (resp.statusCode() == 429 || resp.statusCode() == 503) {
-                        // backpressure / unavailable — expected, not an error
-                        onFailure("decision HTTP " + resp.statusCode(), null, start);
+                    if (resp.statusCode() == 429) {
+                        // Backpressure proves the service is alive. Counting it
+                        // as an outage opened the circuit precisely when the
+                        // service was healthy but briefly busy.
+                        if (ModConfig.debug()) {
+                            LOGGER.debug("[Cognition] decision backpressure; retry later");
+                        }
+                        return;
+                    }
+                    if (resp.statusCode() == 404) {
+                        // The world may have survived a service/database reset.
+                        // Forget the stale registration and let the brain retry
+                        // instead of asking this same unknown id forever.
+                        onSuccess(start);
+                        enqueue(() -> {
+                            citizen.setRegisteredWithService(false);
+                            onPlan.accept(null);
+                        });
+                        return;
+                    }
+                    if (resp.statusCode() == 503) {
+                        onFailure("decision HTTP 503", null, start);
                         return;
                     }
                     if (resp.statusCode() != 200) {

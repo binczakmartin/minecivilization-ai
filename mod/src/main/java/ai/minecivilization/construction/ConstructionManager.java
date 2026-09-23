@@ -38,6 +38,9 @@ public final class ConstructionManager extends SavedData {
     static {
         registerBlueprint(StarterWarehouse.create());
         registerBlueprint(StarterHouse.create());
+        registerBlueprint(AnimalPen.create());
+        for (String wood : java.util.List.of("spruce", "birch", "jungle", "acacia", "dark_oak", "cherry", "mangrove"))
+            registerBlueprint(AnimalPen.create(wood));
     }
 
     public static void registerBlueprint(Blueprint blueprint) {

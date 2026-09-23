@@ -81,6 +81,18 @@ public final class BuildBlueprintSkill implements CitizenSkill {
             context.fail(new SkillFailure("INVALID_BLOCK_STATE", next.blockState, false));
             return SkillResult.FAILED;
         }
+        if (ai.minecivilization.construction.AnimalPen.isPen(project.blueprintId)) {
+            var existing = context.level.getBlockState(next.pos);
+            if (existing.is(state.getBlock())) {
+                project.placed.add(project.key(next.pos.getX(), next.pos.getY(), next.pos.getZ()));
+                manager.setDirty();
+                return SkillResult.RUNNING;
+            }
+            if (!existing.canBeReplaced() || !context.level.getFluidState(next.pos).isEmpty()) {
+                context.fail(new SkillFailure("PEN_OBSTRUCTED", "pen construction must not overwrite existing structures", true));
+                return SkillResult.FAILED;
+            }
+        }
         Item blockItem = net.minecraft.world.item.BlockItem.byBlock(state.getBlock());
         if (blockItem == net.minecraft.world.item.Items.AIR) {
             context.fail(new SkillFailure("INVALID_BLOCK_STATE",
@@ -89,10 +101,14 @@ public final class BuildBlueprintSkill implements CitizenSkill {
         }
         String itemId = CitizenInventory.idOf(new ItemStack(blockItem));
 
-        // missing materials: try to withdraw from nearest registered storage once
+        // Missing materials: walk to storage and withdraw. "Still walking" is
+        // not the same answer as "the material is absent"; the old boolean
+        // helper failed the build on the first tick of every long walk.
         if (!context.citizen.getInventory().containsAtLeast(itemId, 1)) {
-            boolean withdrew = tryWithdrawFromStorage(context, itemId);
-            if (!withdrew || !context.citizen.getInventory().containsAtLeast(itemId, 1)) {
+            SkillResult withdrawal = tryWithdrawFromStorage(context, itemId);
+            if (withdrawal == SkillResult.RUNNING) return withdrawal;
+            if (withdrawal == SkillResult.FAILED) return SkillResult.FAILED;
+            if (!context.citizen.getInventory().containsAtLeast(itemId, 1)) {
                 project.status = ConstructionProject.Status.WAITING_FOR_RESOURCES;
                 manager.setDirty();
                 context.fail(SkillFailure.missing(
@@ -107,21 +123,24 @@ public final class BuildBlueprintSkill implements CitizenSkill {
         double distSqr = context.citizen.distanceToSqr(
                 next.pos.getX() + 0.5, next.pos.getY() + 0.5, next.pos.getZ() + 0.5);
         if (distSqr > 25.0) {
-            context.navigator.moveTo(next.pos, 1.0);
-            context.navigator.tick();
-            if (context.navigator.hasFailed()) {
-                context.fail(context.navigator.failure());
-                return SkillResult.FAILED;
-            }
-            // remember we are walking; next tick will place when close
-            context.put("pendingProject", project.id);
-            return SkillResult.RUNNING;
+            SkillResult arrival = SkillNavigation.approach(context, next.pos, 25.0, "build.walk");
+            if (arrival != SkillResult.COMPLETED) return arrival;
         }
         context.navigator.stop();
 
-        // physically place: consume exactly one item
+        // Physically place: consume exactly one item, and refund it if the world
+        // rejects the write.  A project must never advance on a phantom block.
         context.citizen.getInventory().extract(itemId, 1);
-        context.level.setBlock(next.pos, state, 3);
+        if (!context.level.setBlock(next.pos, state, 3)) {
+            context.citizen.getInventory().insert(new ItemStack(blockItem));
+            context.fail(new SkillFailure("BLOCK_PLACE_FAILED",
+                    "the world rejected blueprint block at " + next.pos, true));
+            return SkillResult.FAILED;
+        }
+        // A blueprint that includes chests registers them as it raises them.
+        ai.minecivilization.storage.StorageDiscovery.onContainerPlaced(context.level, next.pos);
+        ai.minecivilization.colony.LandmarkRegistry.get(context.level)
+                .notice(context.level, next.pos);
         project.placed.add(project.key(next.pos.getX(), next.pos.getY(), next.pos.getZ()));
         context.citizen.getSkills().addXp("building", 0.05f);
         context.citizen.onBlockPlaced(itemId);
@@ -134,24 +153,27 @@ public final class BuildBlueprintSkill implements CitizenSkill {
         if (project.isFinished(blueprint)) {
             project.status = ConstructionProject.Status.COMPLETED;
             manager.setDirty();
+            // A blueprint can place a sign but cannot say anything on it.
+            ai.minecivilization.colony.DistrictMarker.stamp(context.level, project);
             context.citizen.onProjectCompleted(project);
             return SkillResult.COMPLETED;
         }
         return SkillResult.RUNNING;
     }
 
-    private boolean tryWithdrawFromStorage(SkillContext context, String itemId) {
-        StorageNode storage = StorageManager.nearest(context.level, context.citizen.blockPosition());
-        if (storage == null) return false;
+    private SkillResult tryWithdrawFromStorage(SkillContext context, String itemId) {
+        StorageNode storage = StorageManager.nearestWith(context.level,
+                context.citizen.blockPosition(), itemId, 1);
+        if (storage == null) return SkillResult.COMPLETED;
         var be = context.level.getBlockEntity(storage.containerPos());
-        if (!(be instanceof net.minecraft.world.Container container)) return false;
+        if (!(be instanceof net.minecraft.world.Container container)) return SkillResult.COMPLETED;
 
         double distSqr = context.citizen.distanceToSqr(storage.containerPos().getX() + 0.5,
                 storage.containerPos().getY() + 0.5, storage.containerPos().getZ() + 0.5);
         if (distSqr > 12.0) {
-            context.navigator.moveTo(storage.containerPos(), 1.0);
-            context.navigator.tick();
-            return false; // keep trying next tick
+            SkillResult arrival = SkillNavigation.approach(context, storage.containerPos(),
+                    12.0, "build.withdraw");
+            if (arrival != SkillResult.COMPLETED) return arrival;
         }
         context.navigator.stop();
         for (int i = 0; i < container.getContainerSize(); i++) {
@@ -163,10 +185,10 @@ public final class BuildBlueprintSkill implements CitizenSkill {
                 stack.shrink(taken);
                 if (stack.isEmpty()) container.setItem(i, ItemStack.EMPTY);
                 container.setChanged();
-                return true;
+                return SkillResult.COMPLETED;
             }
         }
-        return false;
+        return SkillResult.COMPLETED;
     }
 
     @Override

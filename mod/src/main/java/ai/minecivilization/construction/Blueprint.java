@@ -33,6 +33,11 @@ public final class Blueprint {
             String id = bracket >= 0 ? blockState.substring(0, bracket) : blockState;
             return id;
         }
+
+        @Override
+        public String toString() {
+            return x + "," + y + "," + z + "=" + blockState;
+        }
     }
 
     public final String id;

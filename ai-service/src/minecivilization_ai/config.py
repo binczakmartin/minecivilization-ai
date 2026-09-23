@@ -54,7 +54,11 @@ class Settings(BaseSettings):
 
     # --- scheduler / backpressure ---
     max_concurrent_llm_requests: int = 1  # MAX_CONCURRENT_LLM_REQUESTS
-    max_llm_decisions_per_minute: int = 30  # MAX_LLM_DECISIONS_PER_MINUTE
+    # Sized for the offline mock, which is deterministic, local and free: with
+    # eleven citizens asking for work the moment they finish a job, thirty a
+    # minute is a queue, and a queued decision is a citizen standing still.
+    # Lower this when pointing at Ollama, where each decision costs real time.
+    max_llm_decisions_per_minute: int = 600  # MAX_LLM_DECISIONS_PER_MINUTE
     cognition_queue_limit: int = 128
 
     # --- internet (must stay false for offline operation) ---

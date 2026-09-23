@@ -7,6 +7,7 @@ import ai.minecivilization.skills.SkillFailure;
 import ai.minecivilization.skills.SkillResult;
 import ai.minecivilization.skills.SkillType;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.CropBlock;
@@ -41,8 +42,12 @@ public final class PlantCropSkill implements CitizenSkill {
             return SkillResult.FAILED;
         }
         BlockPos above = farmland.above();
-        if (!context.level.getBlockState(farmland).is(net.minecraft.world.level.block.Blocks.FARMLAND)) {
-            context.fail(new SkillFailure("NOT_FARMLAND", "target farmland is gone", true));
+        BlockPos support = farmland.below();
+        if (!context.level.getBlockState(farmland).is(Blocks.FARMLAND)
+                || !context.level.getBlockState(support).isFaceSturdy(
+                        context.level, support, Direction.UP)) {
+            context.fail(new SkillFailure("UNSUPPORTED_BLOCK",
+                    "farmland has no supporting ground", true));
             return SkillResult.FAILED;
         }
         if (!context.level.getBlockState(above).canBeReplaced()) {
@@ -50,7 +55,7 @@ public final class PlantCropSkill implements CitizenSkill {
             return SkillResult.FAILED;
         }
 
-        String seedId = context.params.extra.getOrDefault("seed", "minecraft:wheat_seeds");
+        String seedId = context.params.extra.getOrDefault("seed", context.params.resource == null ? "minecraft:wheat_seeds" : context.params.resource);
         if (!context.citizen.getInventory().containsAtLeast(seedId, 1)) {
             context.fail(SkillFailure.missing("no " + seedId + " to plant"));
             return SkillResult.FAILED;
@@ -61,9 +66,9 @@ public final class PlantCropSkill implements CitizenSkill {
             return SkillResult.FAILED;
         }
 
-        BlockState cropState = Blocks.WHEAT.defaultBlockState();
-        if (!(cropState.getBlock() instanceof CropBlock)) {
-            context.fail(SkillFailure.notImplemented("crop type"));
+        BlockState cropState = ai.minecivilization.farming.Crops.state(seedId);
+        if (cropState == null) {
+            context.fail(SkillFailure.notImplemented("unsupported seed " + seedId));
             return SkillResult.FAILED;
         }
         if (!cropState.canSurvive(context.level, above)) {
@@ -71,8 +76,11 @@ public final class PlantCropSkill implements CitizenSkill {
             return SkillResult.FAILED;
         }
 
+        if (!context.level.setBlock(above, cropState, 3)) {
+            context.fail(SkillFailure.missing("could not plant at target"));
+            return SkillResult.FAILED;
+        }
         context.citizen.getInventory().extract(seedId, 1);
-        context.level.setBlock(above, cropState, 3);
         context.citizen.getSkills().addXp("farming", 0.03f);
         return SkillResult.COMPLETED;
     }

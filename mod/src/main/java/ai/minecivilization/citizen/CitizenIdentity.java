@@ -16,10 +16,15 @@ public final class CitizenIdentity {
     };
     /**
      * The role rotation. Citizens self-organize by joining this list in spawn
-     * order: lumberjack, miner, farmer, builder, crafter, then it repeats.
+     * order: lumberjack, miner, farmer, builder, crafter, shepherd, then it
+     * repeats.
+     *
+     * <p>The shepherd comes sixth on purpose. Livestock is what a settlement
+     * reaches for once it is fed and housed — but it is also what unlocks the
+     * next tier, since wool makes beds and beds allow births.</p>
      */
     private static final String[] ROLES = {
-            "LUMBERJACK", "MINER", "FARMER", "BUILDER", "CRAFTER"
+            "LUMBERJACK", "MINER", "FARMER", "BUILDER", "CRAFTER", "SHEPHERD"
     };
 
     public UUID citizenId;

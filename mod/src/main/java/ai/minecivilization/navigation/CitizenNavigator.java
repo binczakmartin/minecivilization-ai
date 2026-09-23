@@ -35,6 +35,7 @@ public final class CitizenNavigator {
     private final PathNavigation navigation;
 
     private BlockPos target;
+    private BlockPos requestedTarget;
     private double targetDist;
     private long lastProgressTime;
     private Vec3 lastProgressPos;
@@ -57,7 +58,9 @@ public final class CitizenNavigator {
      */
     public boolean moveTo(BlockPos pos, double speed) {
         if (failed) return false;
-        boolean changed = target == null || !target.equals(pos);
+        if (pos.equals(requestedTarget) && navigation.isInProgress()) return true;
+        boolean changed = requestedTarget == null || !requestedTarget.equals(pos);
+        requestedTarget = pos.immutable();
         target = pos.immutable();
         if (changed) {
             targetDist = 0.9;
@@ -117,6 +120,11 @@ public final class CitizenNavigator {
             if (++pathAttempts > APPROACH_PATH_ATTEMPTS) break;
             if (navigation.moveTo(stand.getX() + 0.5, stand.getY(), stand.getZ() + 0.5, speed)) {
                 target = stand;
+                // The fallback stand becomes the path's real target. Leaving the
+                // solid block in requestedTarget made every stall look like a
+                // brand-new destination and reset repaths to zero, defeating
+                // the bound exactly when the ring fallback was needed most.
+                requestedTarget = stand;
                 targetDist = 1.2;
                 return true;
             }
@@ -135,17 +143,11 @@ public final class CitizenNavigator {
     }
 
     public boolean moveTo(Entity entity, double speed) {
-        target = entity.blockPosition();
-        targetDist = 1.2;
-        repaths = 0;
-        stalledTicks = 0;
-        failed = false;
-        boolean ok = navigation.moveTo(entity, speed);
-        if (ok) {
-            lastProgressTime = citizen.level().getGameTime();
-            lastProgressPos = citizen.position();
-        }
-        return ok;
+        // Moving animals still use the same bounded stall/repath accounting.
+        // Calling this every tick must not reset failure detection every tick.
+        BlockPos pos = entity.blockPosition();
+        if (requestedTarget != null && requestedTarget.distSqr(pos) <= 4 && navigation.isInProgress()) return !failed;
+        return moveTo(pos, speed);
     }
 
     /** Call once per tick while a MOVE skill is active. */
@@ -204,6 +206,7 @@ public final class CitizenNavigator {
     public void stop() {
         navigation.stop();
         target = null;
+        requestedTarget = null;
         repaths = 0;
         stalledTicks = 0;
         failed = false;

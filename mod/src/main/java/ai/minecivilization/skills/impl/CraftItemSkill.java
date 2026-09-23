@@ -67,6 +67,13 @@ public final class CraftItemSkill implements CitizenSkill {
         if (inventory.count(target) >= targetQty) return SkillResult.COMPLETED;
 
         RecipeHolder<CraftingRecipe> holder = context.get("recipe", (RecipeHolder<CraftingRecipe>) null);
+        if (holder != null
+                && planConsumption(inventory, holder.value().getIngredients()) == null) {
+            // What we were using has run out. Another recipe may still work —
+            // materials change while a citizen works, so the choice is not final.
+            holder = null;
+            context.data.remove("recipe");
+        }
         if (holder == null) {
             holder = findRecipe(context, target);
             if (holder == null) {
@@ -124,18 +131,10 @@ public final class CraftItemSkill implements CitizenSkill {
             return SkillResult.RUNNING;
         }
 
-        if (context.citizen.distanceToSqr(station.getX() + 0.5, station.getY() + 0.5,
-                station.getZ() + 0.5) > REACH_SQR) {
-            context.navigator.moveTo(station, 1.0);
-            context.navigator.tick();
-            if (context.navigator.hasFailed()) {
-                context.fail(context.navigator.failure());
-                return SkillResult.FAILED;
-            }
-            return SkillResult.RUNNING;
-        }
-        context.navigator.stop();
-        return SkillResult.COMPLETED;
+        // Walk there, and make a way if walking will not do: a citizen standing
+        // a few blocks from its own workbench should not report it unreachable
+        // because a fence is in between.
+        return SkillNavigation.approach(context, station, REACH_SQR, "craft.walk");
     }
 
     // ------------------------------------------------------------------ crafting
@@ -269,14 +268,40 @@ public final class CraftItemSkill implements CitizenSkill {
         return false;
     }
 
+    /**
+     * A recipe for {@code target} that the citizen can actually pay for.
+     *
+     * <p>Most items have more than one recipe, and taking whichever the recipe
+     * manager happens to list first is a trap: a stick can be made from planks
+     * <em>or</em> from bamboo, so a citizen holding a stack of planks and no
+     * bamboo would pick the bamboo recipe and report missing ingredients
+     * forever. It did — a hundred and eight times in one session.</p>
+     *
+     * <p>Affordable recipes win. When none is affordable the first candidate is
+     * returned anyway, so the failure names something the citizen was actually
+     * trying to make rather than nothing at all.</p>
+     */
     private RecipeHolder<CraftingRecipe> findRecipe(SkillContext context, String target) {
+        CitizenInventory inventory = context.citizen.getInventory();
+        RecipeHolder<CraftingRecipe> fallback = null;
+
         for (RecipeHolder<CraftingRecipe> holder
                 : context.level.getRecipeManager().getAllRecipesFor(RecipeType.CRAFTING)) {
-            String produced = CitizenInventory.idOf(
-                    holder.value().getResultItem(context.level.registryAccess()));
-            if (produced.equals(target)) return holder;
+            ItemStack result;
+            try {
+                result = holder.value().getResultItem(context.level.registryAccess());
+            } catch (RuntimeException ex) {
+                continue;   // special recipes have no fixed result
+            }
+            if (result == null || result.isEmpty()) continue;
+            if (!CitizenInventory.idOf(result).equals(target)) continue;
+
+            if (fallback == null) fallback = holder;
+            if (planConsumption(inventory, holder.value().getIngredients()) != null) {
+                return holder;   // one we can pay for today
+            }
         }
-        return null;
+        return fallback;
     }
 
     private static boolean needsTable(CraftingRecipe recipe) {

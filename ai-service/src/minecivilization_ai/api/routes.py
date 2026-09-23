@@ -242,6 +242,9 @@ async def decide(
         "system_prompt": load_prompt("citizen_system"),
     }
 
+    # Release the read transaction before awaiting inference/rate limiting. Holding
+    # one connection per queued citizen exhausts the pool and blocks the event loop.
+    session.rollback()
     priority = PRIORITY_ORDER[body.priority]
     try:
         result = await scheduler.submit(
@@ -277,6 +280,9 @@ async def decide(
             queued_behind=result.queued_behind,
         )
 
+    citizen = session.get(Citizen, citizen_id)
+    if citizen is None:
+        raise HTTPException(status_code=404, detail="citizen removed while deciding")
     decision: Decision = result.parsed
     _apply_decision_side_effects(session, citizen, decision)
     session.add(LLMDecision(

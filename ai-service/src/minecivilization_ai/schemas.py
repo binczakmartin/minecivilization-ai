@@ -45,19 +45,42 @@ class TaskType(str, Enum):
     SMELT = "SMELT"
     MOVE = "MOVE"
     INSPECT = "INSPECT"
+    DECORATE = "DECORATE"    # light the streets, lay a hearth, plant flowers
+    HUNT = "HUNT"            # kill for meat — last resort, never the penned herd
+    MINE_SHAFT = "MINE_SHAFT"  # work the colony's shared mine
+    TEND_LIVESTOCK = "TEND_LIVESTOCK"
+    PREPARE_PEN = "PREPARE_PEN"
+    TAME_WOLF = "TAME_WOLF"
+    COLLECT = "COLLECT"
+    HERD = "HERD"            # lead an animal home to the pasture
+    BREED = "BREED"          # feed a pair so the herd grows
 
 
 class SkillType(str, Enum):
     IDLE = "IDLE"
     MOVE_TO = "MOVE_TO"
+    TRAVERSE = "TRAVERSE"   # move by changing the terrain: bridge, tunnel, pillar
     FOLLOW = "FOLLOW"
     FIND_BLOCK = "FIND_BLOCK"
     MINE_BLOCK = "MINE_BLOCK"
     MINE_AREA = "MINE_AREA"
+    FELL_TREE = "FELL_TREE"
+    DIG_MINE = "DIG_MINE"
     PICKUP_ITEM = "PICKUP_ITEM"
     PLACE_BLOCK = "PLACE_BLOCK"
     HARVEST_CROP = "HARVEST_CROP"
     PLANT_CROP = "PLANT_CROP"
+    CULTIVATE = "CULTIVATE"
+    LIGHT_FARM = "LIGHT_FARM"
+    FORAGE = "FORAGE"
+    TILL_SOIL = "TILL_SOIL"
+    TEND_LIVESTOCK = "TEND_LIVESTOCK"
+    PREPARE_PEN = "PREPARE_PEN"
+    TAME_WOLF = "TAME_WOLF"
+    HERD_ANIMAL = "HERD_ANIMAL"
+    BREED_ANIMALS = "BREED_ANIMALS"
+    HUNT = "HUNT"
+    DECORATE = "DECORATE"
     CRAFT_ITEM = "CRAFT_ITEM"
     SMELT_ITEM = "SMELT_ITEM"
     DEPOSIT_ITEM = "DEPOSIT_ITEM"
@@ -191,14 +214,60 @@ class CivilizationSummary(BaseModel):
     day: int = 0
     known_storage: int = 0
     bottlenecks: list[str] = []
+    # Largest stockpiles in the settlement's registered containers. Lets a
+    # policy answer "do we already own this?" before sending anyone mining.
+    stock: dict[str, int] = {}
 
 
 class ObservationCitizen(BaseModel):
     name: str
     profession: str = "UNASSIGNED"
     health: float = 20.0
-    hunger: float = 20.0
+    # 0..100, where 100 is full and below ~15 is starving. NOT the vanilla
+    # 0..20 food bar: the mod tracks its own finer-grained scale, and reading
+    # this as 0..20 makes every hunger rule fire only at death's door.
+    hunger: float = 100.0
     energy: float = 1.0
+
+
+class ColonyZoneRef(BaseModel):
+    type: str
+    distance: int = 0
+    id: Optional[str] = None
+    center: Optional[list[int]] = None
+    # FOREST zones only: the tree species the colony has brought home and replants
+    species: list[str] = []
+
+
+class KnownPlace(BaseModel):
+    """Somewhere the colony remembers: a workbench, a furnace, a machine.
+
+    Shared across every citizen, so one citizen's workshop is everyone's — and
+    unbounded in distance, because "far away" is a problem for the walk, not
+    for the memory.
+    """
+
+    count: int = 0
+    distance: Optional[int] = None
+    nearest: Optional[list[int]] = None
+
+
+class ColonySpace(BaseModel):
+    """Where the citizen stands in relation to its colony.
+
+    Without this a citizen cannot tell that it has wandered two hundred blocks
+    from home, nor where its trade is supposed to be practised.
+    """
+
+    center: Optional[list[int]] = None
+    distance_from_center: int = 0
+    town_radius: int = 0
+    in_zone: Optional[str] = None
+    work_zone: Optional[ColonyZoneRef] = None
+    zones: list[ColonyZoneRef] = []
+    # Workstations, containers and machinery the colony knows the location of,
+    # keyed by kind (CRAFTING_TABLE, FURNACE, STONECUTTER, MECHANISM, ...).
+    known_places: dict[str, KnownPlace] = {}
 
 
 class Observation(BaseModel):
@@ -206,6 +275,7 @@ class Observation(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    colony: ColonySpace = Field(default_factory=ColonySpace)
     citizen: ObservationCitizen
     position: Optional[list[int]] = Field(None, min_length=3, max_length=3)
     current_goal: Optional[str] = None

@@ -30,6 +30,7 @@ import net.minecraft.world.DifficultyInstance;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.damagesource.DamageSource;
 import net.minecraft.world.entity.EntityType;
+import net.minecraft.world.entity.EquipmentSlot;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.Mob;
 import net.minecraft.world.entity.MobSpawnType;
@@ -72,6 +73,15 @@ public class CitizenEntity extends PathfinderMob {
             SynchedEntityData.defineId(CitizenEntity.class, EntityDataSerializers.STRING);
     private static final EntityDataAccessor<String> DATA_STATUS =
             SynchedEntityData.defineId(CitizenEntity.class, EntityDataSerializers.STRING);
+    /**
+     * The trade, synced to clients.
+     *
+     * <p>Identity lives in NBT, which never reaches the client — so the
+     * renderer saw every citizen as UNASSIGNED and drew all of them with the
+     * same face, whatever trade they actually held.</p>
+     */
+    private static final EntityDataAccessor<String> DATA_PROFESSION =
+            SynchedEntityData.defineId(CitizenEntity.class, EntityDataSerializers.STRING);
 
     /** Melee reach in blocks (feet-to-feet) before the citizen swings. */
     private static final double ATTACK_REACH = 2.5;
@@ -106,6 +116,14 @@ public class CitizenEntity extends PathfinderMob {
     /** Block id -> last known position, discovered by actually looking around. */
     private final Map<String, BlockPos> knownResources = new LinkedHashMap<>();
     private final List<String> disabledSkills = new ArrayList<>();
+    /**
+     * Blocks placed purely to stand on — bridge decks, pillar supports.
+     *
+     * <p>Deliberately not persisted: scaffolding is only worth tidying while
+     * the citizen is still standing next to it, and a dirt tower left over a
+     * restart is better forgotten than chased across a save.</p>
+     */
+    private final List<BlockPos> scaffoldPlaced = new ArrayList<>();
 
     private CitizenIdentity identity = new CitizenIdentity();
     private CitizenPersonality personality = new CitizenPersonality();
@@ -121,6 +139,12 @@ public class CitizenEntity extends PathfinderMob {
 
     /** Transient combat state (deliberately not persisted — fights don't cross restarts). */
     private Mob combatTarget;
+    /** Something the citizen is backing away from rather than fighting. */
+    private Mob fleeFrom;
+    /** What kind of thing it is — decides how far away counts as safe. */
+    private CombatPolicy.ThreatKind fleeKind = CombatPolicy.ThreatKind.MELEE;
+    /** When the retreat started, so it cannot last forever. */
+    private long fleeStartedAt;
     private double combatLeash = ATTACKER_LEASH;
     private long combatLastHitAt;
     private long combatNextAttackAt;
@@ -157,6 +181,20 @@ public class CitizenEntity extends PathfinderMob {
         builder.define(DATA_ACTION, "idle");
         builder.define(DATA_GOAL, "idle");
         builder.define(DATA_STATUS, "ok");
+        builder.define(DATA_PROFESSION, "UNASSIGNED");
+    }
+
+    /** The trade as the client knows it — the only version a renderer may trust. */
+    public String getSyncedProfession() {
+        return this.entityData.get(DATA_PROFESSION);
+    }
+
+    /** Push the server-side trade out to watching clients. */
+    private void publishProfession() {
+        String trade = this.identity.profession == null ? "UNASSIGNED" : this.identity.profession;
+        if (!trade.equals(this.entityData.get(DATA_PROFESSION))) {
+            this.entityData.set(DATA_PROFESSION, trade);
+        }
     }
 
     // ------------------------------------------------------------------ accessors
@@ -390,6 +428,7 @@ public class CitizenEntity extends PathfinderMob {
         super.readAdditionalSaveData(tag);
         if (tag.contains(TAG_IDENTITY, Tag.TAG_COMPOUND)) {
             this.identity.load(tag.getCompound(TAG_IDENTITY));
+            this.applyIdentityName();
         }
         if (tag.contains(TAG_PERSONALITY, Tag.TAG_COMPOUND)) {
             this.personality.load(tag.getCompound(TAG_PERSONALITY));
@@ -488,6 +527,73 @@ public class CitizenEntity extends PathfinderMob {
         super.remove(reason);
     }
 
+    /**
+     * Put the citizen's own name on the entity, visibly.
+     *
+     * <p>Without this the world (and every log line) calls every citizen
+     * {@code entity.minecivilization.citizen}: they all look identical, cannot
+     * be told apart in a crowd, and cannot be found again. The name tag is the
+     * cheapest possible way to make a settlement legible.</p>
+     */
+    /**
+     * Change a citizen's trade.
+     *
+     * <p>The name tag, the face and the tool in its hand all follow the trade,
+     * so all three are refreshed. The citizen keeps its tools and its skills —
+     * a retrained lumberjack still swings an axe well — it simply takes its
+     * orders from a different rule now.</p>
+     */
+    public void retrain(String profession) {
+        if (profession == null || profession.isBlank()) return;
+        if (profession.equals(this.identity.profession)) return;
+        this.identity.profession = profession;
+        this.applyIdentityName();
+        this.syncEquipmentDisplay();
+        this.setRegisteredWithService(false);   // re-register under the new trade
+        this.markDirty();
+    }
+
+    /** Record a throwaway block so it can be taken down again afterwards. */
+    public void rememberScaffold(BlockPos pos) {
+        if (pos == null) return;
+        BlockPos immutable = pos.immutable();
+        if (!this.scaffoldPlaced.contains(immutable)) {
+            this.scaffoldPlaced.add(immutable);
+        }
+        // A citizen should never be dragging a hundred of these around.
+        while (this.scaffoldPlaced.size() > 64) {
+            this.scaffoldPlaced.remove(0);
+        }
+    }
+
+    /** Throwaway blocks still standing, highest first — take a tower down from the top. */
+    public List<BlockPos> scaffoldPlaced() {
+        List<BlockPos> sorted = new ArrayList<>(this.scaffoldPlaced);
+        sorted.sort((a, b) -> Integer.compare(b.getY(), a.getY()));
+        return sorted;
+    }
+
+    public void forgetScaffold(BlockPos pos) {
+        this.scaffoldPlaced.remove(pos);
+    }
+
+    public void forgetAllScaffold() {
+        this.scaffoldPlaced.clear();
+    }
+
+    public void applyIdentityName() {
+        String name = this.identity.name;
+        if (name == null || name.isBlank()) return;
+        String trade = this.identity.profession == null
+                || "UNASSIGNED".equals(this.identity.profession)
+                ? "" : " \u00b7 " + this.identity.profession.toLowerCase(java.util.Locale.ROOT);
+        this.setCustomName(net.minecraft.network.chat.Component.literal(name + trade));
+        this.setCustomNameVisible(true);
+        if (!this.level().isClientSide) {
+            this.publishProfession();
+        }
+    }
+
     @Override
     @Nullable
     public SpawnGroupData finalizeSpawn(ServerLevelAccessor level, DifficultyInstance difficulty,
@@ -515,6 +621,7 @@ public class CitizenEntity extends PathfinderMob {
         }
         // Command/egg spawned citizens start with no seed money: they gather from the world.
         this.inventory.clear();
+        this.applyIdentityName();
         this.markDirty();
         return super.finalizeSpawn(level, difficulty, spawnType, groupData);
     }
@@ -543,6 +650,10 @@ public class CitizenEntity extends PathfinderMob {
 
         // Deterministic self-defence runs first: combat is survival, not
         // policy, so it reacts locally and never waits for the AI service.
+        this.tickMarker();
+        if (time % 20 == 0) {
+            this.syncEquipmentDisplay();
+        }
         boolean fighting = this.tickCombat(server, time);
 
         // GOAL -> TASK -> SKILL: the deterministic brain runs the current plan and
@@ -575,13 +686,25 @@ public class CitizenEntity extends PathfinderMob {
         this.onInventoryChanged();
     }
 
+    /**
+     * Whether the brain may run at all this tick.
+     *
+     * <p>This used to refuse work below the starvation line, which reads as
+     * sensible and is in fact a death spiral: a starving citizen was forbidden
+     * from doing the one thing that would feed it, so its hunger kept falling
+     * and it stood still until it died. A settlement with no food would freeze
+     * entirely and never recover.</p>
+     *
+     * <p>Hunger now shapes <em>what</em> a citizen does — the decision policy
+     * puts eating above everything else — rather than stopping it from acting.
+     * Only actually dying takes a citizen out of the loop.</p>
+     */
     public boolean isEligibleForWork() {
-        if (this.hunger < HUNGER_STARVING && !this.executor.hasActiveTask()) {
-            this.setStatus("hungry");
-            return false;
-        }
         if (this.isDeadOrDying()) {
             return false;
+        }
+        if (this.hunger < HUNGER_STARVING) {
+            this.setStatus("hungry");
         }
         return true;
     }
@@ -633,10 +756,103 @@ public class CitizenEntity extends PathfinderMob {
      *
      * @return true while a fight is driving movement this tick
      */
+    /** Keep the outline in step with the /mciv highlight toggle. */
+    /**
+     * Put the right tool in the citizen's hand, and its armour on its back.
+     *
+     * <p>Purely a display of what the citizen already owns: the real items stay
+     * in its inventory and the equipment slots hold copies with a zero drop
+     * chance, so nothing is duplicated when one dies. Without this a miner with
+     * a full set of iron tools is indistinguishable from one with nothing.</p>
+     */
+    private void syncEquipmentDisplay() {
+        var task = this.brain.currentTaskOrNull();
+        String suffix = ai.minecivilization.citizen.CitizenLook.toolSuffixFor(
+                this.identity.profession, task == null ? null : task.type.name());
+
+        // A fight outranks the job: show the weapon if there is one.
+        if (this.combatTarget != null) {
+            ItemStack weapon = bestMatching("_sword");
+            if (weapon.isEmpty()) weapon = bestMatching("_axe");
+            if (!weapon.isEmpty()) suffix = null;
+            setDisplayItem(EquipmentSlot.MAINHAND, weapon);
+            if (!weapon.isEmpty()) return;
+        }
+
+        setDisplayItem(EquipmentSlot.MAINHAND,
+                suffix == null ? ItemStack.EMPTY : bestMatching(suffix));
+
+        for (EquipmentSlot slot : new EquipmentSlot[]{EquipmentSlot.HEAD, EquipmentSlot.CHEST,
+                EquipmentSlot.LEGS, EquipmentSlot.FEET}) {
+            setDisplayItem(slot, bestArmourFor(slot));
+        }
+    }
+
+    /** Copy an owned item into a display slot, never letting it drop. */
+    private void setDisplayItem(EquipmentSlot slot, ItemStack owned) {
+        ItemStack shown = this.getItemBySlot(slot);
+        if (ItemStack.isSameItem(shown, owned)) return;
+        this.setItemSlot(slot, owned.isEmpty() ? ItemStack.EMPTY : owned.copyWithCount(1));
+        this.setDropChance(slot, 0.0F);   // the real item lives in the inventory
+    }
+
+    /** The best carried item whose id ends with this suffix, by material tier. */
+    private ItemStack bestMatching(String suffix) {
+        ItemStack best = ItemStack.EMPTY;
+        int bestTier = -1;
+        for (int i = 0; i < this.inventory.getContainerSize(); i++) {
+            ItemStack stack = this.inventory.getItem(i);
+            if (stack.isEmpty()) continue;
+            String id = CitizenInventory.idOf(stack);
+            if (!id.endsWith(suffix)) continue;
+            int tier = materialTier(id);
+            if (tier > bestTier) {
+                bestTier = tier;
+                best = stack;
+            }
+        }
+        return best;
+    }
+
+    private ItemStack bestArmourFor(EquipmentSlot slot) {
+        String suffix = switch (slot) {
+            case HEAD -> "_helmet";
+            case CHEST -> "_chestplate";
+            case LEGS -> "_leggings";
+            case FEET -> "_boots";
+            default -> null;
+        };
+        return suffix == null ? ItemStack.EMPTY : bestMatching(suffix);
+    }
+
+    private static int materialTier(String itemId) {
+        if (itemId.contains("netherite")) return 5;
+        if (itemId.contains("diamond")) return 4;
+        if (itemId.contains("iron")) return 3;
+        if (itemId.contains("stone")) return 2;
+        if (itemId.contains("golden")) return 2;
+        if (itemId.contains("wooden") || itemId.contains("leather")) return 1;
+        return 0;
+    }
+
+    private void tickMarker() {
+        boolean wanted = ai.minecivilization.colony.CitizenMarkers.highlighted();
+        if (this.hasGlowingTag() != wanted) {
+            this.setGlowingTag(wanted);
+        }
+    }
+
     private boolean tickCombat(ServerLevel server, long time) {
         if (!ModConfig.COMBAT_ENABLED.get() || !this.isAlive()) {
             this.combatTarget = null;
+            this.fleeFrom = null;
             return false;
+        }
+
+        // Retreating outranks everything: a citizen next to a creeper has no
+        // business weighing up a fight with the zombie behind it.
+        if (this.fleeFrom != null && tickFlee(server, time)) {
+            return true;
         }
 
         if (this.combatTarget != null) {
@@ -691,41 +907,138 @@ public class CitizenEntity extends PathfinderMob {
         }
         Mob found = findCombatTarget(server);
         if (found == null) {
-            return false;
+            // findCombatTarget may have decided we should be running instead.
+            return this.fleeFrom != null && tickFlee(server, time);
         }
         engage(found, time);
         return true;
     }
 
-    /** Nearest hostile worth fighting, per CombatPolicy (pure rules). */
+    /**
+     * Look at every nearby hostile and decide what this citizen should do about
+     * it. The nearest threat that must be fled from wins over any fight: being
+     * next to a creeper is more urgent than a zombie two blocks further away.
+     */
     private Mob findCombatTarget(ServerLevel server) {
+        this.fleeFrom = null;
         double radius = CombatPolicy.effectiveRadius(
                 ModConfig.COMBAT_TRIGGER_RADIUS.get(), this.personality.riskTolerance);
-        double scanRadius = Math.max(radius, ATTACKER_LEASH);
+        double scanRadius = Math.max(Math.max(radius, ATTACKER_LEASH),
+                CombatPolicy.DEADLY_AVOID_RADIUS);
         boolean starving = this.hunger < HUNGER_STARVING;
+        boolean armed = this.hasWeapon();
+        float healthFraction = this.getMaxHealth() <= 0 ? 1f : this.getHealth() / this.getMaxHealth();
         LivingEntity attacker = this.getLastHurtByMob();
         boolean attackerRecent =
                 this.tickCount - this.getLastHurtByMobTimestamp() <= ATTACKER_RECENT_TICKS;
 
         AABB box = this.getBoundingBox().inflate(scanRadius);
-        Mob best = null;
-        double bestDistSqr = Double.MAX_VALUE;
+        Mob bestFight = null;
+        double bestFightDist = Double.MAX_VALUE;
+        Mob bestFlee = null;
+        double bestFleeDist = Double.MAX_VALUE;
+        CombatPolicy.ThreatKind bestFleeKind = CombatPolicy.ThreatKind.MELEE;
+
         // Enemy is a marker interface (not an Entity subtype): scan mobs, filter with instanceof
         for (Mob candidate : server.getEntitiesOfClass(Mob.class, box)) {
             if (!(candidate instanceof Enemy) || !candidate.isAlive()) continue;
             double distSqr = this.distanceToSqr(candidate);
             if (distSqr > scanRadius * scanRadius) continue; // inflate() box reaches corners
+
             boolean recentAttacker = attackerRecent && attacker == candidate;
-            if (!CombatPolicy.shouldEngage(true, distSqr, radius, ATTACKER_LEASH,
-                    recentAttacker, starving)) {
-                continue;
-            }
-            if (distSqr < bestDistSqr) {
-                best = candidate;
-                bestDistSqr = distSqr;
+            CombatPolicy.Response response = CombatPolicy.assess(true,
+                    CombatPolicy.classify(entityId(candidate)), distSqr, radius, ATTACKER_LEASH,
+                    recentAttacker, healthFraction, starving, armed);
+
+            if (response == CombatPolicy.Response.FLEE && distSqr < bestFleeDist) {
+                bestFlee = candidate;
+                bestFleeDist = distSqr;
+                bestFleeKind = CombatPolicy.classify(entityId(candidate));
+            } else if (response == CombatPolicy.Response.ENGAGE && distSqr < bestFightDist) {
+                bestFight = candidate;
+                bestFightDist = distSqr;
             }
         }
-        return best;
+
+        if (bestFlee != null) {
+            if (this.fleeFrom != bestFlee) {
+                this.fleeStartedAt = this.level().getGameTime();
+            }
+            this.fleeFrom = bestFlee;
+            this.fleeKind = bestFleeKind;
+            return null;   // running takes precedence over any available fight
+        }
+        return bestFight;
+    }
+
+    /** Something worth swinging: a sword or an axe beats bare hands. */
+    private boolean hasWeapon() {
+        for (int slot = 0; slot < this.inventory.getContainerSize(); slot++) {
+            var stack = this.inventory.getItem(slot);
+            if (stack.isEmpty()) continue;
+            String id = CitizenInventory.idOf(stack);
+            if (id.endsWith("_sword") || id.endsWith("_axe")) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Put distance between the citizen and something it must not fight.
+     *
+     * <p>Running directly away can corner a citizen against the terrain, so the
+     * retreat aims for a point away from the threat and biased toward the
+     * colony — help, walls and daylight are all more likely at home.</p>
+     *
+     * @return true while a retreat is driving movement this tick
+     */
+    private boolean tickFlee(ServerLevel server, long time) {
+        Mob threat = this.fleeFrom;
+        if (threat == null || !threat.isAlive()) {
+            this.fleeFrom = null;
+            return false;
+        }
+        double distSqr = this.distanceToSqr(threat);
+        double safe = CombatPolicy.safeDistance(this.fleeKind,
+                CombatPolicy.effectiveRadius(ModConfig.COMBAT_TRIGGER_RADIUS.get(),
+                        this.personality.riskTolerance));
+        if (distSqr > safe * safe) {
+            this.fleeFrom = null;
+            return false;   // far enough; get back to work
+        }
+        // A threat that cannot be escaped — behind a wall, or following us round
+        // a pen — must not cost a citizen the rest of its life.
+        if (time - this.fleeStartedAt > CombatPolicy.MAX_FLEE_TICKS) {
+            this.fleeFrom = null;
+            this.brain.addEvent("stopped running from " + entityId(threat));
+            return false;
+        }
+
+        if (CombatPolicy.shouldRepath(time, this.combatLastRepathAt, COMBAT_REPATH_INTERVAL)) {
+            net.minecraft.world.phys.Vec3 away = this.position().subtract(threat.position());
+            if (away.lengthSqr() < 1.0e-4) {
+                away = new net.minecraft.world.phys.Vec3(1, 0, 0);
+            }
+            away = away.normalize().scale(12.0);
+
+            // Bias the retreat homeward rather than deeper into the wild.
+            BlockPos home = ai.minecivilization.colony.ZoneManager.get(server).townCenter(server);
+            net.minecraft.world.phys.Vec3 homeward =
+                    new net.minecraft.world.phys.Vec3(home.getX() + 0.5 - this.getX(), 0,
+                            home.getZ() + 0.5 - this.getZ());
+            if (homeward.lengthSqr() > 1.0) {
+                away = away.add(homeward.normalize().scale(6.0));
+            }
+
+            BlockPos destination = BlockPos.containing(this.getX() + away.x, this.getY(),
+                    this.getZ() + away.z);
+            this.navigator.stop();
+            this.navigator.moveTo(destination, 1.3D);
+            this.combatLastRepathAt = time;
+        }
+        this.navigator.tick();
+        this.setDisplayState("FLEE", entityId(threat),
+                "backing off (" + (int) Math.sqrt(distSqr) + "m)");
+        return true;
     }
 
     private void engage(Mob target, long time) {

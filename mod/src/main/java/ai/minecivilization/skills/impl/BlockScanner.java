@@ -34,11 +34,34 @@ final class BlockScanner {
     private BlockScanner() {
     }
 
+    /**
+     * The nearest place of this kind the colony remembers, if it is still there.
+     *
+     * <p>Verified before it is handed back: a remembered furnace that has since
+     * been mined out would otherwise send a citizen on a long walk to nothing.</p>
+     */
+    private static BlockPos recall(SkillContext context, Block wanted) {
+        var key = net.minecraftforge.registries.ForgeRegistries.BLOCKS.getKey(wanted);
+        if (key == null) return null;
+        var kind = ai.minecivilization.colony.LandmarkKind.of(key.toString());
+        if (kind == null) return null;
+
+        var registry = ai.minecivilization.colony.LandmarkRegistry.get(context.level);
+        BlockPos pos = registry.nearest(kind, context.citizen.blockPosition());
+        if (pos == null) return null;
+        if (!context.level.isLoaded(pos)) return pos;   // far away, but believed
+
+        if (context.level.getBlockState(pos).is(wanted)) return pos;
+        registry.forget(pos);
+        return null;
+    }
+
     /** Forget any previous search (e.g. the workstation was destroyed). */
     static void reset(SkillContext context) {
         context.data.remove("scan.origin");
         context.data.remove("scan.radius");
         context.data.remove("scan.index");
+        context.data.remove("scan.cursor");
         context.data.remove("scan.done");
     }
 
@@ -53,6 +76,13 @@ final class BlockScanner {
      *         search is still running or {@link #done(SkillContext)} is true.
      */
     static BlockPos find(SkillContext context, Block wanted) {
+        // Ask the colony before searching the ground. A workbench somebody
+        // built last week is still a workbench, however far away it is —
+        // rediscovering it on every job was both wasteful and, past one search
+        // radius, simply impossible.
+        BlockPos remembered = recall(context, wanted);
+        if (remembered != null) return remembered;
+
         if (done(context)) return null;
 
         BlockPos origin = context.get("scan.origin", context.citizen.blockPosition());
@@ -69,18 +99,24 @@ final class BlockScanner {
                     && s.isFaceSturdy(context.level, p, Direction.UP);
         };
 
-        int total = 2 * radius + 1;
-        long cells = (long) total * total * total;
+        long cells = ai.minecivilization.navigation.SpiralScan.cellCount(radius);
         int processed = 0;
+        int[] offset = new int[3];
 
-        while (index < cells && processed < SLICE_PER_TICK) {
-            int x = (int) (index % total);
-            int y = (int) ((index / total) % total);
-            int z = (int) (index / (total * (long) total));
+        // Nearest first: the crafting table a citizen is standing beside should
+        // not be found after the far corner of a 48-block cube.
+        var cursor = (ai.minecivilization.navigation.SpiralScan.Cursor)
+                context.get("scan.cursor", (Object) null);
+        if (cursor == null) {
+            cursor = new ai.minecivilization.navigation.SpiralScan.Cursor();
+            context.put("scan.cursor", cursor);
+        }
+
+        while (processed < SLICE_PER_TICK && cursor.next(radius, offset)) {
             index++;
             processed++;
 
-            BlockPos pos = origin.offset(x - radius, y - radius, z - radius);
+            BlockPos pos = origin.offset(offset[0], offset[1], offset[2]);
             if (pos.getY() < context.level.getMinBuildHeight()
                     || pos.getY() >= context.level.getMaxBuildHeight()) {
                 continue;
@@ -94,12 +130,13 @@ final class BlockScanner {
         }
 
         context.put("scan.index", index);
-        if (index >= cells) {
+        if (cursor.exhausted()) {
             if (radius < MAX_RADIUS) {
-                // widen once, starting a fresh ring from the citizen's current spot
+                // widen once, starting a fresh walk from the citizen's current spot
                 context.put("scan.radius", Math.min(MAX_RADIUS, radius * 2));
                 context.put("scan.index", 0L);
                 context.put("scan.origin", context.citizen.blockPosition());
+                context.data.remove("scan.cursor");
             } else {
                 context.put("scan.done", true);
             }

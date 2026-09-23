@@ -50,6 +50,11 @@ minecraft {
         }
 
         register('server') {
+            // Its own working directory, not the client's: a dedicated server
+            // keeps its world in run-server/world while the client keeps its
+            // single-player worlds in run/saves. Sharing one directory made the
+            // two quietly fight over configs and logs.
+            workingDir = layout.projectDirectory.dir('run-server')
             args '--nogui'
         }
 

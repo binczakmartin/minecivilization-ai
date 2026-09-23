@@ -18,9 +18,12 @@ class CitizenIdentityTest {
         assertEquals("FARMER", CitizenIdentity.professionForPopulation(2));
         assertEquals("BUILDER", CitizenIdentity.professionForPopulation(3));
         assertEquals("CRAFTER", CitizenIdentity.professionForPopulation(4));
+        // Livestock is what a fed and housed settlement reaches for next — and
+        // what unlocks the tier above, since wool makes beds and beds allow births.
+        assertEquals("SHEPHERD", CitizenIdentity.professionForPopulation(5));
         // ... and the rotation repeats for the next wave of citizens
-        assertEquals("LUMBERJACK", CitizenIdentity.professionForPopulation(5));
-        assertEquals("MINER", CitizenIdentity.professionForPopulation(6));
+        assertEquals("LUMBERJACK", CitizenIdentity.professionForPopulation(6));
+        assertEquals("MINER", CitizenIdentity.professionForPopulation(7));
     }
 
     @Test
@@ -28,7 +31,7 @@ class CitizenIdentityTest {
         for (int population = -10; population <= 100; population++) {
             String profession = CitizenIdentity.professionForPopulation(population);
             switch (profession) {
-                case "LUMBERJACK", "MINER", "FARMER", "BUILDER", "CRAFTER" -> {
+                case "LUMBERJACK", "MINER", "FARMER", "BUILDER", "CRAFTER", "SHEPHERD" -> {
                     // valid role
                 }
                 default -> throw new AssertionError(
@@ -36,6 +39,6 @@ class CitizenIdentityTest {
             }
         }
         // floorMod keeps negative inputs inside the array too
-        assertEquals("CRAFTER", CitizenIdentity.professionForPopulation(-1));
+        assertEquals("SHEPHERD", CitizenIdentity.professionForPopulation(-1));
     }
 }

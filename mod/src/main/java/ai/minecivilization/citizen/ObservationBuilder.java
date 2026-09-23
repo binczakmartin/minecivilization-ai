@@ -2,6 +2,9 @@ package ai.minecivilization.citizen;
 
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
+import ai.minecivilization.colony.Zone;
+import ai.minecivilization.colony.ZoneManager;
+import ai.minecivilization.colony.ZoneType;
 import ai.minecivilization.combat.CombatPolicy;
 import ai.minecivilization.config.ModConfig;
 import ai.minecivilization.construction.ConstructionManager;
@@ -29,6 +32,9 @@ import net.minecraft.world.phys.AABB;
  *  - aggregate civilization summaries
  */
 public final class ObservationBuilder {
+
+    /** How many stockpile lines an observation carries — a briefing, not a ledger. */
+    private static final int STOCK_ENTRIES = 16;
 
     private ObservationBuilder() {
     }
@@ -66,7 +72,7 @@ public final class ObservationBuilder {
         JsonObject nearby = new JsonObject();
 
         JsonArray storages = new JsonArray();
-        for (StorageNode node : StorageManager.get(level).all()) {
+        for (StorageNode node : StorageManager.get(level).active(level)) {
             JsonObject s = new JsonObject();
             s.addProperty("id", node.storageId);
             s.addProperty("distance", round(self.distanceToSqr(
@@ -112,11 +118,13 @@ public final class ObservationBuilder {
         civ.addProperty("food_reserve", foodReserve(level));
         civ.addProperty("active_projects", activeProjects(level));
         civ.addProperty("day", (int) (level.getDayTime() / 24000L));
-        civ.addProperty("known_storage", StorageManager.get(level).all().size());
+        civ.addProperty("known_storage", StorageManager.get(level).active(level).size());
+        civ.add("stock", settlementStock(self, level));
         JsonArray bottlenecks = new JsonArray();
         for (String b : projectBottlenecks(level)) bottlenecks.add(b);
         civ.add("bottlenecks", bottlenecks);
         root.add("civilization", civ);
+        root.add("colony", colonySpace(self, level));
 
         JsonArray events = new JsonArray();
         for (var it = brain.recentEvents(); it.hasNext(); ) {
@@ -163,9 +171,101 @@ public final class ObservationBuilder {
         return sb.toString();
     }
 
+    /**
+     * The settlement's largest stockpiles, as a citizen could learn them by
+     * opening the warehouse chests. Capped hard: an observation is a briefing,
+     * not an inventory dump, and every entry costs tokens on the way to the
+     * model.
+     */
+    private static JsonObject settlementStock(CitizenEntity self, ServerLevel level) {
+        JsonObject stock = new JsonObject();
+        ai.minecivilization.storage.SettlementStock.totals(level, self.blockPosition())
+                .entrySet().stream()
+                .sorted(java.util.Map.Entry.<String, Integer>comparingByValue().reversed())
+                .limit(STOCK_ENTRIES)
+                .forEach(entry -> stock.addProperty(entry.getKey(), entry.getValue()));
+        return stock;
+    }
+
+    /**
+     * Where the citizen stands in relation to its colony.
+     *
+     * <p>Without this a citizen has no idea it has wandered two hundred blocks
+     * from home, which zone it is standing in, or where its trade is supposed
+     * to be practised. It is the difference between a crowd and a settlement.</p>
+     */
+    private static JsonObject colonySpace(CitizenEntity self, ServerLevel level) {
+        JsonObject out = new JsonObject();
+        ZoneManager zones = ZoneManager.get(level);
+        BlockPos center = zones.townCenter(level);
+        BlockPos here = self.blockPosition();
+
+        JsonArray centerPos = new JsonArray();
+        centerPos.add(center.getX());
+        centerPos.add(center.getY());
+        centerPos.add(center.getZ());
+        out.add("center", centerPos);
+        out.addProperty("distance_from_center", (int) Math.sqrt(center.distSqr(here)));
+        out.addProperty("town_radius", zones.radius());
+
+        Zone standingIn = zones.at(here);
+        out.addProperty("in_zone", standingIn == null ? null : standingIn.type.name());
+
+        // Where this trade is meant to work, and how far off it currently is.
+        ZoneType trade = ZoneType.forProfession(self.getIdentity().profession);
+        Zone workplace = trade == null ? null : zones.nearest(trade, here);
+        if (workplace != null) {
+            JsonObject work = new JsonObject();
+            work.addProperty("type", workplace.type.name());
+            work.addProperty("id", workplace.id);
+            JsonArray at = new JsonArray();
+            at.add(workplace.centerX());
+            at.add(workplace.center().getY());
+            at.add(workplace.centerZ());
+            work.add("center", at);
+            work.addProperty("distance", (int) Math.sqrt(workplace.distanceSqrTo(here)));
+            if (!workplace.species.isEmpty()) {
+                JsonArray species = new JsonArray();
+                for (String s : workplace.species) species.add(s);
+                work.add("species", species);
+            }
+            out.add("work_zone", work);
+        }
+
+        JsonArray districts = new JsonArray();
+        for (Zone zone : zones.all()) {
+            JsonObject z = new JsonObject();
+            z.addProperty("type", zone.type.name());
+            z.addProperty("distance", (int) Math.sqrt(zone.distanceSqrTo(here)));
+            districts.add(z);
+        }
+        out.add("zones", districts);
+
+        // What the colony owns and where: shared, so one citizen's workbench is
+        // every citizen's workbench.
+        JsonObject known = new JsonObject();
+        var registry = ai.minecivilization.colony.LandmarkRegistry.get(level);
+        for (var entry : registry.census().entrySet()) {
+            JsonObject place = new JsonObject();
+            place.addProperty("count", entry.getValue());
+            BlockPos nearestOne = registry.nearest(entry.getKey(), here);
+            if (nearestOne != null) {
+                place.addProperty("distance", (int) Math.sqrt(nearestOne.distSqr(here)));
+                JsonArray at = new JsonArray();
+                at.add(nearestOne.getX());
+                at.add(nearestOne.getY());
+                at.add(nearestOne.getZ());
+                place.add("nearest", at);
+            }
+            known.add(entry.getKey().name(), place);
+        }
+        out.add("known_places", known);
+        return out;
+    }
+
     private static int foodReserve(ServerLevel level) {
         int total = 0;
-        for (StorageNode node : StorageManager.get(level).all()) {
+        for (StorageNode node : StorageManager.get(level).active(level)) {
             var be = level.getBlockEntity(node.containerPos());
             if (!(be instanceof Container container)) continue;
             for (int i = 0; i < container.getContainerSize(); i++) {

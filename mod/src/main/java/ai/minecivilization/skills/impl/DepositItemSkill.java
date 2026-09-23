@@ -6,6 +6,8 @@ import ai.minecivilization.skills.SkillContext;
 import ai.minecivilization.skills.SkillFailure;
 import ai.minecivilization.skills.SkillResult;
 import ai.minecivilization.skills.SkillType;
+import ai.minecivilization.storage.DeliveryPolicy;
+import ai.minecivilization.storage.ItemCategory;
 import ai.minecivilization.storage.StorageManager;
 import ai.minecivilization.storage.StorageNode;
 import net.minecraft.core.BlockPos;
@@ -17,6 +19,14 @@ import net.minecraft.world.item.ItemStack;
  * Containers must be within reach — no remote container access.
  */
 public final class DepositItemSkill implements CitizenSkill {
+
+    /**
+     * Task parameter naming the one {@link ItemCategory} to put away, set by
+     * {@link DeliverItemsSkill} when it files a bag shelf by shelf. Absent
+     * means "everything deliverable".
+     */
+    public static final String CATEGORY_FILTER = "deposit.category";
+
     @Override
     public SkillType type() {
         return SkillType.DEPOSIT_ITEM;
@@ -53,13 +63,10 @@ public final class DepositItemSkill implements CitizenSkill {
 
         double distSqr = context.citizen.distanceToSqr(pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5);
         if (distSqr > 12.0) {
-            context.navigator.moveTo(pos, 1.0);
-            context.navigator.tick();
-            if (context.navigator.hasFailed()) {
-                context.fail(context.navigator.failure());
-                return SkillResult.FAILED;
-            }
-            return SkillResult.RUNNING;
+            // Walk there, and make a way if walking will not do.
+            SkillResult arrival = SkillNavigation.approach(context, pos, 12.0, "deposit.walk");
+            if (arrival == SkillResult.FAILED) return SkillResult.FAILED;
+            if (arrival == SkillResult.RUNNING) return SkillResult.RUNNING;
         }
         context.navigator.stop();
 
@@ -68,14 +75,26 @@ public final class DepositItemSkill implements CitizenSkill {
         int requested = context.params.quantity;       // -1 = everything matching
         int movedTotal = 0;
 
+        ItemCategory onlyCategory = categoryFilter(context);
+
         for (int slot = 0; slot < context.citizen.getInventory().items().size(); slot++) {
             ItemStack stack = context.citizen.getInventory().get(slot);
             if (stack.isEmpty() || stack.isDamageableItem()) continue;
             String id = CitizenInventory.idOf(stack);
             if (onlyResource != null && !id.equals(onlyResource)) continue;
+            if (onlyCategory != null && ItemCategory.of(id) != onlyCategory) continue;
 
             int want = stack.getCount();
-            if (requested > 0) want = Math.min(want, requested - movedTotal);
+            if (requested > 0) {
+                want = Math.min(want, requested - movedTotal);
+            } else {
+                // Keep a personal reserve of food and bridging blocks: a citizen
+                // that deposits every last scrap immediately asks for it back.
+                int spare = DeliveryPolicy.depositable(
+                        id, context.citizen.getInventory().count(id));
+                want = Math.min(want, spare);
+            }
+            if (want <= 0) continue;
 
             int moved = insertInto(container, context.citizen.getInventory().items().get(slot), want);
             if (moved > 0) {
@@ -90,7 +109,7 @@ public final class DepositItemSkill implements CitizenSkill {
 
         boolean allDone = requested > 0
                 ? movedTotal >= requested
-                : !hasDeliverables(context);
+                : !hasDeliverables(context, onlyCategory);
         if (allDone) {
             if (movedTotal > 0) {
                 StorageManager.markDeposited(context.level, node, movedTotal);
@@ -98,17 +117,33 @@ public final class DepositItemSkill implements CitizenSkill {
             return SkillResult.COMPLETED;
         }
         if (movedTotal == 0) {
-            context.fail(SkillFailure.missing("nothing deliverable (only tools/insufficient space?)"));
+            context.fail(SkillFailure.missing(
+                    "nothing deliverable here (tools, personal reserve, or the container is full)"));
             return SkillResult.FAILED;
         }
         return SkillResult.RUNNING;
     }
 
-    private boolean hasDeliverables(SkillContext context) {
-        for (ItemStack stack : context.citizen.getInventory().items()) {
-            if (!stack.isEmpty() && !stack.isDamageableItem()) return true;
+    /** Anything left that this pass is allowed to deposit, reserve excluded. */
+    private boolean hasDeliverables(SkillContext context, ItemCategory onlyCategory) {
+        CitizenInventory inventory = context.citizen.getInventory();
+        for (ItemStack stack : inventory.items()) {
+            if (stack.isEmpty() || stack.isDamageableItem()) continue;
+            String id = CitizenInventory.idOf(stack);
+            if (onlyCategory != null && ItemCategory.of(id) != onlyCategory) continue;
+            if (DeliveryPolicy.depositable(id, inventory.count(id)) > 0) return true;
         }
         return false;
+    }
+
+    private static ItemCategory categoryFilter(SkillContext context) {
+        String name = context.params.extra.get(CATEGORY_FILTER);
+        if (name == null) return null;
+        try {
+            return ItemCategory.valueOf(name);
+        } catch (IllegalArgumentException ex) {
+            return null;
+        }
     }
 
     static int insertInto(Container container, ItemStack stack, int limit) {

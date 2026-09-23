@@ -5,7 +5,8 @@ from tests.conftest import TOKEN
 
 def obs_body(**kwargs):
     base = {
-        "citizen": {"name": "Alex", "profession": "BUILDER", "health": 20, "hunger": 18},
+        # hunger is 0..100 (100 = full), not the vanilla 0..20 food bar
+        "citizen": {"name": "Alex", "profession": "BUILDER", "health": 20, "hunger": 90},
         "position": [100, 64, -20],
         "inventory": {},
         "civilization": {"population": 1, "food_reserve": 400, "active_projects": 0},
@@ -270,3 +271,36 @@ def test_metrics_endpoint(client):
     assert m["total_decisions"] >= 1
     assert m["provider"] == "mock"
     assert m["avg_latency_ms"] >= 0
+
+
+def test_decision_releases_database_connection_while_awaiting_cognition(client, monkeypatch):
+    from sqlalchemy import event
+    from minecivilization_ai.db.session import get_engine
+
+    register(client)
+    engine = get_engine()
+    checked_out = []
+
+    def checkout(*args):
+        checked_out.append(True)
+
+    def checkin(*args):
+        checked_out.pop()
+
+    event.listen(engine, "checkout", checkout)
+    event.listen(engine, "checkin", checkin)
+    scheduler = client.app.state.scheduler
+    original = scheduler.submit
+
+    async def verify_released(*args, **kwargs):
+        assert not checked_out, "Queued decisions must not hold a database connection"
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(scheduler, "submit", verify_released)
+    try:
+        response = client.post("/v1/citizens/c-alex/decision", json=obs_body(), headers=TOKEN)
+        assert response.status_code == 200, response.text
+        assert response.json()["accepted"]
+    finally:
+        event.remove(engine, "checkout", checkout)
+        event.remove(engine, "checkin", checkin)
