@@ -22,7 +22,8 @@ public final class CitizenPlan {
 
     public enum TaskType {
         IDLE, REST, GATHER, HARVEST, PLANT, DELIVER, WITHDRAW,
-        BUILD, PLACE, CRAFT, SMELT, MOVE, INSPECT, HERD, BREED, DECORATE, HUNT, MINE_SHAFT, TEND_LIVESTOCK, TAME_WOLF, COLLECT, PREPARE_PEN
+        BUILD, PLACE, CRAFT, SMELT, MOVE, INSPECT, HERD, BREED, DECORATE, HUNT, MINE_SHAFT,
+        TEND_LIVESTOCK, TAME_WOLF, COLLECT, PREPARE_PEN, ESCAPE, SIGN, ROADWORK, EXPLORE
     }
 
     public static final class Goal {
@@ -128,6 +129,14 @@ public final class CitizenPlan {
                 }
                 tasks.add(new Task(type, tResource, qty, optString(t, "target"),
                         block, optString(t, "project_id"), pos));
+            }
+            // A non-rest goal with no executable task is a decision service
+            // bug, not permission to stand idle. REST/IDLE may legitimately be
+            // empty; every production goal must carry work.
+            if (goalType != GoalType.IDLE && goalType != GoalType.REST
+                    && (tasks.isEmpty() || tasks.stream().allMatch(t ->
+                    t.type == TaskType.IDLE || t.type == TaskType.REST))) {
+                return null;
             }
             return new CitizenPlan(summary, goal, tasks);
         } catch (RuntimeException ex) {

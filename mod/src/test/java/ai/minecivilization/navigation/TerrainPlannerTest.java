@@ -223,6 +223,24 @@ class TerrainPlannerTest {
     }
 
     @Test
+    void aMissingClimbStepIsBuiltAsAStairWhenTheShelfIsSupported() {
+        World w = world(p -> p.getY() <= 63
+                || (p.getX() == 0 && p.getY() <= 64));
+
+        TerrainPlan plan = TerrainPlanner.plan(STAND, new BlockPos(1, 65, 0), w, exact());
+
+        assertNotNull(plan);
+        assertEquals(1, plan.countOps(TerrainPlan.OpKind.PLACE));
+        assertEquals(TerrainPlan.MoveKind.STAIR_UP, plan.steps().get(0).move);
+        TerrainPlan.Op placement = allOps(plan).stream()
+                .filter(op -> op.kind == TerrainPlan.OpKind.PLACE)
+                .findFirst().orElseThrow();
+        assertEquals(new BlockPos(1, 64, 0), placement.pos);
+        assertEquals("stair:east", placement.variant,
+                "a one-block climb should become a usable stair, not a floating pillar");
+    }
+
+    @Test
     void aOneWideShaftIsClimbedByPillaringUnderneathOneself() {
         // Only the x=0,z=0 column is open above ground: no room to zigzag, so
         // the citizen must place a block into the very cell it stands in.
@@ -335,10 +353,21 @@ class TerrainPlannerTest {
     private static final class World implements BlockView {
         private final Predicate<BlockPos> solid;
         private final Predicate<BlockPos> unbreakable;
+        private Predicate<BlockPos> water = p -> false;
 
         World(Predicate<BlockPos> solid, Predicate<BlockPos> unbreakable) {
             this.solid = solid;
             this.unbreakable = unbreakable;
+        }
+
+        World flooded(Predicate<BlockPos> where) {
+            this.water = where;
+            return this;
+        }
+
+        @Override
+        public boolean swimmable(BlockPos pos) {
+            return water.test(pos) && !solid.test(pos);
         }
 
         @Override
@@ -359,6 +388,171 @@ class TerrainPlannerTest {
         @Override
         public boolean inBounds(BlockPos pos) {
             return pos.getY() >= -64 && pos.getY() < 320;
+        }
+    }
+
+    // ------------------------------------------------------------------ any target
+
+    /**
+     * Reaching a target however high or deep it is.
+     *
+     * <p>Written after high branches and buried ore both came back
+     * "no route even after digging and bridging" over open, featureless
+     * ground. The cause was the estimate pricing a block of climb like a block
+     * of walking, so the search fanned out sideways until it ran out of nodes.
+     * These pin the behaviour that matters: a route exists, and it is one a
+     * citizen survives.</p>
+     */
+    @Test
+    void anyHeightIsReachableOverOpenGround() {
+        World open = world(GROUND);
+        for (int height = 66; height <= 110; height += 4) {
+            TerrainPlanner.Options o = new TerrainPlanner.Options();
+            o.arrivalRadius = 2;
+            // Enough carried material to climb: the planner's budget, not its
+            // geometry, is what should ever stop a climb.
+            o.maxOps = 256;
+            TerrainPlan plan = TerrainPlanner.plan(STAND, new BlockPos(2, height, 1), open, o);
+            assertNotNull(plan, "no route to a target " + (height - 64) + " blocks up");
+        }
+    }
+
+    @Test
+    void anyDepthIsReachableThroughSolidRock() {
+        World open = world(GROUND);
+        for (int depth = 62; depth >= 10; depth -= 6) {
+            TerrainPlanner.Options o = new TerrainPlanner.Options();
+            o.arrivalRadius = 2;
+            o.maxOps = 256;
+            o.searchHeight = 80;
+            TerrainPlan plan = TerrainPlanner.plan(STAND, new BlockPos(-3, depth, 1), open, o);
+            assertNotNull(plan, "no route to a target at y=" + depth);
+        }
+    }
+
+    @Test
+    void climbingNeverStepsMoreThanOneBlockAtATime() {
+        // The whole safety argument for a tall climb: every tread is one block,
+        // so there is never a jump a citizen cannot make or a fall it takes
+        // damage from.
+        World open = world(GROUND);
+        TerrainPlanner.Options o = new TerrainPlanner.Options();
+        o.arrivalRadius = 1;
+        o.maxOps = 256;
+        TerrainPlan plan = TerrainPlanner.plan(STAND, new BlockPos(0, 90, 0), open, o);
+        assertNotNull(plan);
+
+        BlockPos previous = STAND;
+        for (TerrainPlan.Step step : plan.steps()) {
+            int rise = step.feet.getY() - previous.getY();
+            assertTrue(rise <= 1, "climbed " + rise + " blocks in one step");
+            previous = step.feet;
+        }
+    }
+
+    @Test
+    void aWalkableHillIsPreferredToBuildingATower() {
+        // The climb estimate deliberately overshoots on open ground. It must
+        // not make a citizen ignore a perfectly good slope beside it.
+        Predicate<BlockPos> hill = p -> {
+            if (p.getY() <= 63) return true;
+            // A staircase rising one block per step along +x, up to y=75.
+            int step = p.getX();
+            return step >= 1 && step <= 12 && p.getY() <= 63 + step && Math.abs(p.getZ()) <= 2;
+        };
+        World slope = world(hill);
+        TerrainPlanner.Options o = new TerrainPlanner.Options();
+        o.arrivalRadius = 1;
+        o.maxOps = 256;
+        TerrainPlan plan = TerrainPlanner.plan(STAND, new BlockPos(12, 76, 0), slope, o);
+        assertNotNull(plan);
+
+        long placements = plan.steps().stream()
+                .flatMap(step -> step.ops.stream())
+                .filter(op -> op.kind == TerrainPlan.OpKind.PLACE)
+                .count();
+        assertTrue(placements <= 2,
+                "walked up a hill but still placed " + placements + " block(s)");
+    }
+
+    // ------------------------------------------------------------------ water
+
+    /**
+     * Crossing and leaving water.
+     *
+     * <p>Ground navigation treats water as having no floor, so a stream read
+     * as a wall, a lake as the edge of the world, and a citizen that fell into
+     * either could not path out of the cell it was floating in. Swimming is
+     * the one medium where every direction is open, including straight up.</p>
+     */
+    @Test
+    void aLakeIsSwumAcrossRatherThanBridged() {
+        // A channel carved out of the ground and filled with water.
+        Predicate<BlockPos> carved = p -> p.getY() <= 63
+                && !(p.getX() >= 3 && p.getX() <= 12 && p.getY() >= 61);
+        World lake = world(carved).flooded(p -> p.getX() >= 3 && p.getX() <= 12
+                && p.getY() >= 61 && p.getY() <= 63);
+
+        TerrainPlanner.Options o = exact();
+        TerrainPlan plan = TerrainPlanner.plan(STAND, new BlockPos(16, 64, 0), lake, o);
+        assertNotNull(plan, "a citizen must be able to cross water");
+
+        long swum = plan.steps().stream()
+                .filter(step -> step.move == TerrainPlan.MoveKind.SWIM).count();
+        assertTrue(swum > 0, "crossed the lake without ever swimming");
+
+        long placed = plan.steps().stream()
+                .flatMap(step -> step.ops.stream())
+                .filter(op -> op.kind == TerrainPlan.OpKind.PLACE)
+                .count();
+        assertTrue(placed <= 2, "paved the lake instead of swimming it: " + placed + " blocks");
+    }
+
+    @Test
+    void aCitizenInWaterCanGetOut() {
+        // The case that stranded people: standing in a flooded pit with the
+        // bank one block up. Nothing to stand on, so every ground rule said no.
+        Predicate<BlockPos> pit = p -> p.getY() <= 63 && !(p.getX() == 0 && p.getZ() == 0
+                && p.getY() >= 61);
+        World flooded = world(pit).flooded(p -> p.getX() == 0 && p.getZ() == 0
+                && p.getY() >= 61 && p.getY() <= 63);
+
+        TerrainPlanner.Options o = exact();
+        TerrainPlan plan = TerrainPlanner.plan(new BlockPos(0, 61, 0),
+                new BlockPos(4, 64, 0), flooded, o);
+        assertNotNull(plan, "a citizen in water must be able to climb out");
+    }
+
+    @Test
+    void swimmingNeedsNoFloorAndBuildsNone() {
+        // Open water with no bottom in reach: the route exists anyway.
+        World ocean = world(p -> p.getY() <= 30).flooded(p -> p.getY() > 30 && p.getY() <= 63);
+
+        TerrainPlanner.Options o = exact();
+        TerrainPlan plan = TerrainPlanner.plan(new BlockPos(0, 62, 0),
+                new BlockPos(10, 62, 0), ocean, o);
+        assertNotNull(plan, "open water must be crossable");
+        for (TerrainPlan.Step step : plan.steps()) {
+            assertTrue(step.ops.isEmpty(), "swimming should place and dig nothing");
+        }
+    }
+
+    @Test
+    void lavaIsNeverTreatedAsSwimmable() {
+        // swimmable() is water only; a view that reports no water leaves the
+        // planner with the ordinary rules, which refuse lava outright.
+        World molten = world(GROUND);
+        assertFalse(molten.swimmable(new BlockPos(0, 64, 0)));
+    }
+
+    @Test
+    void dryLandStillWalksRatherThanSwims() {
+        World dry = world(GROUND);
+        TerrainPlan plan = TerrainPlanner.plan(STAND, new BlockPos(8, 64, 0), dry, exact());
+        assertNotNull(plan);
+        for (TerrainPlan.Step step : plan.steps()) {
+            assertTrue(step.move != TerrainPlan.MoveKind.SWIM,
+                    "swam across dry ground");
         }
     }
 }

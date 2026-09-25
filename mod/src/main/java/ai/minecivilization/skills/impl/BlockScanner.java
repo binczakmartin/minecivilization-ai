@@ -46,6 +46,22 @@ final class BlockScanner {
         var kind = ai.minecivilization.colony.LandmarkKind.of(key.toString());
         if (kind == null) return null;
 
+        // A workstation is used by one person at a time. Handing every citizen
+        // the nearest one sent the whole colony to the same block, where they
+        // could not all fit and each reported it unreachable — thirteen hundred
+        // times in one session, against one crafting table.
+        if (kind.isWorkstation()) {
+            BlockPos claimed = ai.minecivilization.colony.Workstations.claimNearest(
+                    context.level, context.citizen, kind);
+            if (claimed != null) {
+                context.put("station.kind", kind);
+                context.put("station.pos", claimed);
+                return claimed;
+            }
+            // Nothing remembered of this kind: fall through to looking around.
+            return null;
+        }
+
         var registry = ai.minecivilization.colony.LandmarkRegistry.get(context.level);
         BlockPos pos = registry.nearest(kind, context.citizen.blockPosition());
         if (pos == null) return null;
@@ -54,6 +70,43 @@ final class BlockScanner {
         if (context.level.getBlockState(pos).is(wanted)) return pos;
         registry.forget(pos);
         return null;
+    }
+
+    /**
+     * Take a workstation found by eye, if it is one and it is free.
+     *
+     * @return true when the block may be used — always true for anything that
+     *         is not a workstation
+     */
+    private static boolean claimIfWorkstation(SkillContext context, Block wanted, BlockPos pos) {
+        var key = net.minecraftforge.registries.ForgeRegistries.BLOCKS.getKey(wanted);
+        if (key == null) return true;
+        var kind = ai.minecivilization.colony.LandmarkKind.of(key.toString());
+        if (kind == null || !kind.isWorkstation()) return true;
+
+        // Record it either way: a workstation the colony did not know about is
+        // worth remembering even if this citizen cannot have it right now.
+        ai.minecivilization.colony.LandmarkRegistry.get(context.level)
+                .notice(context.level, pos);
+
+        BlockPos claimed = ai.minecivilization.colony.Workstations.claimNearest(
+                context.level, context.citizen, kind);
+        // The gazetteer may not know of one yet; this citizen is looking at it.
+        context.put("station.kind", kind);
+        context.put("station.pos", claimed == null ? pos : claimed);
+        return true;
+    }
+
+    /** Give back a claimed workstation when the job that took it is over. */
+    static void releaseStation(SkillContext context) {
+        var kind = context.get("station.kind",
+                (ai.minecivilization.colony.LandmarkKind) null);
+        BlockPos pos = context.get("station.pos", (BlockPos) null);
+        if (kind == null || pos == null) return;
+        ai.minecivilization.colony.Workstations.release(context.level, context.citizen,
+                kind, pos);
+        context.data.remove("station.kind");
+        context.data.remove("station.pos");
     }
 
     /** Forget any previous search (e.g. the workstation was destroyed). */
@@ -124,6 +177,10 @@ final class BlockScanner {
             if (!context.level.isLoaded(pos)) continue;
             if (context.level.getBlockState(pos).is(wanted)
                     && Reachability.canInteractFrom(pos, bodyFree, sturdyFloor)) {
+                // Finding a workstation by eye is no different from remembering
+                // one: if somebody else is already using it, keep looking
+                // rather than adding to the queue on that block.
+                if (!claimIfWorkstation(context, wanted, pos)) continue;
                 context.put("scan.index", index);
                 return pos;
             }

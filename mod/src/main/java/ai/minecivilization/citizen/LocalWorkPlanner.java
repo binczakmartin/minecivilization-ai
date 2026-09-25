@@ -2,11 +2,15 @@ package ai.minecivilization.citizen;
 
 import java.util.*;
 import ai.minecivilization.entity.CitizenEntity;
+import ai.minecivilization.construction.ConstructionManager;
+import ai.minecivilization.construction.ConstructionProject;
 import ai.minecivilization.farming.Crops;
 import ai.minecivilization.inventory.CitizenInventory;
+import ai.minecivilization.navigation.PlacementSafety;
 import ai.minecivilization.storage.*;
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.level.block.state.BlockState;
 import static ai.minecivilization.citizen.CitizenPlan.*;
 
 /** Bounded local jobs with failure cooldowns, independent of the AI service. */
@@ -15,9 +19,30 @@ public final class LocalWorkPlanner {
     private int rotation;
     private long nextLightingCheck;
     private static String key(Task t) { return t.type + ":" + t.resource + ":" + t.block + ":" + t.target; }
-    public void failed(Task t, long now) { blockedUntil.put(key(t), now + 1200); }
+    /** Put a job on ice after it failed. Null is not a job, and is ignored. */
+    public void failed(Task t, long now) {
+        if (t == null) return;
+        blockedUntil.put(key(t), now + 1200);
+    }
     private Task task(TaskType type, String resource, int quantity) {
         return new Task(type, resource, quantity, null, null, null, null);
+    }
+
+    /**
+     * How much to bring back from a trip.
+     *
+     * <p>Measurement put roughly three quarters of all colony time into
+     * walking. A journey of sixty blocks to fetch a single log is the same
+     * walk as one to fetch sixteen, so asking for one was throwing away most
+     * of the cost of going.</p>
+     */
+    private static final int WORTHWHILE_HAUL = 16;
+
+    private Task gatherTask(String resource, int quantity) {
+        String source = ai.minecivilization.forestry.ResourceFamily.sourceBlocks(resource)
+                .stream().findFirst().orElse(resource);
+        return new Task(TaskType.GATHER, resource, Math.max(quantity, WORTHWHILE_HAUL),
+                null, source, null, null);
     }
     private boolean isBlocked(Task task, long now) {
         return blockedUntil.getOrDefault(key(task), 0L) > now;
@@ -65,6 +90,110 @@ public final class LocalWorkPlanner {
         return false;
     }
     private long nextHusbandryCheck;
+
+    private CitizenPlan civicStations(ServerLevel level, CitizenEntity citizen) {
+        var inventory = citizen.getInventory();
+        BlockPos spot;
+        if (!station(level, citizen, "minecraft:crafting_table")) {
+            if (inventory.count("minecraft:crafting_table") > 0) {
+                spot = civicSpot(level, citizen);
+                if (spot != null) {
+                    Task place = new Task(TaskType.PLACE, "minecraft:crafting_table", 1,
+                            null, "minecraft:crafting_table", null,
+                            new int[]{spot.getX(), spot.getY(), spot.getZ()});
+                    return plan(place, "Place a reachable crafting station for the colony");
+                }
+            }
+            if (inventory.count("minecraft:oak_log") >= 1
+                    || inventory.count("minecraft:oak_planks") >= 1) {
+                return plan(task(TaskType.CRAFT, "minecraft:crafting_table", 1),
+                        "Bootstrap a crafting table for future colony work");
+            }
+        }
+        if (!station(level, citizen, "minecraft:furnace")
+                && inventory.count("minecraft:furnace") > 0) {
+            spot = civicSpot(level, citizen);
+            if (spot != null) {
+                Task place = new Task(TaskType.PLACE, "minecraft:furnace", 1,
+                        null, "minecraft:furnace", null,
+                        new int[]{spot.getX(), spot.getY(), spot.getZ()});
+                return plan(place, "Place a reachable furnace for future colony work");
+            }
+        }
+        if (inventory.count("minecraft:torch") >= 4) {
+            spot = lightingSpot(level, citizen);
+            if (spot != null) {
+                Task place = new Task(TaskType.PLACE, "minecraft:torch", 1,
+                        null, "minecraft:torch", null,
+                        new int[]{spot.getX(), spot.getY(), spot.getZ()});
+                return plan(place, "Light the next safe colony work area");
+            }
+        }
+        return null;
+    }
+
+    private BlockPos lightingSpot(ServerLevel level, CitizenEntity citizen) {
+        BlockPos origin = citizen.blockPosition();
+        for (int radius = 2; radius <= 12; radius++) {
+            for (int dx = -radius; dx <= radius; dx++) {
+                for (int dz = -radius; dz <= radius; dz++) {
+                    if (Math.max(Math.abs(dx), Math.abs(dz)) != radius) continue;
+                    for (int dy = -1; dy <= 2; dy++) {
+                        BlockPos p = origin.offset(dx, dy, dz);
+                        if (!level.isLoaded(p) || !level.getBlockState(p).isAir()
+                                || !level.getBlockState(p.above()).isAir()
+                                || !level.getBlockState(p.below()).isFaceSturdy(level,
+                                p.below(), net.minecraft.core.Direction.UP)
+                                || StorageDiscovery.isStorageBlock(level, p.below())
+                                || level.getBlockState(p.below()).is(net.minecraft.world.level.block.Blocks.CRAFTING_TABLE)
+                                || ConstructionManager.get(level).protectsCell(p)
+                                || !PlacementSafety.canOccupy(level, citizen, p, false)) continue;
+                        if (torchNearby(level, p, 6)) continue;
+                        return p;
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    private boolean torchNearby(ServerLevel level, BlockPos point, int radius) {
+        for (BlockPos p : BlockPos.betweenClosed(point.offset(-radius, -2, -radius),
+                point.offset(radius, 2, radius))) {
+            if (!level.isLoaded(p)) continue;
+            if (level.getBlockState(p).is(net.minecraft.world.level.block.Blocks.TORCH)
+                    || level.getBlockState(p).is(net.minecraft.world.level.block.Blocks.WALL_TORCH)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private BlockPos civicSpot(ServerLevel level, CitizenEntity citizen) {
+        BlockPos origin = citizen.blockPosition();
+        for (int radius = 2; radius <= 8; radius++) {
+            for (int dx = -radius; dx <= radius; dx++) {
+                for (int dz = -radius; dz <= radius; dz++) {
+                    if (Math.max(Math.abs(dx), Math.abs(dz)) != radius) continue;
+                    for (int dy = -1; dy <= 2; dy++) {
+                        BlockPos p = origin.offset(dx, dy, dz);
+                        if (!level.isLoaded(p) || !level.getBlockState(p).isAir()
+                                || !level.getBlockState(p.above()).isAir()
+                                || !level.getBlockState(p.below()).isFaceSturdy(level,
+                                p.below(), net.minecraft.core.Direction.UP)
+                                || StorageDiscovery.isStorageBlock(level, p.below())
+                                || level.getBlockState(p.below()).is(net.minecraft.world.level.block.Blocks.CRAFTING_TABLE)
+                                || level.getBlockState(p.below()).is(net.minecraft.world.level.block.Blocks.FURNACE)
+                                || ConstructionManager.get(level).protectsCell(p)
+                                || !PlacementSafety.canOccupy(level, citizen, p, false)) continue;
+                        return p;
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
     public CitizenPlan husbandry(ServerLevel level, CitizenEntity citizen) {
         // Husbandry belongs to the shepherd. Letting every idle citizen help
         // looked cooperative in code but made the whole colony independently
@@ -93,26 +222,35 @@ public final class LocalWorkPlanner {
         if (ripe != null && !isBlocked(ripe, level.getGameTime())) return plan(ripe,
                 "Harvest a ripe crop already discovered nearby");
 
-        List<Task> candidates = new ArrayList<>();
-        var inv = citizen.getInventory();
-        boolean storage = StorageManager.nearest(level, citizen.blockPosition()) != null;
-        if (!storage) {
-            if (inv.count("minecraft:chest") == 0) candidates.add(task(TaskType.CRAFT, "minecraft:chest", 1));
-            else {
-                BlockPos base = citizen.blockPosition();
-                outer: for (int r = 1; r <= 4; r++) for (int dx = -r; dx <= r; dx++)
-                    for (int dz = -r; dz <= r; dz++) for (int dy = -2; dy <= 1; dy++) {
-                        BlockPos p = base.offset(dx, dy, dz);
-                        if (!level.isLoaded(p) || !level.getBlockState(p).isAir()
-                                || !level.getBlockState(p.above()).isAir()
-                                || !level.getBlockState(p.below()).isFaceSturdy(level, p.below(), net.minecraft.core.Direction.UP)
-                                || !level.getEntities(citizen, new net.minecraft.world.phys.AABB(p)).isEmpty()) continue;
-                        candidates.add(new Task(TaskType.PLACE, "minecraft:chest", 1, null,
-                            "minecraft:chest", null, new int[]{p.getX(), p.getY(), p.getZ()}));
-                        break outer;
-                    }
+        for (ConstructionProject project : ConstructionManager.get(level).all()) {
+            if (project.status == ConstructionProject.Status.COMPLETED
+                    || project.status == ConstructionProject.Status.FAILED) continue;
+            Task build = new Task(TaskType.BUILD, null, -1, "micro", null, project.id, null);
+            if (!isBlocked(build, level.getGameTime())) {
+                return plan(build, "Advance an active colony construction project");
             }
         }
+
+        CitizenPlan civic = civicStations(level, citizen);
+        if (civic != null && !isBlocked(civic.tasks.get(0), level.getGameTime())) return civic;
+
+        String[] remembered = {"minecraft:oak_log", "minecraft:cobblestone", "minecraft:dirt"};
+        for (int i = 0; i < remembered.length; i++) {
+            String resource = remembered[Math.floorMod(rotation + i, remembered.length)];
+            if (citizen.getInventory().count(resource) >= 32) continue;
+            Task known = knownGather(level, citizen, resource);
+            if (known != null && !isBlocked(known, level.getGameTime())) {
+                return plan(known, "Use a resource location already discovered nearby");
+            }
+        }
+
+        List<Task> candidates = new ArrayList<>();
+        var inv = citizen.getInventory();
+        // Bootstrapping the colony's first chest lives on the work board, not
+        // here: it needs a claim, and every citizen can see the colony has no
+        // chest. Twelve unclaimed copies of that decision is twelve people
+        // felling twelve trees to make twelve chests in the same three blocks.
+        boolean storage = StorageManager.nearest(level, citizen.blockPosition()) != null;
         if (storage) for (int slot = 0; slot < inv.getContainerSize(); slot++) {
             var stack = inv.getItem(slot);
             if (!stack.isEmpty() && !stack.isDamageableItem()
@@ -126,9 +264,11 @@ public final class LocalWorkPlanner {
         if (!hoe) candidates.add(task(TaskType.CRAFT, "minecraft:wooden_hoe", 1));
         List<String> seeds = new ArrayList<>(Crops.SEEDS.keySet());
         Collections.sort(seeds);
-        Collections.rotate(seeds, rotation++ % seeds.size());
-        for (String seed : seeds) if (inv.count(seed) > 0 && (!Crops.needsFarmland(seed) || hoe))
-            candidates.add(task(TaskType.PLANT, seed, Math.min(8, inv.count(seed))));
+        if (!seeds.isEmpty()) {
+            Collections.rotate(seeds, rotation++ % seeds.size());
+            for (String seed : seeds) if (inv.count(seed) > 0 && (!Crops.needsFarmland(seed) || hoe))
+                candidates.add(task(TaskType.PLANT, seed, Math.min(8, inv.count(seed))));
+        }
         if (inv.count("minecraft:iron_ingot") >= 3 && inv.count("minecraft:bucket") == 0 && inv.count("minecraft:water_bucket") == 0)
             candidates.add(task(TaskType.CRAFT, "minecraft:bucket", 1));
         // Do not invent crop jobs. The old rotation blindly offered carrots,
@@ -139,11 +279,67 @@ public final class LocalWorkPlanner {
         String[] resources = {"minecraft:oak_log", "minecraft:cobblestone", "minecraft:dirt"};
         for (int i = 0; i < resources.length; i++) {
             String resource = resources[Math.floorMod(rotation + i + citizen.getId(), resources.length)];
-            if (inv.count(resource) < 32) candidates.add(task(TaskType.GATHER, resource, 32));
+            if (inv.count(resource) < 32) candidates.add(gatherTask(resource, 1));
         }
         for (Task t : candidates) {
             if (isBlocked(t, level.getGameTime())) continue;
             return plan(t, "Useful local work while awaiting cognition");
+        }
+
+        // There may be no stock, no crop and no valid storage in a newly loaded
+        // chunk. Keep the worker physical instead of leaving it parked: try a
+        // bounded rotation of ordinary resources, then patrol to a real nearby
+        // standable cell. Both paths are safe to retry and never target a
+        // container or civic property through the mining skill.
+        String[] emergency = {
+                "minecraft:oak_log", "minecraft:cobblestone", "minecraft:dirt",
+                "minecraft:stone", "minecraft:oak_planks", "minecraft:gravel",
+                "minecraft:sand", "minecraft:iron_ore", "minecraft:coal_ore"
+        };
+        for (int i = 0; i < emergency.length; i++) {
+            String resource = emergency[Math.floorMod(rotation + i, emergency.length)];
+            Task maintenance = gatherTask(resource, 1);
+            if (!isBlocked(maintenance, level.getGameTime())) {
+                return plan(maintenance, "Keep gathering useful material while waiting for work");
+            }
+        }
+        BlockPos patrol = patrolTarget(level, citizen);
+        if (patrol != null) {
+            Task move = new Task(TaskType.MOVE, null, -1, null, null, null,
+                    new int[]{patrol.getX(), patrol.getY(), patrol.getZ()});
+            return plan(move, "Patrol to the next safe work area");
+        }
+        return plan(task(TaskType.GATHER, "minecraft:dirt", 1),
+                "Retry basic material work after the world changed");
+    }
+
+    private Task knownGather(ServerLevel level, CitizenEntity citizen, String resource) {
+        var sources = ai.minecivilization.forestry.ResourceFamily.sourceBlocks(resource);
+        for (var entry : citizen.knownResources().entrySet()) {
+            BlockPos pos = entry.getValue();
+            if (!sources.contains(entry.getKey()) || !level.isLoaded(pos)
+                    || pos.distSqr(citizen.blockPosition()) > 64 * 64) continue;
+            if (!new ai.minecivilization.navigation.LevelBlockView(level).diggable(pos)) continue;
+            return new Task(TaskType.GATHER, resource, 1, null, entry.getKey(), null,
+                    new int[]{pos.getX(), pos.getY(), pos.getZ()});
+        }
+        return null;
+    }
+
+    private BlockPos patrolTarget(ServerLevel level, CitizenEntity citizen) {
+        BlockPos origin = citizen.blockPosition();
+        rotation++;
+        for (int radius = 4; radius <= 16; radius++) {
+            for (int side = 0; side < 4; side++) {
+                int dx = side == 0 ? radius : side == 1 ? -radius : 0;
+                int dz = side == 2 ? radius : side == 3 ? -radius : 0;
+                for (int dy = -2; dy <= 2; dy++) {
+                    BlockPos candidate = origin.offset(dx, dy, dz);
+                    if (!level.isLoaded(candidate) || candidate.equals(origin)
+                            || ConstructionManager.get(level).protectsCell(candidate)) continue;
+                    if (PlacementSafety.canStand(level, citizen, candidate)) return candidate;
+                }
+            }
         }
         return null;
     }
@@ -162,7 +358,7 @@ public final class LocalWorkPlanner {
             if (produce == null) continue;
             int have = citizen.getInventory().count(produce);
             if (have >= 8) continue;
-            int wanted = 8 - have;
+            int wanted = 1;
 
             BlockPos pos = entry.getValue();
             if (!level.isLoaded(pos) || pos.distSqr(origin) > 64 * 64) continue;

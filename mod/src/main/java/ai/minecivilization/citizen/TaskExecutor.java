@@ -8,6 +8,7 @@ import ai.minecivilization.crafting.CraftPlanner;
 import ai.minecivilization.crafting.Production;
 import ai.minecivilization.crafting.VanillaRecipeSource;
 import ai.minecivilization.entity.CitizenEntity;
+import ai.minecivilization.navigation.PlacementSafety;
 import ai.minecivilization.navigation.PlacementSupport;
 import ai.minecivilization.skills.CitizenSkill;
 import ai.minecivilization.skills.SkillContext;
@@ -15,6 +16,7 @@ import ai.minecivilization.skills.SkillFailure;
 import ai.minecivilization.skills.SkillRegistry;
 import ai.minecivilization.skills.SkillResult;
 import ai.minecivilization.skills.SkillType;
+import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerLevel;
 
 /**
@@ -109,7 +111,36 @@ public final class TaskExecutor {
         return task != null;
     }
 
+    /**
+     * The skill actually running, following the chain into sub-executors.
+     *
+     * <p>A CRAFT that resolves a recipe tree hands the real work to a nested
+     * executor, so asking the outer one what it is doing answered "nothing" —
+     * and a third of all colony time was therefore filed under "starting a
+     * craft" when the citizens were in fact out felling trees for it.</p>
+     */
+    /**
+     * Game time the running skill last did something real.
+     *
+     * <p>Skills reset their own clock whenever they mine a block, place one,
+     * or finish a sub-step, because that is what the timeout is measured
+     * against. It is also the only honest answer to "is this citizen working?"
+     * — mining, crafting and searching are all done standing perfectly still,
+     * so position tells you nothing.</p>
+     */
+    public long skillProgressAt() {
+        if (craftRunner != null) {
+            long inner = craftRunner.skillProgressAt();
+            if (inner != Long.MIN_VALUE) return inner;
+        }
+        return ctx == null ? Long.MIN_VALUE : ctx.startGameTime;
+    }
+
     public SkillType activeSkillType() {
+        if (craftRunner != null) {
+            SkillType inner = craftRunner.activeSkillType();
+            if (inner != null) return inner;
+        }
         return activeSkill != null ? activeSkill.type() : null;
     }
 
@@ -129,9 +160,17 @@ public final class TaskExecutor {
         this.craftSubTask = null;
     }
 
-    /** MOVE_TO normally; TRAVERSE once this task has hit impassable terrain. */
+    /**
+     * MOVE_TO normally; TRAVERSE once this task has hit impassable terrain.
+     *
+     * <p>A task may also ask for terrain modification up front by naming
+     * {@code traverse} as its target. The rescue ladder uses that on its upper
+     * rungs: once ordinary walking has demonstrably failed several times,
+     * spending another attempt proving it again is wasted time.</p>
+     */
     private SkillType moveSkill() {
-        return terrainEscalated ? SkillType.TRAVERSE : SkillType.MOVE_TO;
+        return terrainEscalated || (task != null && "traverse".equals(task.target))
+                ? SkillType.TRAVERSE : SkillType.MOVE_TO;
     }
 
     /**
@@ -163,13 +202,18 @@ public final class TaskExecutor {
             ctx.startGameTime = level.getGameTime();
         }
 
+        // Work animations are emitted by the skill that owns the mutation;
+        // the executor only sequences tasks and must not fake a swing while a
+        // citizen is merely searching or walking.
         Outcome outcome = program(level, self);
-
-        // uniform per-skill-attempt timeout (startPhase() resets the window)
+        // Per-skill timeout, sized to the job (startPhase() resets the window).
+        // A flat budget killed whole-tree felling and terrain traversal while
+        // they were visibly making progress.
         if (outcome.status == Status.RUNNING && activeSkill != null
-                && ctx.timedOut(level.getGameTime())) {
-            SkillFailure f = SkillFailure.timeout(
-                    activeSkill.type() + " exceeded " + ctx.timeoutTicks + " ticks");
+                && ctx.timedOut(level.getGameTime(),
+                        activeSkill.type().budgetTicks(ctx.timeoutTicks))) {
+            SkillFailure f = SkillFailure.timeout(activeSkill.type() + " exceeded "
+                    + activeSkill.type().budgetTicks(ctx.timeoutTicks) + " ticks");
             activeSkill.cancel(ctx);
             activeSkill = null;
             return Outcome.failed(f);
@@ -210,6 +254,7 @@ public final class TaskExecutor {
                 });
             }
             case BUILD -> single(level, SkillType.BUILD_BLUEPRINT, p -> {
+                if ("micro".equals(task.target)) p.extra.put("micro", "true");
             });
             case PLACE -> place(level, self);
             case GATHER -> gather(level, self);
@@ -247,6 +292,18 @@ public final class TaskExecutor {
             case HUNT -> single(level, SkillType.HUNT, p -> {
             });
             case MINE_SHAFT -> single(level, SkillType.DIG_MINE, p -> {
+            });
+            // The last rung of the rescue ladder. It carries the destination it
+            // should lean toward in `position`, so a citizen digging out of a
+            // cave surfaces nearer the colony than it went in.
+            case ESCAPE -> single(level, SkillType.DIG_TO_SURFACE, p -> {
+            });
+            case SIGN -> single(level, SkillType.PLACE_SIGN, p -> {
+            });
+            // Road work is ordinary block placement with a different reason, so
+            // it reuses the placement machinery rather than duplicating it.
+            case ROADWORK -> place(level, self);
+            case EXPLORE -> single(level, SkillType.EXPLORE, p -> {
             });
             case INSPECT -> done();
         };
@@ -322,6 +379,12 @@ public final class TaskExecutor {
             params.position = spot;
         }
         return single(level, SkillType.PLACE_BLOCK, p -> {
+            if (params.resource != null) {
+                var item = ai.minecivilization.inventory.CitizenInventory.itemById(params.resource);
+                if (item instanceof net.minecraft.world.item.BlockItem) {
+                    p.extra.put("item", params.resource);
+                }
+            }
         });
     }
 
@@ -343,6 +406,9 @@ public final class TaskExecutor {
                     if (pos.getY() < level.getMinBuildHeight()
                             || pos.getY() >= level.getMaxBuildHeight()) continue;
                     if (!level.getBlockState(pos).canBeReplaced()) continue;
+                    if (ai.minecivilization.construction.ConstructionManager.get(level)
+                            .protectsCell(pos)) continue;
+                    if (!PlacementSafety.canOccupy(level, self, pos, false)) continue;
                     if (!PlacementSupport.canPlace(level, state, pos)) continue;
                     bestDist = d;
                     best = new int[]{pos.getX(), pos.getY(), pos.getZ()};
@@ -484,6 +550,19 @@ public final class TaskExecutor {
                 if (have >= qty) return done();
                 findAttempts = 0;
                 ctx.params.extra.remove("radius");
+                if (params.position != null) {
+                    BlockPos known = new BlockPos(params.position[0], params.position[1], params.position[2]);
+                    if (usableKnownTarget(level, known, resource)) {
+                        if (params.block == null) params.block = sourceBlock(resource);
+                        aimAtTreeBase(level);
+                        phase = Phase.GATHER_MOVE;
+                        return beginPhase(moveSkill());
+                    }
+                    // The remembered target was collected, protected, or changed
+                    // by another worker.  Do not repeatedly walk to a stale
+                    // coordinate; fall back to the bounded search once.
+                    params.position = null;
+                }
                 return beginFind();
             }
             case GATHER_FIND -> {
@@ -626,13 +705,22 @@ public final class TaskExecutor {
         return total;
     }
 
+    private boolean usableKnownTarget(ServerLevel level, BlockPos pos, String resource) {
+        if (!level.isLoaded(pos) || level.getBlockEntity(pos) != null) return false;
+        if (!new ai.minecivilization.navigation.LevelBlockView(level).diggable(pos)) return false;
+        String actual = net.minecraftforge.registries.ForgeRegistries.BLOCKS
+                .getKey(level.getBlockState(pos).getBlock()).toString();
+        return ai.minecivilization.forestry.ResourceFamily.sourceBlocks(resource).contains(actual);
+    }
+
+    private static String sourceBlock(String resource) {
+        var sources = ai.minecivilization.forestry.ResourceFamily.sourceBlocks(resource);
+        return sources.isEmpty() ? resource : sources.getFirst();
+    }
+
     private Outcome beginFind() {
         if (params.block == null && params.resource != null) {
-            var item = ai.minecivilization.inventory.CitizenInventory.itemById(params.resource);
-            var block = net.minecraft.world.level.block.Block.byItem(item);
-            if (block != null && block != net.minecraft.world.level.block.Blocks.AIR) {
-                params.block = net.minecraftforge.registries.ForgeRegistries.BLOCKS.getKey(block).toString();
-            }
+            params.block = sourceBlock(params.resource);
         }
         activeSkill = SkillRegistry.create(SkillType.FIND_BLOCK);
         if (!activeSkill.canStart(ctx)) {

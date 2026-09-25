@@ -3,6 +3,7 @@ package ai.minecivilization.skills.impl;
 import java.util.HashSet;
 import java.util.Set;
 
+import ai.minecivilization.entity.WorkAnimation;
 import ai.minecivilization.forestry.Forageables;
 import ai.minecivilization.inventory.CitizenInventory;
 import ai.minecivilization.navigation.SpiralScan;
@@ -117,7 +118,18 @@ public final class ForageSkill implements CitizenSkill {
         context.navigator.stop();
 
         // Plants break instantly and drop where they stood.
-        context.level.destroyBlock(target, true, context.citizen);
+        if (ai.minecivilization.construction.ConstructionManager.get(context.level)
+                .protectsCell(target)) {
+            attempted.add(target);
+            target = null;
+            return SkillResult.RUNNING;
+        }
+        if (!context.level.destroyBlock(target, true, context.citizen)) {
+            attempted.add(target);
+            target = null;
+            return SkillResult.RUNNING;
+        }
+        context.citizen.animateAction(WorkAnimation.FORAGE, target);
         attempted.add(target);
         broken++;
         target = null;
@@ -130,6 +142,8 @@ public final class ForageSkill implements CitizenSkill {
     // ------------------------------------------------------------------ helpers
 
     private boolean isForageable(SkillContext context, BlockPos pos) {
+        if (ai.minecivilization.construction.ConstructionManager.get(context.level)
+                .protectsCell(pos)) return false;
         var block = context.level.getBlockState(pos).getBlock();
         var key = ForgeRegistries.BLOCKS.getKey(block);
         return key != null && Forageables.isForageable(key.toString());

@@ -1,13 +1,18 @@
 package ai.minecivilization.construction;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 
+import ai.minecivilization.navigation.PlacementSupport;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.ListTag;
 import net.minecraft.nbt.StringTag;
@@ -15,6 +20,7 @@ import net.minecraft.nbt.Tag;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.level.block.BedBlock;
+import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.saveddata.SavedData;
 import org.jetbrains.annotations.Nullable;
@@ -49,6 +55,72 @@ public final class ConstructionManager extends SavedData {
 
     public static Blueprint blueprint(String id) {
         return BLUEPRINTS.get(id);
+    }
+
+    /**
+     * Resolve a blueprint, rebuilding it from its id if this session has not
+     * generated it yet.
+     *
+     * <p>Projects are saved with the world; procedural blueprints are not —
+     * they live in a static map that is empty on every start and filled only
+     * as a generator happens to be called. A project loaded from disk therefore
+     * routinely names a blueprint nothing has registered, and the builder fails
+     * with a <em>fatal</em> {@code UNKNOWN_BLUEPRINT} it can never recover
+     * from. In one session that was sixteen hundred failures — the colony's
+     * entire construction effort — because nothing ever rebuilt
+     * {@code marker_oak} after a reload.</p>
+     *
+     * <p>Every generated blueprint id encodes what it is, so every one of them
+     * can be regenerated. This is the single place that knows how, and the
+     * only thing callers should use.</p>
+     */
+    public static Blueprint ensureBlueprint(ServerLevel level, String id) {
+        if (id == null || id.isEmpty()) return null;
+        Blueprint existing = BLUEPRINTS.get(id);
+        if (existing != null) return existing;
+
+        String markerPrefix = ai.minecivilization.colony.DistrictMarker.ID_PREFIX;
+        if (id.startsWith(markerPrefix)) {
+            return ai.minecivilization.colony.DistrictMarker.blueprint(
+                    id.substring(markerPrefix.length()));
+        }
+        if (id.startsWith(TownHall.ID_PREFIX)) {
+            return TownHall.create(id.substring(TownHall.ID_PREFIX.length()));
+        }
+        if (id.startsWith(ai.minecivilization.architecture.HouseCatalog.ID_PREFIX)) {
+            return ai.minecivilization.architecture.HouseCatalog.ensureRegistered(level, id);
+        }
+        if (AnimalPen.isPen(id)) {
+            // Pens are registered statically for the woods the mod knows, so a
+            // miss here means a wood it does not — rebuild it from the id.
+            int underscore = id.lastIndexOf('_');
+            if (underscore > 0) {
+                return AnimalPen.create(id.substring(underscore + 1));
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Rebuild every blueprint the world's projects refer to.
+     *
+     * <p>Called once when the colony first ticks, so a builder never meets an
+     * unregistered blueprint in the first place, and so a project whose
+     * blueprint genuinely cannot be rebuilt is retired instead of being
+     * offered to citizens forever.</p>
+     *
+     * @return how many projects were retired as unbuildable
+     */
+    public int reconcileBlueprints(ServerLevel level) {
+        int retired = 0;
+        for (ConstructionProject project : projects.values()) {
+            if (project.status == ConstructionProject.Status.FAILED) continue;
+            if (ensureBlueprint(level, project.blueprintId) != null) continue;
+            project.status = ConstructionProject.Status.FAILED;
+            retired++;
+        }
+        if (retired > 0) setDirty();
+        return retired;
     }
 
     public static List<Blueprint> blueprints() {
@@ -107,7 +179,7 @@ public final class ConstructionManager extends SavedData {
      * never moved: their blocks would be left behind.
      */
     public void relocate(ConstructionProject project, int originX, int originY, int originZ) {
-        if (!project.placed.isEmpty()) return;
+        if (!project.placed.isEmpty() || !project.ownedCells.isEmpty()) return;
         if (project.originX == originX && project.originY == originY
                 && project.originZ == originZ) return;
         project.originX = originX;
@@ -183,6 +255,137 @@ public final class ConstructionManager extends SavedData {
         return best;
     }
 
+    /**
+     * True when a cell is part of a colony building and must not be touched.
+     *
+     * <p>What a project has <em>built</em>, not what it intends to build.
+     *
+     * <p>This has been wrong twice, in the same direction. First it was the
+     * whole bounding box of every project — several thousand cells of open
+     * countryside, trees and all, declared unbreakable. Narrowing that to the
+     * cells the design fills was better and still wrong: a district marker is
+     * sited from the surface heightmap, which puts it on top of a tree, and
+     * the tree then became unharvestable because a post was one day going to
+     * stand there. Planning a building must not freeze the ground under it.</p>
+     *
+     * <p>So: a cell is protected once it is part of the structure. Until then
+     * it is ordinary terrain, which is exactly what site preparation is for —
+     * and the builder clears its own site through an explicit, authorised
+     * step rather than by everyone else being forbidden to touch it.</p>
+     */
+    public boolean protectsCell(BlockPos pos) {
+        if (pos == null) return false;
+        String key = null;
+        for (ConstructionProject project : projects.values()) {
+            if (key == null) key = project.key(pos.getX(), pos.getY(), pos.getZ());
+            if (project.ownedCells.contains(key) || project.placed.contains(key)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** True when a named project owns this world cell. */
+    public boolean ownsCell(String projectId, BlockPos pos) {
+        if (projectId == null || pos == null) return false;
+        ConstructionProject project = byId(projectId);
+        if (project == null) return false;
+        if (project.ownedCells.contains(project.key(pos.getX(), pos.getY(), pos.getZ()))) return true;
+        Blueprint blueprint = BLUEPRINTS.get(project.blueprintId);
+        return blueprint != null && blueprint.hasEntryAt(
+                pos.getX() - project.originX,
+                pos.getY() - project.originY,
+                pos.getZ() - project.originZ);
+    }
+
+    private boolean isRecordedProjectCell(BlockPos pos) {
+        for (ConstructionProject project : projects.values()) {
+            if (project.ownedCells.contains(project.key(pos.getX(), pos.getY(), pos.getZ()))
+                    || project.placed.contains(project.key(pos.getX(), pos.getY(), pos.getZ()))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Natural terrain may be cleared as an explicit construction-site step. */
+    public static boolean isNaturalSiteBlock(ServerLevel level, BlockState state, BlockPos pos) {
+        if (level == null || state == null || pos == null || level.getBlockEntity(pos) != null) {
+            return false;
+        }
+        if (!state.getFluidState().isEmpty() || state.getDestroySpeed(level, pos) < 0f) return false;
+        return state.is(Blocks.GRASS_BLOCK) || state.is(Blocks.DIRT)
+                || state.is(Blocks.PODZOL) || state.is(Blocks.COARSE_DIRT)
+                || state.is(Blocks.ROOTED_DIRT) || state.is(Blocks.SAND)
+                || state.is(Blocks.RED_SAND) || state.is(Blocks.GRAVEL)
+                || state.is(Blocks.CLAY) || state.is(Blocks.STONE)
+                || state.is(Blocks.ANDESITE) || state.is(Blocks.GRANITE)
+                || state.is(Blocks.DIORITE) || state.is(Blocks.TUFF)
+                || state.is(Blocks.DEEPSLATE) || state.is(Blocks.COBBLED_DEEPSLATE)
+                || state.is(Blocks.CALCITE);
+    }
+
+    public void reconcile(ServerLevel level, ConstructionProject project, Blueprint blueprint) {
+        if (level == null || project == null || blueprint == null) return;
+        boolean changed = false;
+        Map<String, Blueprint.BlockEntry> expectedByPosition = new HashMap<>();
+        for (Blueprint.BlockEntry entry : blueprint.entries()) {
+            expectedByPosition.put(entry.x + "," + entry.y + "," + entry.z, entry);
+        }
+        Set<String> owned = new LinkedHashSet<>(project.ownedCells);
+        owned.addAll(project.placed);
+        for (String key : owned) {
+            String[] parts = key.split(",");
+            if (parts.length != 3) {
+                project.placed.remove(key);
+                project.ownedCells.remove(key);
+                changed = true;
+                continue;
+            }
+            int x;
+            int y;
+            int z;
+            try {
+                x = Integer.parseInt(parts[0]);
+                y = Integer.parseInt(parts[1]);
+                z = Integer.parseInt(parts[2]);
+            } catch (NumberFormatException ex) {
+                project.placed.remove(key);
+                project.ownedCells.remove(key);
+                changed = true;
+                continue;
+            }
+            BlockPos pos = new BlockPos(x, y, z);
+            if (!project.ownedCells.contains(key)) {
+                project.ownedCells.add(key);
+                changed = true;
+            }
+            if (!level.isLoaded(pos)) {
+                // Ownership is durable even while the chunk is unavailable.
+                project.ownedCells.add(key);
+                continue;
+            }
+            String relative = (x - project.originX) + ","
+                    + (y - project.originY) + "," + (z - project.originZ);
+            Blueprint.BlockEntry expected = expectedByPosition.get(relative);
+            BlockState expectedState = expected == null ? null : parseState(level, expected.blockState);
+            boolean matches = expected != null && expectedState != null
+                    && level.getBlockState(pos).equals(expectedState);
+            if (matches) {
+                if (project.placed.add(key)) changed = true;
+            } else {
+                if (project.placed.remove(key)) changed = true;
+                if (project.status == ConstructionProject.Status.COMPLETED) {
+                    project.status = ConstructionProject.Status.PLANNED;
+                    changed = true;
+                }
+                // Keep ownedCells: a player replacing a civic block must not
+                // turn it into an ordinary natural block that site prep can erase.
+            }
+        }
+        if (changed) setDirty();
+    }
+
     public static ConstructionProject resolve(ServerLevel level, String projectId, BlockPos near) {
         ConstructionManager manager = get(level);
         if (projectId != null && !projectId.isEmpty() && !"nearest".equals(projectId)) {
@@ -215,7 +418,28 @@ public final class ConstructionManager extends SavedData {
                 return Optional.of(new NextStep(pos, entry.blockState, true,
                         "unparseable block state: " + entry.blockState));
             }
-            if (!state.canSurvive(level, pos)) {
+            BlockState existing = level.getBlockState(pos);
+            if (existing.equals(state)) {
+                // Reconcile the ledger with the real world instead of asking a
+                // builder to overwrite a block that is already correct.
+                project.placed.add(key);
+                project.ownedCells.add(key);
+                continue;
+            }
+            if (!existing.canBeReplaced()) {
+                if (isRecordedProjectCell(pos)) {
+                    return Optional.of(new NextStep(pos, entry.blockState, true,
+                            "cell is already owned by a construction project"));
+                }
+                if (isNaturalSiteBlock(level, existing, pos)) {
+                    return Optional.of(new NextStep(pos, entry.blockState, false,
+                            "prepare natural site", true));
+                }
+                return Optional.of(new NextStep(pos, entry.blockState, true,
+                        "cell is occupied by a different block"));
+            }
+            if (!PlacementSupport.canPlace(level, state, pos)
+                    || !supportChainReady(level, project, blueprint, state, pos)) {
                 deferred.add(entry);
                 continue;
             }
@@ -230,6 +454,41 @@ public final class ConstructionManager extends SavedData {
                     "missing support at " + pos.getX() + "," + pos.getY() + "," + pos.getZ()));
         }
         return Optional.empty();
+    }
+
+    private boolean supportChainReady(ServerLevel level, ConstructionProject project,
+                                      Blueprint blueprint, BlockState state, BlockPos pos) {
+        BlockPos below = pos.below();
+        if (level.getBlockState(below).isFaceSturdy(level, below, Direction.UP)) return true;
+        Direction support = attachedSupport(state);
+        if (support == null) return true; // PlacementSupport already rejected this case.
+        BlockPos supportPos = pos.relative(support);
+        if (!blueprint.containsRelative(supportPos.getX() - project.originX,
+                supportPos.getY() - project.originY,
+                supportPos.getZ() - project.originZ)) return true;
+        String key = project.key(supportPos.getX(), supportPos.getY(), supportPos.getZ());
+        if (project.placed.contains(key) || project.ownedCells.contains(key)) return true;
+        for (Blueprint.BlockEntry entry : blueprint.entries()) {
+            if (project.originX + entry.x == supportPos.getX()
+                    && project.originY + entry.y == supportPos.getY()
+                    && project.originZ + entry.z == supportPos.getZ()) {
+                BlockState expected = parseState(level, entry.blockState);
+                return expected != null && level.getBlockState(supportPos).equals(expected);
+            }
+        }
+        return true;
+    }
+
+    private static Direction attachedSupport(BlockState state) {
+        if (state.hasProperty(net.minecraft.world.level.block.state.properties.BlockStateProperties.HORIZONTAL_FACING)) {
+            Direction direction = state.getValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.HORIZONTAL_FACING);
+            if (direction.getAxis().isHorizontal()) return direction.getOpposite();
+        }
+        if (state.hasProperty(net.minecraft.world.level.block.state.properties.BlockStateProperties.FACING)) {
+            Direction direction = state.getValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.FACING);
+            if (direction.getAxis().isHorizontal()) return direction.getOpposite();
+        }
+        return null;
     }
 
     public static BlockState parseState(ServerLevel level, String blockStateString) {
@@ -247,12 +506,20 @@ public final class ConstructionManager extends SavedData {
         public final String blockState;
         public final boolean unsupported;
         public final String detail;
+        /** The worker must remove natural terrain before placing this entry. */
+        public final boolean clearExisting;
 
         public NextStep(BlockPos pos, String blockState, boolean unsupported, String detail) {
+            this(pos, blockState, unsupported, detail, false);
+        }
+
+        public NextStep(BlockPos pos, String blockState, boolean unsupported, String detail,
+                        boolean clearExisting) {
             this.pos = pos;
             this.blockState = blockState;
             this.unsupported = unsupported;
             this.detail = detail;
+            this.clearExisting = clearExisting;
         }
     }
 
@@ -274,6 +541,9 @@ public final class ConstructionManager extends SavedData {
                 placedList.add(StringTag.valueOf(key));
             }
             t.put("placed", placedList);
+            ListTag ownedList = new ListTag();
+            for (String key : p.ownedCells) ownedList.add(StringTag.valueOf(key));
+            t.put("owned", ownedList);
             list.add(t);
         }
         tag.put("projects", list);
@@ -299,7 +569,13 @@ public final class ConstructionManager extends SavedData {
             p.createdAtGameTime = t.getLong("created");
             ListTag placedList = t.getList("placed", Tag.TAG_STRING);
             for (int j = 0; j < placedList.size(); j++) {
-                p.placed.add(placedList.getString(j));
+                String key = placedList.getString(j);
+                p.placed.add(key);
+                p.ownedCells.add(key); // migrate pre-ownership saves safely
+            }
+            ListTag ownedList = t.getList("owned", Tag.TAG_STRING);
+            for (int j = 0; j < ownedList.size(); j++) {
+                p.ownedCells.add(ownedList.getString(j));
             }
             manager.projects.put(p.id, p);
         }

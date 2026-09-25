@@ -34,7 +34,10 @@ public final class StorageManager extends SavedData {
         if (storageId != null && !storageId.isEmpty() && !"nearest".equals(storageId)) {
             StorageNode node = manager.nodes.get(storageId);
             if (node != null && isLive(level, node)) return node;
-            if (node != null) manager.remove(node.storageId);
+            // Keep an unloaded registration: absence from the loaded world is
+            // not evidence that a player removed the chest.  Once the chunk is
+            // loaded, active()/nearest() will validate and remove it if stale.
+            if (node != null && level.isLoaded(node.containerPos())) manager.remove(node.storageId);
         }
         return null;
     }
@@ -109,10 +112,10 @@ public final class StorageManager extends SavedData {
         return best;
     }
 
-    /** Loaded positions are checked against Minecraft; unloaded ones are left intact. */
+    /** Only loaded, still-existing containers are live work destinations. */
     private static boolean isLive(ServerLevel level, StorageNode node) {
         BlockPos pos = node.containerPos();
-        if (!level.isLoaded(pos)) return true;
+        if (!level.isLoaded(pos)) return false;
         return StorageDiscovery.isStorageBlock(level, pos)
                 && level.getBlockEntity(pos) instanceof Container;
     }

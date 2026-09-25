@@ -50,6 +50,11 @@ public final class SkillContext {
     }
 
     public boolean timedOut(long now) {
-        return timeoutTicks > 0 && now - startGameTime > timeoutTicks;
+        return timedOut(now, timeoutTicks);
+    }
+
+    /** Timed out against a budget the caller sized for the running skill. */
+    public boolean timedOut(long now, int budgetTicks) {
+        return budgetTicks > 0 && now - startGameTime > budgetTicks;
     }
 }

@@ -103,6 +103,13 @@ public final class ResourceFamily {
         if (isStone(itemId)) {
             return new LinkedHashSet<>(STONE_ITEMS);
         }
+        // Charcoal is coal for every purpose a colony has: it lights the same
+        // torch and fires the same furnace. Treating them as different items
+        // meant a settlement with a forest and no coal seam could never make a
+        // torch, however much charcoal it had burned.
+        if (FUEL_ITEMS.contains(itemId)) {
+            return new LinkedHashSet<>(FUEL_ITEMS);
+        }
         return Set.of(itemId);
     }
 
@@ -110,6 +117,10 @@ public final class ResourceFamily {
     public static boolean satisfies(String wanted, String candidate) {
         return candidate != null && equivalentItems(wanted).contains(candidate);
     }
+
+    /** Fuels that are interchangeable in every recipe the colony uses. */
+    private static final Set<String> FUEL_ITEMS =
+            new LinkedHashSet<>(List.of("minecraft:coal", "minecraft:charcoal"));
 
     /** True when this item has substitutes at all — most do not. */
     public static boolean hasSubstitutes(String itemId) {

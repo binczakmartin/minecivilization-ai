@@ -48,13 +48,15 @@ final class SkillNavigation {
             context.navigator.stop();
             return SkillResult.COMPLETED;
         }
+        context.citizen.clearWorkAnimation();
 
         CitizenSkill traverse = context.get(key, (CitizenSkill) null);
         if (traverse != null) {
             return tickTraverse(context, traverse, key);
         }
 
-        context.navigator.moveTo(target, 1.0);
+        context.navigator.requestSafeStep();
+        context.navigator.moveToSafe(target, 1.0);
         context.navigator.tick();
         if (!context.navigator.hasFailed()) {
             return SkillResult.RUNNING;

@@ -20,10 +20,28 @@ public final class ColonyData extends SavedData {
     private long lastBirthTick = Long.MIN_VALUE;
     private int births;
     private int deaths;
+    /** What the settlement calls itself — written on the town hall sign. */
+    private String name = "Colony";
 
     public static ColonyData get(ServerLevel level) {
         return level.getDataStorage().computeIfAbsent(
                 new SavedData.Factory<>(ColonyData::new, ColonyData::load, null), KEY);
+    }
+
+    /**
+     * The settlement's name, for signs, the notice board and the event feed.
+     *
+     * <p>Never empty: a nameless colony would produce a blank town hall sign,
+     * which is worse than a generic one.</p>
+     */
+    public String name() {
+        return name == null || name.isBlank() ? "Colony" : name;
+    }
+
+    public void rename(String newName) {
+        if (newName == null || newName.isBlank() || newName.equals(name)) return;
+        this.name = newName.length() > 32 ? newName.substring(0, 32) : newName;
+        setDirty();
     }
 
     /** Game time the colony was first recognised, or -1 before then. */
@@ -76,6 +94,7 @@ public final class ColonyData extends SavedData {
         tag.putLong("lastBirth", lastBirthTick);
         tag.putInt("births", births);
         tag.putInt("deaths", deaths);
+        tag.putString("name", name());
         return tag;
     }
 
@@ -86,6 +105,7 @@ public final class ColonyData extends SavedData {
         data.lastBirthTick = tag.contains("lastBirth") ? tag.getLong("lastBirth") : Long.MIN_VALUE;
         data.births = tag.getInt("births");
         data.deaths = tag.getInt("deaths");
+        if (tag.contains("name")) data.name = tag.getString("name");
         return data;
     }
 }

@@ -1,6 +1,7 @@
 package ai.minecivilization.skills.impl;
 
 import ai.minecivilization.entity.CitizenEntity;
+import ai.minecivilization.entity.WorkAnimation;
 import ai.minecivilization.skills.CitizenSkill;
 import ai.minecivilization.skills.SkillContext;
 import ai.minecivilization.skills.SkillFailure;
@@ -44,6 +45,7 @@ public final class EatSkill implements CitizenSkill {
             context.fail(new SkillFailure("INVALID_FOOD", "item is not food", true));
             return SkillResult.FAILED;
         }
+        context.citizen.animateAction(WorkAnimation.EAT, null);
         context.citizen.setHunger(Math.min(CitizenEntity.HUNGER_FULL,
                 context.citizen.getHunger()
                         + CitizenEntity.hungerForNutrition(properties.nutrition())));

@@ -1,5 +1,6 @@
 package ai.minecivilization.skills.impl;
 
+import ai.minecivilization.entity.WorkAnimation;
 import ai.minecivilization.inventory.CitizenInventory;
 import ai.minecivilization.skills.CitizenSkill;
 import ai.minecivilization.skills.SkillContext;
@@ -84,6 +85,7 @@ public final class SmeltItemSkill implements CitizenSkill {
     }
 
     private SkillResult move(SkillContext context) {
+        context.citizen.clearWorkAnimation();
         BlockPos pos = context.get("pos", (BlockPos) null);
         if (pos == null) {
             context.put("phase", Phase.FIND);
@@ -101,6 +103,7 @@ public final class SmeltItemSkill implements CitizenSkill {
     }
 
     private SkillResult work(SkillContext context) {
+        context.citizen.clearWorkAnimation();
         BlockPos pos = context.get("pos", (BlockPos) null);
         if (pos == null) {
             context.put("phase", Phase.FIND);
@@ -193,6 +196,8 @@ public final class SmeltItemSkill implements CitizenSkill {
 
         int leftover = inventory.insert(output.copy());
         int moved = output.getCount() - leftover;
+        if (moved > 0) context.citizen.animateAction(WorkAnimation.SMELT,
+                context.get("pos", (BlockPos) null));
         if (moved > 0) {
             output.shrink(moved);
             if (output.isEmpty()) {
@@ -272,7 +277,11 @@ public final class SmeltItemSkill implements CitizenSkill {
             if (stack.isEmpty()) inventory.set(i, ItemStack.EMPTY);
             moved += take;
         }
-        if (moved > 0) furnace.setChanged();
+        if (moved > 0) {
+            context.citizen.animateAction(WorkAnimation.SMELT,
+                    context.get("pos", (BlockPos) null));
+            furnace.setChanged();
+        }
         return moved;
     }
 
@@ -296,6 +305,10 @@ public final class SmeltItemSkill implements CitizenSkill {
     @Override
     public void cancel(SkillContext context) {
         context.navigator.stop();
+        // Hand the workbench back. The claim would lapse on its own, but a
+        // minute of a station nobody is standing at is a minute the colony
+        // queues behind it.
+        BlockScanner.releaseStation(context);
     }
 
     @Override

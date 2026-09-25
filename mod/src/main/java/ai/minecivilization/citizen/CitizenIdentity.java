@@ -41,9 +41,54 @@ public final class CitizenIdentity {
         return ROLES[Math.floorMod(population, ROLES.length)];
     }
 
-    /** A fresh random display name (role assignment stays deterministic). */
+    /**
+     * A display name nobody in the colony is using yet.
+     *
+     * <p>Picking uniformly from sixteen names gave a colony of sixteen four
+     * citizens called Hugo and three called Noor. That is not cosmetic: every
+     * command that takes a citizen name resolves to whichever duplicate comes
+     * first, so half the settlement became unaddressable — you could not
+     * inspect, track or rescue the citizen you meant.</p>
+     *
+     * <p>Once the pool is exhausted, names are numbered rather than repeated:
+     * "Hugo II" is still a name you can type.</p>
+     */
     public static String randomName(net.minecraft.util.RandomSource random) {
-        return NAMES[random.nextInt(NAMES.length)];
+        return uniqueName(random, taken());
+    }
+
+    /** Names currently in use anywhere in the colony. */
+    private static java.util.Set<String> taken() {
+        java.util.Set<String> used = new java.util.HashSet<>();
+        for (var citizen : ai.minecivilization.entity.CitizenIndex.all()) {
+            String name = citizen.getIdentity().name;
+            if (name != null) used.add(name);
+        }
+        return used;
+    }
+
+    /** Pure name choice, so the uniqueness rule is testable without a world. */
+    static String uniqueName(net.minecraft.util.RandomSource random,
+                             java.util.Set<String> used) {
+        int start = random.nextInt(NAMES.length);
+        for (int i = 0; i < NAMES.length; i++) {
+            String candidate = NAMES[(start + i) % NAMES.length];
+            if (!used.contains(candidate)) return candidate;
+        }
+        // Everybody's first name is taken: start a second generation.
+        String base = NAMES[start];
+        for (int generation = 2; generation < 1000; generation++) {
+            String candidate = base + " " + roman(generation);
+            if (!used.contains(candidate)) return candidate;
+        }
+        return base;
+    }
+
+    /** Small roman numerals, which read as names rather than as ids. */
+    static String roman(int value) {
+        String[] numerals = {"II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X"};
+        return value >= 2 && value - 2 < numerals.length
+                ? numerals[value - 2] : String.valueOf(value);
     }
 
     /** Fresh identity for a newly spawned citizen (role left UNASSIGNED:

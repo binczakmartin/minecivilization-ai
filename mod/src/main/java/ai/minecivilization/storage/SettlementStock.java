@@ -1,7 +1,10 @@
 package ai.minecivilization.storage;
 
+import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Set;
 
 import ai.minecivilization.inventory.CitizenInventory;
 import net.minecraft.core.BlockPos;
@@ -38,13 +41,14 @@ public final class SettlementStock {
      */
     public static Map<String, Integer> totals(ServerLevel level, BlockPos from, int radius) {
         Map<String, Integer> totals = new LinkedHashMap<>();
+        Set<Container> seenContainers = Collections.newSetFromMap(new IdentityHashMap<>());
         long limit = (long) radius * radius;
 
         for (StorageNode node : StorageManager.get(level).all()) {
             if (!node.isPublic()) continue;
             if (node.containerPos().distSqr(from) > limit) continue;
             Container container = containerAt(level, node);
-            if (container == null) continue;
+            if (container == null || !seenContainers.add(container)) continue;
 
             for (int slot = 0; slot < container.getContainerSize(); slot++) {
                 ItemStack stack = container.getItem(slot);

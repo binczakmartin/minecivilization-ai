@@ -1,7 +1,9 @@
 package ai.minecivilization.skills.impl;
 
+import ai.minecivilization.entity.WorkAnimation;
 import ai.minecivilization.farming.Crops;
 import ai.minecivilization.skills.*;
+import ai.minecivilization.navigation.PlacementSafety;
 import ai.minecivilization.navigation.SpiralScan;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
@@ -32,7 +34,9 @@ public final class CultivateSkill implements CitizenSkill {
         return -1;
     }
     private boolean viable(SkillContext c, BlockPos ground) {
-        if (!c.level.isLoaded(ground) || rejected.contains(ground)) return false;
+        if (!c.level.isLoaded(ground) || rejected.contains(ground)
+                || ai.minecivilization.construction.ConstructionManager.get(c.level)
+                .protectsCell(ground)) return false;
         BlockPos support = ground.below();
         if (!c.level.getBlockState(support).isFaceSturdy(c.level, support, Direction.UP)) {
             return false;
@@ -79,10 +83,22 @@ public final class CultivateSkill implements CitizenSkill {
         }
         if (arrival == SkillResult.RUNNING) return arrival;
         c.navigator.stop();
+        if (!PlacementSafety.canOccupy(c.level, c.citizen, target, false)) {
+            rejected.add(target); target = null; filling = false; c.failure = null;
+            return SkillResult.RUNNING;
+        }
         if (filling) {
             var inv = c.citizen.getInventory();
+            if (ai.minecivilization.construction.ConstructionManager.get(c.level)
+                    .protectsCell(target)) {
+                rejected.add(target); target = null; filling = false;
+                return SkillResult.RUNNING;
+            }
             if (inv.containsAtLeast("minecraft:bucket", 1) && c.level.getBlockState(target).is(Blocks.WATER)
-                    && c.level.getFluidState(target).isSource() && c.level.setBlock(target, Blocks.AIR.defaultBlockState(), 3)) {
+                    && c.level.getFluidState(target).isSource()
+                    && c.level.setBlock(target, Blocks.AIR.defaultBlockState(), 3)
+                    && c.level.getBlockState(target).isAir()) {
+                c.citizen.animateAction(WorkAnimation.REACH, target);
                 inv.extract("minecraft:bucket", 1);
                 int left = inv.insert(new ItemStack(Items.WATER_BUCKET));
                 if (left > 0) c.citizen.spawnAtLocation(new ItemStack(Items.WATER_BUCKET, left));
@@ -91,11 +107,17 @@ public final class CultivateSkill implements CitizenSkill {
             return SkillResult.RUNNING;
         }
         if (Crops.needsFarmland(seed) && !c.level.getBlockState(target).is(Blocks.FARMLAND)) {
-            int slot = hoe(c);
-            if (slot < 0) { target = null; return SkillResult.RUNNING; }
-            if (!c.level.setBlock(target, Blocks.FARMLAND.defaultBlockState(), 3)) {
+            if (ai.minecivilization.construction.ConstructionManager.get(c.level)
+                    .protectsCell(target)) {
                 rejected.add(target); target = null; return SkillResult.RUNNING;
             }
+            int slot = hoe(c);
+            if (slot < 0) { target = null; return SkillResult.RUNNING; }
+            if (!c.level.setBlock(target, Blocks.FARMLAND.defaultBlockState(), 3)
+                    || !c.level.getBlockState(target).equals(Blocks.FARMLAND.defaultBlockState())) {
+                rejected.add(target); target = null; return SkillResult.RUNNING;
+            }
+            c.citizen.animateAction(WorkAnimation.TILL, target);
             ItemStack tool = c.citizen.getInventory().getItem(slot);
             tool.setDamageValue(tool.getDamageValue() + 1);
             if (tool.getDamageValue() >= tool.getMaxDamage()) c.citizen.getInventory().setItem(slot, ItemStack.EMPTY);
@@ -130,7 +152,11 @@ public final class CultivateSkill implements CitizenSkill {
                 BlockPos wall = basin.relative(side);
                 if (!c.level.getBlockState(wall).isFaceSturdy(c.level, wall, side.getOpposite())) enclosed = false;
             }
-            if (!enclosed || !c.level.setBlock(basin, Blocks.WATER.defaultBlockState(), 3)) continue;
+            if (!enclosed || ai.minecivilization.construction.ConstructionManager.get(c.level)
+                    .protectsCell(basin)
+                    || !PlacementSafety.canOccupy(c.level, c.citizen, basin, false)) continue;
+            if (!c.level.setBlock(basin, Blocks.WATER.defaultBlockState(), 3)) continue;
+            c.citizen.animateAction(WorkAnimation.REACH, basin);
             inv.extract("minecraft:water_bucket", 1);
             int remainder = inv.insert(new ItemStack(Items.BUCKET));
             if (remainder > 0) c.citizen.spawnAtLocation(new ItemStack(Items.BUCKET, remainder));

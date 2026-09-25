@@ -165,4 +165,130 @@ class TreeShapeTest {
         List<BlockPos> b = TreeShape.collect(new BlockPos(0, GROUND, 0), in(logs), in(leaves));
         assertEquals(a, b, "a retry must fell in the same order");
     }
+
+    // ------------------------------------------------------------------ leaving no trace
+
+    /**
+     * Felling has to take the canopy too.
+     *
+     * <p>Taking only the logs leaves the foliage hanging in the air, which is
+     * what a worked forest actually looked like: stumps gone, green clouds
+     * still floating. The canopy is also where the saplings for replanting
+     * come from, so the tree pays for its own replacement.</p>
+     */
+    @Test
+    void theCanopyComesDownWithTheTrunk() {
+        Set<BlockPos> logs = plainOak(0, 0);
+        Set<BlockPos> leaves = canopyAround(0, 0, GROUND + 4);
+
+        List<BlockPos> canopy = TreeShape.canopy(logs, leaves::contains);
+        assertFalse(canopy.isEmpty(), "a leafy tree must yield a canopy");
+        for (BlockPos leaf : leaves) {
+            // The canopy in this fixture overlaps the top of the trunk. A cell
+            // that is both is a log: it is felled either way, and counting it
+            // twice would have the lumberjack swing at thin air.
+            if (logs.contains(leaf)) continue;
+            assertTrue(canopy.contains(leaf), "left a leaf behind at " + leaf);
+        }
+    }
+
+    @Test
+    void theCanopyNeverIncludesTheTrunkItself() {
+        Set<BlockPos> logs = plainOak(0, 0);
+        Set<BlockPos> leaves = canopyAround(0, 0, GROUND + 4);
+
+        for (BlockPos leaf : TreeShape.canopy(logs, leaves::contains)) {
+            assertFalse(logs.contains(leaf), "counted a log as a leaf: " + leaf);
+        }
+    }
+
+    @Test
+    void aDistantWallOfLeavesIsNotThisTreesCanopy() {
+        // Touching canopies in a jungle are one connected region the size of
+        // the biome. A lumberjack must take its own tree, not the forest.
+        Set<BlockPos> logs = plainOak(0, 0);
+        Set<BlockPos> leaves = new HashSet<>(canopyAround(0, 0, GROUND + 4));
+        for (int dx = 0; dx < 40; dx++) {
+            leaves.add(new BlockPos(3 + dx, GROUND + 5, 0));
+        }
+
+        List<BlockPos> canopy = TreeShape.canopy(logs, leaves::contains);
+        assertTrue(canopy.size() <= TreeShape.MAX_CANOPY);
+        assertFalse(canopy.contains(new BlockPos(40, GROUND + 5, 0)),
+                "followed a leaf bridge into the next tree");
+    }
+
+    @Test
+    void anEmptySkyYieldsNoCanopy() {
+        assertTrue(TreeShape.canopy(plainOak(0, 0), p -> false).isEmpty());
+        assertTrue(TreeShape.canopy(Set.of(), p -> true).isEmpty());
+    }
+
+    @Test
+    void everyLogComesBeforeAnyLeaf() {
+        // Interleaving the canopy by height is much worse than it sounds. An
+        // acacia's leaves sit at the same height as its upper trunk, so a
+        // citizen that wanted one log spent four minutes on a hundred and
+        // forty leaves before the tree came down. Taking the trunk out first
+        // means the tree is gone in seconds and decay handles the rest.
+        Set<BlockPos> logs = plainOak(0, 0);
+        Set<BlockPos> leaves = canopyAround(0, 0, GROUND + 2);   // overlaps the trunk
+
+        List<BlockPos> order = TreeShape.fellingOrder(
+                TreeShape.collect(new BlockPos(0, GROUND, 0), logs::contains, leaves::contains),
+                TreeShape.canopy(logs, leaves::contains));
+
+        boolean seenLeaf = false;
+        for (BlockPos pos : order) {
+            boolean isLog = logs.contains(pos);
+            if (!isLog) seenLeaf = true;
+            else assertFalse(seenLeaf, "a log is queued behind a leaf at " + pos);
+        }
+    }
+
+    @Test
+    void theTrunkIsFelledBottomUpSoTheCitizenCanClimbIt() {
+        // A lumberjack reaches the top of a tree by climbing the part of it
+        // that is still standing, so the logs have to be lowest first.
+        Set<BlockPos> logs = plainOak(0, 0);
+        Set<BlockPos> leaves = canopyAround(0, 0, GROUND + 4);
+
+        List<BlockPos> order = TreeShape.fellingOrder(
+                TreeShape.collect(new BlockPos(0, GROUND, 0), logs::contains, leaves::contains),
+                TreeShape.canopy(logs, leaves::contains));
+
+        int previousY = Integer.MIN_VALUE;
+        for (BlockPos pos : order) {
+            if (!logs.contains(pos)) break;   // into the canopy; ordering restarts
+            assertTrue(pos.getY() >= previousY, "trunk order goes back down at " + pos);
+            previousY = pos.getY();
+        }
+    }
+
+    @Test
+    void theWorkOrderCoversEveryLogAndEveryLeafExactlyOnce() {
+        Set<BlockPos> logs = plainOak(0, 0);
+        Set<BlockPos> leaves = canopyAround(0, 0, GROUND + 4);
+
+        List<BlockPos> collected =
+                TreeShape.collect(new BlockPos(0, GROUND, 0), logs::contains, leaves::contains);
+        List<BlockPos> canopy = TreeShape.canopy(logs, leaves::contains);
+        List<BlockPos> order = TreeShape.fellingOrder(collected, canopy);
+
+        assertEquals(order.size(), new HashSet<>(order).size(), "a cell is worked twice");
+        for (BlockPos log : logs) {
+            assertTrue(order.contains(log), "the work order skips a log at " + log);
+        }
+        for (BlockPos leaf : leaves) {
+            if (logs.contains(leaf)) continue;   // felled as a log, see above
+            assertTrue(order.contains(leaf), "the work order skips a leaf at " + leaf);
+        }
+    }
+
+    @Test
+    void aTrunkWithNoCanopyStillProducesAWorkOrder() {
+        Set<BlockPos> logs = plainOak(0, 0);
+        List<BlockPos> order = TreeShape.fellingOrder(List.copyOf(logs), List.of());
+        assertEquals(logs.size(), order.size());
+    }
 }

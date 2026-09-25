@@ -1,5 +1,6 @@
 package ai.minecivilization.skills.impl;
 
+import ai.minecivilization.entity.WorkAnimation;
 import ai.minecivilization.inventory.CitizenInventory;
 import ai.minecivilization.skills.CitizenSkill;
 import ai.minecivilization.skills.SkillContext;
@@ -34,7 +35,15 @@ public final class DepositItemSkill implements CitizenSkill {
 
     @Override
     public boolean canStart(SkillContext context) {
-        return StorageManager.resolve(context.level, context.params.target) != null;
+        StorageNode node = StorageManager.resolve(context.level, context.params.target);
+        return node != null && canAccess(context, node);
+    }
+
+    private static boolean canAccess(SkillContext context, StorageNode node) {
+        if (node == null) return false;
+        if (node.isPublic()) return true;
+        return node.ownerId != null && node.ownerId.equals(
+                context.citizen.getIdentity().citizenId.toString());
     }
 
     @Override
@@ -49,8 +58,8 @@ public final class DepositItemSkill implements CitizenSkill {
     @Override
     public SkillResult tick(SkillContext context) {
         StorageNode node = context.get("node", (StorageNode) null);
-        if (node == null) {
-            context.fail(SkillFailure.notFound("no registered storage available"));
+        if (node == null || !canAccess(context, node)) {
+            context.fail(SkillFailure.notFound("no accessible registered storage available"));
             return SkillResult.FAILED;
         }
         BlockPos pos = context.get("pos", (BlockPos) null);
@@ -98,6 +107,7 @@ public final class DepositItemSkill implements CitizenSkill {
 
             int moved = insertInto(container, context.citizen.getInventory().items().get(slot), want);
             if (moved > 0) {
+                context.citizen.animateAction(WorkAnimation.REACH, pos);
                 stack.shrink(moved);
                 if (stack.isEmpty()) {
                     context.citizen.getInventory().items().set(slot, ItemStack.EMPTY);

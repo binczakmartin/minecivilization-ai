@@ -31,6 +31,8 @@ public final class TerrainPlan {
         WALK,
         /** Walk up one block. */
         STEP_UP,
+        /** Build a supported stair in the adjacent floor cell and step onto it. */
+        STAIR_UP,
         /** Walk down one block. */
         STEP_DOWN,
         /** Controlled drop of 2–3 blocks onto existing ground. */
@@ -39,6 +41,8 @@ public final class TerrainPlan {
         BRIDGE,
         /** Blocks removed at body height, then walked through. */
         DIG_THROUGH,
+        /** Swum through water — no floor needed, and up counts as a direction. */
+        SWIM,
         /** Block placed under one's own feet to gain a level. */
         PILLAR_UP,
         /** Block removed under one's own feet to descend. */
@@ -48,15 +52,23 @@ public final class TerrainPlan {
     public static final class Op {
         public final OpKind kind;
         public final BlockPos pos;
+        /** Optional physical variant, e.g. a stair facing for a built step. */
+        public final String variant;
 
         public Op(OpKind kind, BlockPos pos) {
+            this(kind, pos, "");
+        }
+
+        public Op(OpKind kind, BlockPos pos, String variant) {
             this.kind = kind;
             this.pos = pos.immutable();
+            this.variant = variant == null ? "" : variant;
         }
 
         @Override
         public String toString() {
-            return kind + "@" + pos.getX() + "," + pos.getY() + "," + pos.getZ();
+            return kind + "@" + pos.getX() + "," + pos.getY() + "," + pos.getZ()
+                    + (variant.isEmpty() ? "" : "[" + variant + "]");
         }
     }
 

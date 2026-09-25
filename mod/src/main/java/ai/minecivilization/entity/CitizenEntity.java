@@ -11,6 +11,7 @@ import ai.minecivilization.construction.ConstructionProject;
 import ai.minecivilization.inventory.CitizenInventory;
 import ai.minecivilization.navigation.CitizenNavigator;
 import ai.minecivilization.skills.SkillFailure;
+import ai.minecivilization.skills.SkillType;
 import com.mojang.logging.LogUtils;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
@@ -35,6 +36,7 @@ import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.Mob;
 import net.minecraft.world.entity.MobSpawnType;
 import net.minecraft.world.entity.PathfinderMob;
+import net.minecraft.world.entity.Pose;
 import net.minecraft.world.entity.SpawnGroupData;
 import net.minecraft.world.entity.ai.attributes.AttributeInstance;
 import net.minecraft.world.entity.ai.attributes.AttributeSupplier;
@@ -82,6 +84,10 @@ public class CitizenEntity extends PathfinderMob {
      */
     private static final EntityDataAccessor<String> DATA_PROFESSION =
             SynchedEntityData.defineId(CitizenEntity.class, EntityDataSerializers.STRING);
+    private static final EntityDataAccessor<Byte> DATA_WORK_ACTION =
+            SynchedEntityData.defineId(CitizenEntity.class, EntityDataSerializers.BYTE);
+    private static final EntityDataAccessor<Long> DATA_WORK_ACTION_START =
+            SynchedEntityData.defineId(CitizenEntity.class, EntityDataSerializers.LONG);
 
     /** Melee reach in blocks (feet-to-feet) before the citizen swings. */
     private static final double ATTACK_REACH = 2.5;
@@ -124,12 +130,23 @@ public class CitizenEntity extends PathfinderMob {
      * restart is better forgotten than chased across a save.</p>
      */
     private final List<BlockPos> scaffoldPlaced = new ArrayList<>();
+    /** Exact state owned by each temporary support, so cleanup cannot remove a replacement. */
+    private final Map<BlockPos, BlockState> scaffoldStates = new HashMap<>();
 
     private CitizenIdentity identity = new CitizenIdentity();
     private CitizenPersonality personality = new CitizenPersonality();
     private final CitizenSkills skills = new CitizenSkills();
     private CitizenBrain brain;
     private CitizenNavigator navigator;
+    /**
+     * Breadcrumbs for the colony's road network.
+     *
+     * <p>Every journey this citizen completes is offered to the shared
+     * {@link ai.minecivilization.roads.PathMemory}. Nothing has to ask for a
+     * route to be recorded, which is why the network fills up at all.</p>
+     */
+    private final ai.minecivilization.roads.TripRecorder trips =
+            new ai.minecivilization.roads.TripRecorder();
     private String lastObservation = "{}";
     private boolean registeredWithService = false;
     private boolean workAllowed = true;
@@ -150,11 +167,31 @@ public class CitizenEntity extends PathfinderMob {
     private long combatNextAttackAt;
     private long combatLastRepathAt;
 
+    /** True while a route is being walked with edge protection. */
+    private boolean traversalSneak;
+    /** True while a terrain operation owns a scaffold/pillar transition. */
+    private boolean bracedPlacement;
+    /** Server-side timestamp of the last work pulse; never persisted. */
+    private long lastActionAnimationAt = Long.MIN_VALUE;
+    private long lastActionAnimationTick = Long.MIN_VALUE;
+    /** Prevents repeated emergency repositioning in the same wall. */
+    private int escapeCooldown;
+    /** True only during the atomic block-under-feet transaction. */
+    private boolean selfSupportTransaction;
+    /** Allows one explicitly planned FALL/DIG_DOWN edge. */
+    private boolean controlledDrop;
+
     public CitizenEntity(EntityType<? extends CitizenEntity> type, Level level) {
         super(type, level);
         this.setPersistenceRequired();
         this.xpReward = 5;
         // PathfinderMob already built `navigation` in super(); wrap it deterministically.
+        //
+        // Ground navigation refuses to enter water unless it is told it may
+        // float. Without this a citizen treated a stream as a wall, a lake as
+        // the edge of the world, and — having fallen into either — could not
+        // path its way out of the cell it was standing in.
+        this.navigation.setCanFloat(true);
         this.navigator = new CitizenNavigator(this, this.navigation);
         this.brain = new CitizenBrain(this);
     }
@@ -182,6 +219,8 @@ public class CitizenEntity extends PathfinderMob {
         builder.define(DATA_GOAL, "idle");
         builder.define(DATA_STATUS, "ok");
         builder.define(DATA_PROFESSION, "UNASSIGNED");
+        builder.define(DATA_WORK_ACTION, (byte) WorkAnimation.NONE.ordinal());
+        builder.define(DATA_WORK_ACTION_START, 0L);
     }
 
     /** The trade as the client knows it — the only version a renderer may trust. */
@@ -231,6 +270,125 @@ public class CitizenEntity extends PathfinderMob {
     /** Alias matching the call sites in skills/observation code. */
     public CitizenNavigator getNavigator() {
         return this.navigator;
+    }
+
+    /**
+     * Enable the short, edge-safe walking mode used by MOVE_TO and work-site
+     * approaches.  It is intentionally separate from braced scaffold work so
+     * combat, idle wandering and ordinary errands do not leave a citizen
+     * crouching forever.
+     */
+    public void setTraversalSneak(boolean sneaking) {
+        this.traversalSneak = sneaking;
+        updateWorkPose();
+    }
+
+    /** Keep the worker braced while it owns a pillar/bridge transaction. */
+    public void setBracedPlacement(boolean braced) {
+        this.bracedPlacement = braced;
+        updateWorkPose();
+    }
+
+    public boolean isSafeMovement() {
+        return this.traversalSneak || this.bracedPlacement;
+    }
+
+    public boolean isBracedPlacement() {
+        return this.bracedPlacement;
+    }
+
+    /** True while the current floor is one of this worker's temporary supports. */
+    public boolean isOnOwnedScaffold() {
+        return this.scaffoldPlaced.contains(this.blockPosition().below());
+    }
+
+    /** Mark the intentional, atomic pillar placement window. */
+    public void beginSelfSupportTransaction() {
+        this.selfSupportTransaction = true;
+    }
+
+    public void endSelfSupportTransaction() {
+        this.selfSupportTransaction = false;
+    }
+
+    public void setControlledDrop(boolean allowed) {
+        this.controlledDrop = allowed;
+    }
+
+    private void updateWorkPose() {
+        boolean crouching = isSafeMovement();
+        this.setShiftKeyDown(crouching);
+        if (crouching) {
+            this.setPose(Pose.CROUCHING);
+        } else if (this.level() == null || canStandAtCurrentPosition()) {
+            this.setPose(Pose.STANDING);
+        }
+    }
+
+    private boolean canStandAtCurrentPosition() {
+        if (this.level() == null) return true;
+        var dimensions = this.getDimensions(Pose.STANDING);
+        return this.level().noCollision(this,
+                dimensions.makeBoundingBox(this.getX(), this.getY(), this.getZ()));
+    }
+
+    /** Start/repeat a generic work pulse (kept for small legacy skills). */
+    public void animateAction() {
+        animateAction(WorkAnimation.REACH, null);
+    }
+
+    /**
+     * Publish a semantic work gesture and a vanilla arm-swing pulse together.
+     * The timestamp is server game time, so the pulse remains rate-limited even
+     * when several nested skills touch the same citizen in one tick.
+     */
+    public void animateAction(WorkAnimation action, @Nullable BlockPos target) {
+        if (action == null || action == WorkAnimation.NONE) {
+            clearWorkAnimation();
+            return;
+        }
+        if (this.level() == null || this.level().isClientSide) return;
+
+        long now = this.level().getGameTime();
+        if (target != null) {
+            this.lookControl.setLookAt(Vec3.atCenterOf(target));
+        }
+        WorkAnimation current = getWorkAnimation();
+        boolean changed = current != action;
+        boolean due = lastActionAnimationAt == Long.MIN_VALUE
+                || now < lastActionAnimationAt
+                || now - lastActionAnimationAt >= action.intervalTicks();
+        if (!changed && !due) return;
+
+        this.entityData.set(DATA_WORK_ACTION, (byte) action.ordinal());
+        this.entityData.set(DATA_WORK_ACTION_START, now);
+        this.lastActionAnimationAt = now;
+        refreshEquipmentDisplay();
+        if (lastActionAnimationTick == now) {
+            lastActionAnimationTick = now;
+            return;
+        }
+        lastActionAnimationTick = now;
+        // true broadcasts to the server's nearby players, including the owner.
+        this.swing(InteractionHand.MAIN_HAND, true);
+    }
+
+    public WorkAnimation getWorkAnimation() {
+        return WorkAnimation.byOrdinal(this.entityData.get(DATA_WORK_ACTION));
+    }
+
+    public long getWorkAnimationStart() {
+        return this.entityData.get(DATA_WORK_ACTION_START);
+    }
+
+    public void clearWorkAnimation() {
+        if (getWorkAnimation() != WorkAnimation.NONE) {
+            this.entityData.set(DATA_WORK_ACTION, (byte) WorkAnimation.NONE.ordinal());
+            this.entityData.set(DATA_WORK_ACTION_START, 0L);
+            refreshEquipmentDisplay();
+        }
+        this.lastActionAnimationAt = Long.MIN_VALUE;
+        this.lastActionAnimationTick = Long.MIN_VALUE;
     }
 
     public TaskExecutor getExecutor() {
@@ -510,6 +668,9 @@ public class CitizenEntity extends PathfinderMob {
         if (this.level().isClientSide) {
             return;
         }
+        this.setTraversalSneak(false);
+        this.setBracedPlacement(false);
+        this.setControlledDrop(false);
         if (this.identity.citizenId == null) {
             this.identity.citizenId = this.getUUID();
         }
@@ -553,17 +714,29 @@ public class CitizenEntity extends PathfinderMob {
         this.markDirty();
     }
 
-    /** Record a throwaway block so it can be taken down again afterwards. */
-    public void rememberScaffold(BlockPos pos) {
+    /** Record a throwaway block and the exact state placed there. */
+    public void rememberScaffold(BlockPos pos, BlockState state) {
         if (pos == null) return;
         BlockPos immutable = pos.immutable();
         if (!this.scaffoldPlaced.contains(immutable)) {
             this.scaffoldPlaced.add(immutable);
         }
-        // A citizen should never be dragging a hundred of these around.
-        while (this.scaffoldPlaced.size() > 64) {
-            this.scaffoldPlaced.remove(0);
+        if (state != null) this.scaffoldStates.put(immutable, state);
+        // A citizen should never be dragging a hundred of these around. Keep
+        // the state map in sync rather than silently losing cleanup ownership.
+        while (this.scaffoldPlaced.size() > 256) {
+            BlockPos oldest = this.scaffoldPlaced.remove(0);
+            this.scaffoldStates.remove(oldest);
         }
+    }
+
+    /** Compatibility overload for callers that only have a position. */
+    public void rememberScaffold(BlockPos pos) {
+        rememberScaffold(pos, null);
+    }
+
+    public BlockState scaffoldState(BlockPos pos) {
+        return pos == null ? null : this.scaffoldStates.get(pos.immutable());
     }
 
     /** Throwaway blocks still standing, highest first — take a tower down from the top. */
@@ -574,11 +747,15 @@ public class CitizenEntity extends PathfinderMob {
     }
 
     public void forgetScaffold(BlockPos pos) {
-        this.scaffoldPlaced.remove(pos);
+        if (pos == null) return;
+        BlockPos immutable = pos.immutable();
+        this.scaffoldPlaced.remove(immutable);
+        this.scaffoldStates.remove(immutable);
     }
 
     public void forgetAllScaffold() {
         this.scaffoldPlaced.clear();
+        this.scaffoldStates.clear();
     }
 
     public void applyIdentityName() {
@@ -635,7 +812,27 @@ public class CitizenEntity extends PathfinderMob {
             return;
         }
         ServerLevel server = (ServerLevel) this.level();
+        if (this.escapeCooldown > 0) this.escapeCooldown--;
+        // A combat cancel or timeout must not leave a worker standing on a
+        // temporary tower without the same edge guard used by normal TRAVERSE.
+        if (!this.bracedPlacement && this.isOnOwnedScaffold()) {
+            this.setBracedPlacement(true);
+        }
         long time = server.getGameTime();
+
+        // Account for this tick before anything can return early. "They spend
+        // most of their time doing nothing" is either the most important fact
+        // about this colony or a misreading, and only a running total can say.
+        ai.minecivilization.telemetry.ActivityLedger.sample(this, time);
+
+        // Leave a trail. A journey that ends somewhere becomes a route the
+        // whole colony can follow, and eventually a road it maintains.
+        ai.minecivilization.roads.Route learned = this.trips.tick(server, this.blockPosition());
+        if (learned != null && learned.uses == 1) {
+            ai.minecivilization.telemetry.ColonyEventLog.of(server).infrastructure(server,
+                    "a new route is known: " + learned.displayName()
+                            + " (" + learned.lengthBlocks + " blocks)");
+        }
 
         // Passive hunger: work costs energy, doing nothing costs less.
         if (time % 40 == 0) {
@@ -655,6 +852,20 @@ public class CitizenEntity extends PathfinderMob {
             this.syncEquipmentDisplay();
         }
         boolean fighting = this.tickCombat(server, time);
+        if (this.bracedPlacement && !this.isOnOwnedScaffold()
+                && !this.executor.hasActiveTask() && !fighting) {
+            this.setBracedPlacement(false);
+        }
+        SkillType activeSkill = this.executor.activeSkillType();
+        if (!fighting && (!this.executor.hasActiveTask()
+                || activeSkill == null
+                || activeSkill == SkillType.IDLE
+                || activeSkill == SkillType.MOVE_TO
+                || activeSkill == SkillType.TRAVERSE
+                || activeSkill == SkillType.FIND_BLOCK
+                || activeSkill == SkillType.SLEEP)) {
+            this.clearWorkAnimation();
+        }
 
         // GOAL -> TASK -> SKILL: the deterministic brain runs the current plan and
         // only asks the AI service for a new decision when there is nothing to do
@@ -709,14 +920,18 @@ public class CitizenEntity extends PathfinderMob {
         return true;
     }
 
+    /**
+     * What to eat now.
+     *
+     * <p>The good food while there is any; the rotten flesh only once hunger
+     * has become the more dangerous of the two. A citizen that eats zombie
+     * meat with bread in its pack is not being resourceful, it is poisoning
+     * itself for no reason — and one that starves beside a stack of flesh it
+     * refused is worse.</p>
+     */
     private int findFoodSlot() {
-        for (int i = 0; i < this.inventory.getContainerSize(); i++) {
-            ItemStack stack = this.inventory.getItem(i);
-            if (nutritionOf(stack) > 0) {
-                return i;
-            }
-        }
-        return -1;
+        boolean desperate = this.hunger <= HUNGER_STARVING + 15f;
+        return this.inventory.bestFoodSlot(desperate);
     }
 
     private static int nutritionOf(ItemStack stack) {
@@ -748,15 +963,11 @@ public class CitizenEntity extends PathfinderMob {
 
     // ------------------------------------------------------------------ combat
 
-    /**
-     * Deterministic self-defence: engage the nearest hostile mob inside a
-     * personality-scaled radius (or whoever just hurt us), chase it and punch
-     * it on a cooldown. Runs locally every tick — like eating, fighting is a
-     * survival reflex, never an AI decision.
-     *
-     * @return true while a fight is driving movement this tick
-     */
-    /** Keep the outline in step with the /mciv highlight toggle. */
+    /** Refresh the vanilla equipment slots when a semantic action changes. */
+    public void refreshEquipmentDisplay() {
+        if (!this.level().isClientSide) syncEquipmentDisplay();
+    }
+
     /**
      * Put the right tool in the citizen's hand, and its armour on its back.
      *
@@ -767,8 +978,16 @@ public class CitizenEntity extends PathfinderMob {
      */
     private void syncEquipmentDisplay() {
         var task = this.brain.currentTaskOrNull();
-        String suffix = ai.minecivilization.citizen.CitizenLook.toolSuffixFor(
-                this.identity.profession, task == null ? null : task.type.name());
+        String suffix = switch (getWorkAnimation()) {
+            case MINE -> "_pickaxe";
+            case CHOP -> "_axe";
+            case TILL -> "_hoe";
+            case PLACE, BUILD -> "_axe";
+            case COMBAT -> "_sword";
+            case NONE -> ai.minecivilization.citizen.CitizenLook.toolSuffixFor(
+                    this.identity.profession, task == null ? null : task.type.name());
+            default -> null;
+        };
 
         // A fight outranks the job: show the weapon if there is one.
         if (this.combatTarget != null) {
@@ -791,7 +1010,7 @@ public class CitizenEntity extends PathfinderMob {
     /** Copy an owned item into a display slot, never letting it drop. */
     private void setDisplayItem(EquipmentSlot slot, ItemStack owned) {
         ItemStack shown = this.getItemBySlot(slot);
-        if (ItemStack.isSameItem(shown, owned)) return;
+        if (ItemStack.isSameItemSameComponents(shown, owned)) return;
         this.setItemSlot(slot, owned.isEmpty() ? ItemStack.EMPTY : owned.copyWithCount(1));
         this.setDropChance(slot, 0.0F);   // the real item lives in the inventory
     }
@@ -835,13 +1054,31 @@ public class CitizenEntity extends PathfinderMob {
         return 0;
     }
 
+    /**
+     * Keep the citizen findable.
+     *
+     * <p>Two levels. The outline, toggled by {@code /mciv highlight}, is what
+     * finds somebody through a hillside. On top of that, a citizen who is lost
+     * or stuck glows unconditionally: the whole point of detecting trouble is
+     * that a player can then see where it is, and a stranded citizen that
+     * looks exactly like a working one is trouble nobody acts on.</p>
+     */
     private void tickMarker() {
-        boolean wanted = ai.minecivilization.colony.CitizenMarkers.highlighted();
+        boolean wanted = ai.minecivilization.colony.CitizenMarkers.highlighted()
+                || (this.brain != null && this.brain.isLost());
         if (this.hasGlowingTag() != wanted) {
             this.setGlowingTag(wanted);
         }
     }
 
+    /**
+     * Deterministic self-defence: engage the nearest hostile mob inside a
+     * personality-scaled radius (or whoever just hurt us), chase it and punch
+     * it on a cooldown. Runs locally every tick — like eating, fighting is a
+     * survival reflex, never an AI decision.
+     *
+     * @return true while a fight is driving movement this tick
+     */
     private boolean tickCombat(ServerLevel server, long time) {
         if (!ModConfig.COMBAT_ENABLED.get() || !this.isAlive()) {
             this.combatTarget = null;
@@ -1047,6 +1284,10 @@ public class CitizenEntity extends PathfinderMob {
             this.brain.stopAll(this);
         }
         this.navigator.stop();
+        this.clearWorkAnimation();
+        this.setBracedPlacement(false);
+        this.setTraversalSneak(false);
+        this.setControlledDrop(false);
         this.combatTarget = target;
         this.combatLeash = Math.max(
                 CombatPolicy.effectiveRadius(ModConfig.COMBAT_TRIGGER_RADIUS.get(),
@@ -1065,6 +1306,10 @@ public class CitizenEntity extends PathfinderMob {
 
     private void endCombat() {
         this.combatTarget = null;
+        this.navigator.stop();
+        this.setBracedPlacement(false);
+        this.setTraversalSneak(false);
+        this.setControlledDrop(false);
         // the real state reasserts on the next brain tick (or IDLE if gated)
         this.setDisplayState("IDLE", "", "");
     }
@@ -1174,6 +1419,13 @@ public class CitizenEntity extends PathfinderMob {
 
     @Override
     public boolean hurt(DamageSource source, float amount) {
+        if (!this.level().isClientSide && "suffocated".equals(source.getMsgId())
+                && recoverFromWallCollision()) {
+            // The extraction succeeded, so this particular damage tick is
+            // avoided.  If no free cell exists we deliberately fall through to
+            // vanilla damage instead of making a citizen immortal in a wall.
+            return false;
+        }
         if (super.hurt(source, amount)) {
             // Getting hurt cancels the current work: safety first, no partial plan execution.
             if (!this.level().isClientSide && this.executor.hasActiveTask()) {
@@ -1208,8 +1460,143 @@ public class CitizenEntity extends PathfinderMob {
     @Override
     protected void customServerAiStep() {
         super.customServerAiStep();
-        // Movement is handled by CitizenNavigator; nothing extra here.
+        recoverFromWallCollision();
     }
+
+    /**
+     * A path can legally end at a cell that another worker later fills.  Pull
+     * the citizen out before suffocation damage cancels the whole plan.  The
+     * AABB check and the success post-condition keep this an emergency escape,
+     * not a permanent damage immunity or a free teleport during normal work.
+     */
+    private boolean recoverFromWallCollision() {
+        if (this.selfSupportTransaction || this.escapeCooldown > 0) return false;
+        if (this.level() == null || this.level().noCollision(this, this.getBoundingBox())) {
+            return false;
+        }
+
+        BlockPos escape = findEscapeCell(this.blockPosition());
+        if (escape == null) return false;
+
+        Vec3 oldPosition = this.position();
+        Vec3 oldVelocity = this.getDeltaMovement();
+        float oldFallDistance = this.fallDistance;
+        boolean oldOnGround = this.onGround();
+        boolean oldSafeStep = this.traversalSneak;
+        boolean oldBraced = this.bracedPlacement;
+        this.navigator.halt();
+        this.setPos(escape.getX() + 0.5, escape.getY(), escape.getZ() + 0.5);
+        this.setDeltaMovement(Vec3.ZERO);
+        this.fallDistance = 0.0f;
+        this.setOnGround(true);
+        if (this.level().noCollision(this, this.getBoundingBox())) {
+            this.escapeCooldown = 20;
+            this.navigator.releaseSafeStep();
+            this.setBracedPlacement(false);
+            this.setTraversalSneak(false);
+            LOGGER.warn("[Citizen {}] extracted from an occupied AABB at {}",
+                    this.getName().getString(), this.blockPosition());
+            return true;
+        }
+
+        // Never leave a half-completed extraction if the candidate changed in
+        // the same server tick.  Restore the exact pre-recovery state.
+        this.setPos(oldPosition);
+        this.setDeltaMovement(oldVelocity);
+        this.fallDistance = oldFallDistance;
+        this.setOnGround(oldOnGround);
+        this.setTraversalSneak(oldSafeStep);
+        this.setBracedPlacement(oldBraced);
+        return false;
+    }
+
+    private BlockPos findEscapeCell(BlockPos feet) {
+        BlockPos[] candidates = {
+                feet.above(), feet.north(), feet.south(), feet.east(), feet.west(),
+                feet.above().north(), feet.above().south(),
+                feet.above().east(), feet.above().west(),
+                feet.below(), feet.below().north(), feet.below().south(),
+                feet.below().east(), feet.below().west()
+        };
+        var dimensions = this.getDimensions(getPose());
+        for (BlockPos candidate : candidates) {
+            if (!this.level().isLoaded(candidate)) continue;
+            AABB body = dimensions.makeBoundingBox(
+                    candidate.getX() + 0.5, candidate.getY(), candidate.getZ() + 0.5);
+            if (!this.level().noCollision(this, body)) continue;
+            BlockState floor = this.level().getBlockState(candidate.below());
+            if (!(floor.getBlock() instanceof net.minecraft.world.level.block.LeavesBlock)
+                    && floor.isFaceSturdy(this.level(), candidate.below(), Direction.UP)
+                    && isCellFreeOfOtherLivingEntities(body)) {
+                return candidate.immutable();
+            }
+        }
+        return null;
+    }
+
+    private boolean isCellFreeOfOtherLivingEntities(AABB body) {
+        for (net.minecraft.world.entity.LivingEntity other :
+                this.level().getEntitiesOfClass(net.minecraft.world.entity.LivingEntity.class,
+                        body.inflate(1.0))) {
+            if (other != this && other.getBoundingBox().intersects(body)) return false;
+        }
+        return true;
+    }
+
+    @Override
+    public void travel(Vec3 input) {
+        if (this.isSafeMovement() && blocksSneakEdge(input)) {
+            Vec3 motion = this.getDeltaMovement();
+            this.setDeltaMovement(0.0, motion.y, 0.0);
+            input = new Vec3(0.0, input.y, 0.0);
+        }
+        super.travel(input);
+    }
+
+    private boolean blocksSneakEdge(Vec3 input) {
+        int dx = (int) Math.signum(input.x);
+        int dz = (int) Math.signum(input.z);
+        if (dx == 0 && dz == 0) return false;
+        BlockPos feet = this.blockPosition();
+        if (!this.onGround() && !this.bracedPlacement) return false;
+        if (!hasFloorAt(feet) || (this.bracedPlacement && !hasFloorUnderSelf())) {
+            // Once a worker is genuinely airborne, vanilla gravity owns the
+            // descent.  Only a braced worker is stopped from drifting farther
+            // out over a hole while it is still on a scaffold transaction.
+            return this.bracedPlacement;
+        }
+        if (dx != 0 && !hasFloorAt(feet.offset(dx, 0, 0))
+                && !hasFloorAt(feet.offset(dx, -1, 0))) {
+            if (!controlledDrop || !(hasFloorAt(feet.offset(dx, -2, 0))
+                    || hasFloorAt(feet.offset(dx, -3, 0)))) return true;
+        }
+        if (dz != 0 && !hasFloorAt(feet.offset(0, 0, dz))
+                && !hasFloorAt(feet.offset(0, -1, dz))) {
+            if (!controlledDrop || !(hasFloorAt(feet.offset(0, -2, dz))
+                    || hasFloorAt(feet.offset(0, -3, dz)))) return true;
+        }
+        return false;
+    }
+
+    private boolean hasFloorUnderSelf() {
+        AABB box = this.getBoundingBox().inflate(0.02);
+        BlockPos min = BlockPos.containing(box.minX, this.getY(), box.minZ);
+        BlockPos max = BlockPos.containing(box.maxX, this.getY(), box.maxZ);
+        for (int x = min.getX(); x <= max.getX(); x++) {
+            for (int z = min.getZ(); z <= max.getZ(); z++) {
+                if (!hasFloorAt(new BlockPos(x, this.blockPosition().getY(), z))) return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean hasFloorAt(BlockPos feet) {
+        BlockPos floor = feet.below();
+        BlockState state = this.level().getBlockState(floor);
+        return !(state.getBlock() instanceof net.minecraft.world.level.block.LeavesBlock)
+                && state.isFaceSturdy(this.level(), floor, Direction.UP);
+    }
+
 
     @Override
     public boolean isPushable() {

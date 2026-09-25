@@ -116,6 +116,12 @@ public final class AiBridge {
         MAIN_THREAD.add(r);
     }
 
+    /** Complete a decision request exactly once on the server thread. */
+    private static void finishDecision(Consumer<CitizenPlan> callback, CitizenPlan plan) {
+        if (callback == null) return;
+        enqueue(() -> callback.accept(plan));
+    }
+
     // ------------------------------------------------------------------ HTTP
 
     private static String baseUrl() {
@@ -238,6 +244,9 @@ public final class AiBridge {
     public static void requestDecision(CitizenEntity citizen, String observationJson,
                                        String priority, String reason, Consumer<CitizenPlan> onPlan) {
         if (shouldSkip()) {
+            // The brain must not remain decisionPending when the circuit is
+            // already open.  A null plan is the explicit "no AI work" result.
+            finishDecision(onPlan, null);
             return;
         }
         JsonObject body = new JsonObject();
@@ -245,6 +254,7 @@ public final class AiBridge {
             body.add("observation", JsonParser.parseString(observationJson));
         } catch (RuntimeException ex) {
             LOGGER.error("[Cognition] observation was not valid JSON: {}", ex.getMessage());
+            finishDecision(onPlan, null);
             return;
         }
         body.addProperty("priority", priority);
@@ -264,6 +274,7 @@ public final class AiBridge {
                         if (ModConfig.debug()) {
                             LOGGER.debug("[Cognition] decision backpressure; retry later");
                         }
+                        finishDecision(onPlan, null);
                         return;
                     }
                     if (resp.statusCode() == 404) {
@@ -271,26 +282,27 @@ public final class AiBridge {
                         // Forget the stale registration and let the brain retry
                         // instead of asking this same unknown id forever.
                         onSuccess(start);
-                        enqueue(() -> {
-                            citizen.setRegisteredWithService(false);
-                            onPlan.accept(null);
-                        });
+                        enqueue(() -> citizen.setRegisteredWithService(false));
+                        finishDecision(onPlan, null);
                         return;
                     }
                     if (resp.statusCode() == 503) {
                         onFailure("decision HTTP 503", null, start);
+                        finishDecision(onPlan, null);
                         return;
                     }
                     if (resp.statusCode() != 200) {
                         onFailure("decision HTTP " + resp.statusCode(), null, start);
+                        finishDecision(onPlan, null);
                         return;
                     }
                     onSuccess(start);
                     CitizenPlan plan = parseDecision(resp.body());
-                    enqueue(() -> onPlan.accept(plan));
+                    finishDecision(onPlan, plan);
                 })
                 .exceptionally(ex -> {
                     onFailure("decision", ex.getCause() == null ? ex : ex.getCause(), start);
+                    finishDecision(onPlan, null);
                     return null;
                 });
     }

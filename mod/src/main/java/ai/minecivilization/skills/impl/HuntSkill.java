@@ -1,6 +1,7 @@
 package ai.minecivilization.skills.impl;
 
 import ai.minecivilization.colony.Zone;
+import ai.minecivilization.entity.WorkAnimation;
 import ai.minecivilization.colony.ZoneManager;
 import ai.minecivilization.colony.ZoneType;
 import ai.minecivilization.livestock.AnimalHusbandry;
@@ -9,7 +10,6 @@ import ai.minecivilization.skills.SkillContext;
 import ai.minecivilization.skills.SkillFailure;
 import ai.minecivilization.skills.SkillResult;
 import ai.minecivilization.skills.SkillType;
-import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.animal.Animal;
 import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.phys.AABB;
@@ -74,6 +74,7 @@ public final class HuntSkill implements CitizenSkill {
 
         double distSqr = context.citizen.distanceToSqr(quarry);
         if (distSqr > REACH_SQR) {
+            context.citizen.clearWorkAnimation();
             context.navigator.moveTo(quarry, 1.1);
             context.navigator.tick();
             if (context.navigator.hasFailed()) {
@@ -86,8 +87,9 @@ public final class HuntSkill implements CitizenSkill {
         context.citizen.getLookControl().setLookAt(quarry);
 
         long now = context.level.getGameTime();
+        if (now < nextAttackAt) context.citizen.clearWorkAnimation();
         if (now >= nextAttackAt) {
-            context.citizen.swing(InteractionHand.MAIN_HAND);
+            context.citizen.animateAction(WorkAnimation.COMBAT, quarry.blockPosition());
             context.citizen.doHurtTarget(quarry);
             nextAttackAt = now + ATTACK_INTERVAL;
             context.startGameTime = now;

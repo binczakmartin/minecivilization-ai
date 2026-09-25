@@ -44,6 +44,10 @@ public final class MineCivilization {
     }
 
     private void commonSetup(final FMLCommonSetupEvent event) {
+        // The colony supervision window's channel. Registered here because a
+        // channel must exist before any player connects, and optional in both
+        // directions so neither side needs the other to have the mod.
+        event.enqueueWork(ai.minecivilization.network.ModNetwork::register);
         LOGGER.info("MineCivilization AI initialized (local cognition, deterministic skills)");
     }
 }

@@ -1,6 +1,8 @@
 package ai.minecivilization.skills.impl;
 
+import ai.minecivilization.entity.WorkAnimation;
 import ai.minecivilization.inventory.CitizenInventory;
+import ai.minecivilization.navigation.PlacementSafety;
 import ai.minecivilization.skills.CitizenSkill;
 import ai.minecivilization.skills.SkillContext;
 import ai.minecivilization.skills.SkillFailure;
@@ -43,6 +45,14 @@ public final class PlantCropSkill implements CitizenSkill {
         }
         BlockPos above = farmland.above();
         BlockPos support = farmland.below();
+        if (ai.minecivilization.construction.ConstructionManager.get(context.level)
+                .protectsCell(farmland)
+                || ai.minecivilization.construction.ConstructionManager.get(context.level)
+                .protectsCell(above)) {
+            context.fail(new SkillFailure("PROTECTED_BLOCK",
+                    "farmland belongs to a colony construction footprint", true));
+            return SkillResult.FAILED;
+        }
         if (!context.level.getBlockState(farmland).is(Blocks.FARMLAND)
                 || !context.level.getBlockState(support).isFaceSturdy(
                         context.level, support, Direction.UP)) {
@@ -52,6 +62,10 @@ public final class PlantCropSkill implements CitizenSkill {
         }
         if (!context.level.getBlockState(above).canBeReplaced()) {
             context.fail(new SkillFailure("POSITION_OCCUPIED", "space above farmland occupied", true));
+            return SkillResult.FAILED;
+        }
+        if (!PlacementSafety.canOccupy(context.level, context.citizen, above, false)) {
+            context.fail(new SkillFailure("POSITION_OCCUPIED", "crop cell intersects a living entity", true));
             return SkillResult.FAILED;
         }
 
@@ -76,11 +90,13 @@ public final class PlantCropSkill implements CitizenSkill {
             return SkillResult.FAILED;
         }
 
-        if (!context.level.setBlock(above, cropState, 3)) {
+        if (!context.level.setBlock(above, cropState, 3)
+                || !context.level.getBlockState(above).equals(cropState)) {
             context.fail(SkillFailure.missing("could not plant at target"));
             return SkillResult.FAILED;
         }
         context.citizen.getInventory().extract(seedId, 1);
+        context.citizen.animateAction(WorkAnimation.PLANT, above);
         context.citizen.getSkills().addXp("farming", 0.03f);
         return SkillResult.COMPLETED;
     }

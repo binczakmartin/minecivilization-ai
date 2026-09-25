@@ -1,5 +1,6 @@
 package ai.minecivilization.skills.impl;
 
+import ai.minecivilization.entity.WorkAnimation;
 import ai.minecivilization.inventory.CitizenInventory;
 import ai.minecivilization.skills.CitizenSkill;
 import ai.minecivilization.skills.SkillContext;
@@ -37,10 +38,18 @@ public final class WithdrawItemSkill implements CitizenSkill {
      */
     private static StorageNode resolveSource(SkillContext context) {
         StorageNode named = StorageManager.resolve(context.level, context.params.target);
-        if (named != null) return named;
+        if (named != null && canAccess(context, named)) return named;
         int wanted = context.params.quantity > 0 ? context.params.quantity : 1;
         return SettlementStock.locate(context.level, context.citizen.blockPosition(),
                 context.params.resource, wanted);
+    }
+
+    private static boolean canAccess(SkillContext context, StorageNode node) {
+        if (node == null) return false;
+        if (node.isPublic()) return true;
+        String owner = node.ownerId;
+        return owner != null && owner.equals(
+                context.citizen.getIdentity().citizenId.toString());
     }
 
     @Override
@@ -56,8 +65,8 @@ public final class WithdrawItemSkill implements CitizenSkill {
     @Override
     public SkillResult tick(SkillContext context) {
         StorageNode node = context.get("node", (StorageNode) null);
-        if (node == null) {
-            context.fail(SkillFailure.notFound("no registered storage"));
+        if (node == null || !canAccess(context, node)) {
+            context.fail(SkillFailure.notFound("no accessible registered storage"));
             return SkillResult.FAILED;
         }
         BlockPos pos = context.get("pos", (BlockPos) null);
@@ -90,6 +99,7 @@ public final class WithdrawItemSkill implements CitizenSkill {
             int leftover = context.citizen.getInventory().insert(extracted);
             int accepted = take - leftover;
             if (accepted > 0) {
+                context.citizen.animateAction(WorkAnimation.REACH, pos);
                 stack.shrink(accepted);
                 if (stack.isEmpty()) container.setItem(i, ItemStack.EMPTY);
                 container.setChanged();

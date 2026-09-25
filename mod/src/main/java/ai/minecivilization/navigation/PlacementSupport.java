@@ -41,6 +41,17 @@ public final class PlacementSupport {
                 return level.getBlockState(support).isFaceSturdy(level, support, facing);
             }
         }
+        // Wall torches and several utility blocks use FACING (not
+        // HORIZONTAL_FACING).  They must be allowed to attach to the wall
+        // opposite their facing, while a vertical FACING is never a valid
+        // no-click support.
+        if (state.hasProperty(BlockStateProperties.FACING)) {
+            Direction facing = state.getValue(BlockStateProperties.FACING);
+            if (facing.getAxis().isHorizontal()) {
+                BlockPos support = pos.relative(facing.getOpposite());
+                return level.getBlockState(support).isFaceSturdy(level, support, facing);
+            }
+        }
         return false;
     }
 }

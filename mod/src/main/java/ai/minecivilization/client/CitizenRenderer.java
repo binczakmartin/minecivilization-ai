@@ -21,10 +21,10 @@ import com.mojang.blaze3d.vertex.PoseStack;
  * two-line name tag (name on top, profession underneath).
  */
 public final class CitizenRenderer
-        extends HumanoidMobRenderer<CitizenEntity, HumanoidModel<CitizenEntity>> {
+        extends HumanoidMobRenderer<CitizenEntity, CitizenModel> {
 
     public CitizenRenderer(EntityRendererProvider.Context context) {
-        super(context, new HumanoidModel<>(context.bakeLayer(ModelLayers.PLAYER)), 0.5F);
+        super(context, new CitizenModel(context.bakeLayer(ModelLayers.PLAYER)), 0.5F);
         // Armour has to be drawn by an explicit layer; without it a citizen in
         // a full iron set looks exactly like one in rags. Held items come from
         // HumanoidMobRenderer itself.

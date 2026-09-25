@@ -3,12 +3,14 @@ package ai.minecivilization.skills.impl;
 import java.util.List;
 
 import ai.minecivilization.citizen.CitizenTaskParams;
+import ai.minecivilization.entity.WorkAnimation;
 import ai.minecivilization.colony.Zone;
 import ai.minecivilization.colony.ZoneManager;
 import ai.minecivilization.colony.ZoneType;
 import ai.minecivilization.forestry.TreeShape;
 import ai.minecivilization.forestry.TreeSpecies;
 import ai.minecivilization.inventory.CitizenInventory;
+import ai.minecivilization.navigation.PlacementSafety;
 import ai.minecivilization.skills.CitizenSkill;
 import ai.minecivilization.skills.SkillContext;
 import ai.minecivilization.skills.SkillFailure;
@@ -16,6 +18,7 @@ import ai.minecivilization.skills.SkillRegistry;
 import ai.minecivilization.skills.SkillResult;
 import ai.minecivilization.skills.SkillType;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.tags.BlockTags;
 import net.minecraft.world.level.block.state.BlockState;
 
@@ -40,19 +43,60 @@ import net.minecraft.world.level.block.state.BlockState;
  */
 public final class FellTreeSkill implements CitizenSkill {
 
+    /** Felling traces, behind {@code /mciv debug on}. */
+    private static final org.slf4j.Logger LOGGER = com.mojang.logging.LogUtils.getLogger();
+
     /** Arm's reach for mining, squared — matches MINE_BLOCK. */
     private static final double REACH_SQR = 20.0;
-    /** Branches abandoned before the job is called done anyway. */
-    private static final int MAX_SKIPPED = 6;
+    /**
+     * Retry passes over anything that could not be taken first time.
+     *
+     * <p>Three, then the job ends regardless: a lumberjack must not spend all
+     * afternoon on one unreachable branch, but it must also not walk away from
+     * the first one it cannot climb to.</p>
+     */
+    private static final int MAX_SWEEPS = 3;
+    /** Saplings put back for each tree taken. */
+    private static final int REPLANT_TARGET = 2;
+    /**
+     * Leaves cleared by hand before the rest is left to decay.
+     *
+     * <p>Enough to yield the saplings the replanting needs, and no more. Every
+     * log of the tree is taken — that is what leaves no trace, and it is what
+     * starts vanilla decay on the remaining foliage. Clearing the rest by hand
+     * is a courtesy that cost one citizen four minutes on a single acacia.</p>
+     */
+    private static final int CANOPY_BUDGET = 24;
+    /** Leaves handed to vanilla decay when the trunk comes down. */
+    private static final int MAX_DECAY_SCHEDULED = 512;
+    /** Blocks either side the trunk may be while still worth climbing to. */
+    private static final int CLIMB_REACH = 3;
+    /** Pillar blocks placed for one tree before the climb is given up on. */
+    private static final int MAX_CLIMB = 24;
+
+    private int leavesTaken;
+    private int climbed;
+    /** True while the running sub-skill is a pillar rather than a mine. */
+    private boolean climbing;
 
     private List<BlockPos> trunk;
     private BlockPos base;
     private String logId;
     private int index;
     private int skipped;
+    /** How many of the work list are logs, for the progress label. */
+    private int logCount;
+    /** Cells that could not be taken on this pass; retried before giving up. */
+    private final List<BlockPos> deferred = new java.util.ArrayList<>();
+    /** Sweeps made looking for anything still standing. */
+    private int sweeps;
+    /** The tree's bounding box, so a final sweep knows where to look. */
+    private BlockPos extentMin;
+    private BlockPos extentMax;
     private int scaffoldDug;
     private int teardownWalks;
     private boolean replantAttempted;
+    private boolean cleanupAbandoned;
 
     private CitizenSkill sub;
     private SkillContext subContext;
@@ -75,16 +119,29 @@ public final class FellTreeSkill implements CitizenSkill {
         logId = null;
         index = 0;
         skipped = 0;
+        logCount = 0;
+        leavesTaken = 0;
+        climbed = 0;
+        climbing = false;
+        deferred.clear();
+        sweeps = 0;
+        extentMin = null;
+        extentMax = null;
         scaffoldDug = 0;
         teardownWalks = 0;
         replantAttempted = false;
-        context.citizen.forgetAllScaffold();   // only tidy up this job's own blocks
+        cleanupAbandoned = false;
+        // Keep the ledger of earlier temporary bridges/pillars.  It is not
+        // route-scoped yet, and forgetting it here would make cleanup silently
+        // lose ownership of blocks that are still standing.
+        context.citizen.setBracedPlacement(true);
         sub = null;
         subContext = null;
     }
 
     @Override
     public SkillResult tick(SkillContext context) {
+        if (sub == null) context.citizen.clearWorkAnimation();
         if (trunk == null) {
             SkillResult settled = survey(context);
             if (settled != null) return settled;
@@ -95,6 +152,42 @@ public final class FellTreeSkill implements CitizenSkill {
             index++;
         }
         if (index >= trunk.size()) {
+            // Anything skipped gets another go with fresh scaffolding before
+            // the job is called done. A branch left hanging is exactly the
+            // "trace on the map" whole-tree felling exists to prevent.
+            if (!deferred.isEmpty() && sweeps < MAX_SWEEPS) {
+                // Only logs are worth another pass. A leaf left standing is
+                // removed by decay the moment the last log goes, so chasing it
+                // up a tree that is no longer there buys nothing.
+                List<BlockPos> retry = new java.util.ArrayList<>();
+                for (BlockPos pos : deferred) {
+                    if (isLog(context, pos)) retry.add(pos);
+                }
+                deferred.clear();
+                if (!retry.isEmpty()) {
+                    sweeps++;
+                    trunk = retry;
+                    index = 0;
+                    skipped = 0;
+                    context.startGameTime = context.level.getGameTime();
+                    return SkillResult.RUNNING;
+                }
+            }
+            // Then look at the ground truth: whatever the plan said, is there
+            // still a log of this tree standing? Floating branches usually come
+            // from a neighbour felling into the same canopy, so the only
+            // reliable check is the world itself.
+            if (sweeps < MAX_SWEEPS) {
+                List<BlockPos> leftovers = standingRemains(context);
+                if (!leftovers.isEmpty()) {
+                    sweeps++;
+                    trunk = leftovers;
+                    index = 0;
+                    skipped = 0;
+                    context.startGameTime = context.level.getGameTime();
+                    return SkillResult.RUNNING;
+                }
+            }
             // The tree is down. Take the climbing blocks back before replanting:
             // a felled forest dotted with abandoned dirt towers is worse to look
             // at than the stumps whole-tree felling was meant to remove.
@@ -107,13 +200,53 @@ public final class FellTreeSkill implements CitizenSkill {
         boolean inReach = context.citizen.distanceToSqr(
                 target.getX() + 0.5, target.getY() + 0.5, target.getZ() + 0.5) <= REACH_SQR;
 
+        // Leaves are taken within reach only, and only up to a budget. Every
+        // log is felled regardless — that is what removes the tree and what
+        // sets vanilla decay going on whatever foliage is left. Clearing the
+        // rest by hand is a courtesy, and an expensive one.
+        if (!isLog(context, target)) {
+            if (!inReach || leavesTaken >= CANOPY_BUDGET) {
+                index++;
+                return SkillResult.RUNNING;
+            }
+        }
+
         // Climbing costs blocks. A lumberjack that set out empty-handed simply
         // abandoned every branch above head height, leaving the stump-and-canopy
         // mess whole-tree felling exists to prevent — so it digs up the dirt it
         // needs, the way a player would.
+        // Keep enough blocks to climb with. A spruce is twenty logs tall and a
+        // budget of six left the citizen stranded halfway up its own pillar
+        // with the rest of the trunk still standing.
         if (!inReach && sub == null && !hasScaffold(context)) {
             SkillResult digging = digScaffold(context);
             if (digging != null) return digging;
+        }
+
+        // A branch overhead is climbed to, not navigated to. Handing a
+        // mid-air target to the route planner produced a plan whose steps sit
+        // in the air the pillar has not been built yet — so the walk between
+        // steps failed, the traverse failed, and the citizen burned its whole
+        // timeout on one branch. Every tree in play stalled at the fifth log,
+        // which is exactly where the trunk passes out of arm's reach.
+        //
+        // Pillaring straight up under the trunk is what a player does, needs
+        // no route at all, and cannot fail for any reason but running out of
+        // blocks.
+        if (!inReach && sub == null) {
+            boolean overhead = isOverhead(context, target);
+            SkillResult climbedNow = overhead ? climbOneBlock(context) : null;
+            if (ai.minecivilization.config.ModConfig.debug()) {
+                LOGGER.info("[ClimbTrace] {} at={} target={} overhead={} climbed={} "
+                                + "scaffold={} material={} canRaise={}",
+                        context.citizen.getIdentity().name, context.citizen.blockPosition(),
+                        target, overhead, climbedNow != null, climbed,
+                        climbMaterial(context),
+                        ai.minecivilization.navigation.PlacementSafety.canRaiseOne(
+                                context.level, context.citizen,
+                                context.citizen.blockPosition()));
+            }
+            if (climbedNow != null) return climbedNow;
         }
 
         if (sub == null) {
@@ -125,10 +258,19 @@ public final class FellTreeSkill implements CitizenSkill {
 
         SkillFailure failure = subContext.failure;
         boolean wasTraverse = subIsTraverse;
+        boolean wasClimbing = climbing;
         endSub(context);
 
         if (result == SkillResult.COMPLETED) {
-            if (!wasTraverse) index++;       // the log is down; the next one is up
+            if (wasClimbing) {
+                // One block taller; the same log is now closer to reach.
+                context.startGameTime = context.level.getGameTime();
+                return SkillResult.RUNNING;
+            }
+            if (!wasTraverse) {
+                if (index < trunk.size() && index >= logCount) leavesTaken++;
+                index++;                     // the log is down; the next one is up
+            }
             context.startGameTime = context.level.getGameTime();
             return SkillResult.RUNNING;
         }
@@ -139,12 +281,166 @@ public final class FellTreeSkill implements CitizenSkill {
             index++;
             return SkillResult.RUNNING;
         }
-        index++;
-        if (++skipped > MAX_SKIPPED) {
-            return finish(context);
+        if (ai.minecivilization.config.ModConfig.debug()) {
+            LOGGER.info(
+                    "[FellTrace] {} idx={}/{} logs={} target={} block={} inReach={} traverse={} scaffold={} fail={}",
+                    context.citizen.getIdentity().name, index, trunk.size(), logCount,
+                    trunk.get(index),
+                    context.level.getBlockState(trunk.get(index)), inReach, wasTraverse,
+                    ai.minecivilization.navigation.ScaffoldMaterial.availableAny(
+                            context.citizen.getInventory()), failure);
         }
+        // Could not take it this time. Put it aside for the retry pass instead
+        // of walking away: abandoning after six was what left branches hanging
+        // in mid-air over a felled forest.
+        deferred.add(trunk.get(index));
+        index++;
+        skipped++;
         context.startGameTime = context.level.getGameTime();
         return SkillResult.RUNNING;
+    }
+
+    /**
+     * Anything of this tree still standing, straight from the world.
+     *
+     * <p>The work list is a plan made at the start; the world is what a player
+     * actually sees. Re-reading it catches logs that grew into the job from a
+     * neighbouring canopy, cells another citizen replaced, and anything the
+     * plan simply got wrong.</p>
+     */
+    /**
+     * True when the target is above the citizen and close enough overhead that
+     * simply standing taller would bring it into reach.
+     */
+    private static boolean isOverhead(SkillContext context, BlockPos target) {
+        BlockPos at = context.citizen.blockPosition();
+        int rise = target.getY() - at.getY();
+        if (rise < 2) return false;
+        int dx = Math.abs(target.getX() - at.getX());
+        int dz = Math.abs(target.getZ() - at.getZ());
+        return Math.max(dx, dz) <= CLIMB_REACH;
+    }
+
+    /**
+     * Put one block under our own feet and stand on it.
+     *
+     * @return a result while climbing, or null when this citizen cannot climb
+     *         here and the caller should fall back to ordinary navigation
+     */
+    private SkillResult climbOneBlock(SkillContext context) {
+        if (climbed >= MAX_CLIMB) return null;
+
+        String material = climbMaterial(context);
+        if (material == null) return null;
+
+        BlockPos feet = context.citizen.blockPosition();
+        if (!ai.minecivilization.navigation.PlacementSafety.canRaiseOne(
+                context.level, context.citizen, feet)) {
+            // Something is in the way overhead — climbing a tree, that is
+            // almost always the tree's own canopy, which this job is felling
+            // anyway. Cut it and rise next tick, exactly as a player would.
+            BlockPos blocking = blockedOverhead(context, feet);
+            if (blocking == null) return null;
+            return mineOverhead(context, blocking);
+        }
+
+        CitizenTaskParams params = new CitizenTaskParams();
+        params.position = new int[]{feet.getX(), feet.getY(), feet.getZ()};
+        params.block = material;
+        params.extra.put("pillar", "true");
+        params.extra.put("item", material);
+
+        subContext = new SkillContext(context.citizen, context.level,
+                context.navigator, params);
+        subContext.timeoutTicks = context.timeoutTicks;
+        subContext.startGameTime = context.level.getGameTime();
+        sub = SkillRegistry.create(SkillType.PLACE_BLOCK);
+        subIsTraverse = false;
+        // A pillar is not progress on the log itself, so the index must not
+        // advance when it completes.
+        climbing = true;
+        sub.start(subContext);
+        climbed++;
+        context.citizen.setBracedPlacement(true);
+        context.startGameTime = context.level.getGameTime();
+        return SkillResult.RUNNING;
+    }
+
+    /**
+     * The block stopping this citizen from standing one higher, if it can be
+     * cut away.
+     */
+    private BlockPos blockedOverhead(SkillContext context, BlockPos feet) {
+        var view = new ai.minecivilization.navigation.LevelBlockView(context.level);
+        for (BlockPos cell : new BlockPos[]{feet.above(2), feet.above()}) {
+            if (context.level.getBlockState(cell).isAir()) continue;
+            if (!view.diggable(cell)) continue;
+            return cell;
+        }
+        return null;
+    }
+
+    /** Cut one block of head room so the climb can carry on. */
+    private SkillResult mineOverhead(SkillContext context, BlockPos blocking) {
+        CitizenTaskParams params = new CitizenTaskParams();
+        params.position = new int[]{blocking.getX(), blocking.getY(), blocking.getZ()};
+        params.extra.put("workAnimation", "chop");
+
+        subContext = new SkillContext(context.citizen, context.level,
+                context.navigator, params);
+        subContext.timeoutTicks = context.timeoutTicks;
+        subContext.startGameTime = context.level.getGameTime();
+        sub = SkillRegistry.create(SkillType.MINE_BLOCK);
+        subIsTraverse = false;
+        // Head room is not the log we came for, so the work list must not
+        // advance when this finishes.
+        climbing = true;
+        sub.start(subContext);
+        context.startGameTime = context.level.getGameTime();
+        return SkillResult.RUNNING;
+    }
+
+    /** True when this cell is part of the trunk rather than the canopy. */
+    private boolean isLog(SkillContext context, BlockPos pos) {
+        return context.level.getBlockState(pos).is(BlockTags.LOGS);
+    }
+
+    private List<BlockPos> standingRemains(SkillContext context) {
+        List<BlockPos> remains = new java.util.ArrayList<>();
+        if (extentMin == null || extentMax == null) return remains;
+
+        for (BlockPos pos : BlockPos.betweenClosed(extentMin, extentMax)) {
+            if (!context.level.isLoaded(pos)) continue;
+            BlockState state = context.level.getBlockState(pos);
+            // Leaves left behind are self-healing: with every log of the tree
+            // gone, vanilla decays them on its own. A log is not, so a log is
+            // what a sweep must never leave.
+            if (!state.is(BlockTags.LOGS)) continue;
+            if (ai.minecivilization.construction.ConstructionManager.get(context.level)
+                    .protectsCell(pos)) continue;
+            remains.add(pos.immutable());
+            if (remains.size() >= 64) break;
+        }
+        return remains;
+    }
+
+    /** Remember where the tree stood, so a sweep knows where to look. */
+    private void recordExtent(List<BlockPos> logs, List<BlockPos> leaves) {
+        int minX = Integer.MAX_VALUE, minY = Integer.MAX_VALUE, minZ = Integer.MAX_VALUE;
+        int maxX = Integer.MIN_VALUE, maxY = Integer.MIN_VALUE, maxZ = Integer.MIN_VALUE;
+        for (List<BlockPos> group : List.of(logs, leaves)) {
+            for (BlockPos pos : group) {
+                minX = Math.min(minX, pos.getX());
+                minY = Math.min(minY, pos.getY());
+                minZ = Math.min(minZ, pos.getZ());
+                maxX = Math.max(maxX, pos.getX());
+                maxY = Math.max(maxY, pos.getY());
+                maxZ = Math.max(maxZ, pos.getZ());
+            }
+        }
+        if (minX > maxX) return;
+        extentMin = new BlockPos(minX, minY, minZ);
+        extentMax = new BlockPos(maxX, maxY, maxZ);
     }
 
     // ------------------------------------------------------------------ survey
@@ -166,15 +462,24 @@ public final class FellTreeSkill implements CitizenSkill {
         logId = net.minecraftforge.registries.ForgeRegistries.BLOCKS
                 .getKey(state.getBlock()).toString();
 
-        trunk = TreeShape.collect(start,
+        List<BlockPos> logs = TreeShape.collect(start,
                 pos -> context.level.getBlockState(pos).is(BlockTags.LOGS),
                 pos -> context.level.getBlockState(pos).is(BlockTags.LEAVES));
-        if (trunk.isEmpty()) {
+        if (logs.isEmpty()) {
             context.fail(new SkillFailure("BLOCK_ALREADY_MINED",
                     "the tree is already down", true));
             return SkillResult.FAILED;
         }
-        base = trunk.get(0);
+        base = logs.get(0);
+
+        // The canopy comes down with the trunk. Felling logs alone leaves the
+        // foliage hanging in the air, and it is also where the saplings for
+        // replanting come from.
+        List<BlockPos> leaves = TreeShape.canopy(logs,
+                pos -> context.level.getBlockState(pos).is(BlockTags.LEAVES));
+        trunk = TreeShape.fellingOrder(logs, leaves);
+        logCount = logs.size();
+        recordExtent(logs, leaves);
         index = 0;
         context.startGameTime = context.level.getGameTime();
         return null;
@@ -189,6 +494,8 @@ public final class FellTreeSkill implements CitizenSkill {
         if (subIsTraverse) {
             // Climb to the branch the same way a citizen crosses a ravine.
             params.extra.put("traverse.arrival", "2");
+        } else {
+            params.extra.put("workAnimation", "chop");
         }
         subContext = new SkillContext(context.citizen, context.level, context.navigator, params);
         subContext.timeoutTicks = context.timeoutTicks;
@@ -207,30 +514,71 @@ public final class FellTreeSkill implements CitizenSkill {
      * @return a result while the work continues, or null once the site is clear
      */
     private SkillResult clearScaffold(SkillContext context) {
+        if (cleanupAbandoned) return null;
         for (BlockPos pos : context.citizen.scaffoldPlaced()) {
             BlockState state = context.level.getBlockState(pos);
+            BlockState ownedState = context.citizen.scaffoldState(pos);
+            if (ownedState != null && !state.equals(ownedState)) {
+                // A player or another worker replaced the temporary support;
+                // release ownership without destroying their block.
+                context.citizen.forgetScaffold(pos);
+                continue;
+            }
             if (state.isAir() || trunk.contains(pos)) {
                 context.citizen.forgetScaffold(pos);
                 continue;
             }
+
+            // Never remove the block currently under the worker. First move to
+            // a real neighbouring cell, then the next tick can take the support
+            // away without dropping the citizen down the whole tower.
+            if (pos.equals(context.citizen.blockPosition().below())) {
+                BlockPos stand = findTeardownStand(context);
+                if (stand == null) {
+                    cleanupAbandoned = true;
+                    return null;
+                }
+                if (!context.citizen.blockPosition().equals(stand)) {
+                    if (teardownWalks++ > MAX_TEARDOWN_WALKS) {
+                        cleanupAbandoned = true;
+                        return null;
+                    }
+                    context.navigator.requestSafeStep();
+                    context.navigator.moveToStand(stand, 1.0);
+                    context.navigator.tick();
+                    if (context.navigator.hasFailed()) {
+                        cleanupAbandoned = true;
+                        return null;
+                    }
+                    return SkillResult.RUNNING;
+                }
+            }
+
             double distSqr = context.citizen.distanceToSqr(
                     pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5);
             if (distSqr > REACH_SQR) {
-                // Standing on the very block we are about to take is fine —
-                // the citizen drops onto the next one down.
                 if (teardownWalks++ > MAX_TEARDOWN_WALKS) {
-                    context.citizen.forgetScaffold(pos);
-                    continue;
+                    cleanupAbandoned = true;
+                    return null;
                 }
+                context.navigator.requestSafeStep();
                 context.navigator.moveTo(pos, 1.0);
                 context.navigator.tick();
                 if (context.navigator.hasFailed()) {
-                    context.navigator.stop();
-                    context.citizen.forgetScaffold(pos);
+                    cleanupAbandoned = true;
+                    return null;
                 }
                 return SkillResult.RUNNING;
             }
-            context.level.destroyBlock(pos, true, context.citizen);
+            if (PlacementSafety.hasOtherLivingEntity(context.level, context.citizen, pos)) {
+                cleanupAbandoned = true;
+                return null;
+            }
+            if (!context.level.destroyBlock(pos, true, context.citizen)) {
+                cleanupAbandoned = true;
+                return null;
+            }
+            context.citizen.animateAction(WorkAnimation.MINE, pos);
             context.citizen.forgetScaffold(pos);
             collectNearbyDrops(context);
             context.startGameTime = context.level.getGameTime();
@@ -239,15 +587,61 @@ public final class FellTreeSkill implements CitizenSkill {
         return null;
     }
 
+    private BlockPos findTeardownStand(SkillContext context) {
+        BlockPos feet = context.citizen.blockPosition();
+        for (Direction direction : Direction.Plane.HORIZONTAL) {
+            BlockPos sameLevel = feet.relative(direction);
+            if (!sameLevel.equals(feet)
+                    && PlacementSafety.canStand(context.level, context.citizen, sameLevel)) {
+                return sameLevel;
+            }
+            BlockPos lower = feet.below().relative(direction);
+            if (PlacementSafety.canStand(context.level, context.citizen, lower)) {
+                return lower;
+            }
+        }
+        return null;
+    }
+
     /** Walks spent tidying up before the rest is written off. */
     private static final int MAX_TEARDOWN_WALKS = 12;
 
     /** Blocks a citizen needs in hand before it can pillar up to a branch. */
-    private static final int SCAFFOLD_WANTED = 6;
+    private static final int SCAFFOLD_WANTED = 16;
 
+    /**
+     * Enough rubble to climb with.
+     *
+     * <p>Rubble specifically, not "anything stackable". A lumberjack is by
+     * definition holding logs, so counting those as scaffold meant it never
+     * bothered to dig and instead stood on the timber it had just spent the
+     * afternoon collecting. Digging a block of dirt costs a second; a log
+     * costs four planks.</p>
+     */
     private static boolean hasScaffold(SkillContext context) {
         return ai.minecivilization.navigation.ScaffoldMaterial
-                .available(context.citizen.getInventory()) >= 2;
+                .availableCheap(context.citizen.getInventory()) >= 2;
+    }
+
+    /**
+     * What to stand on. Rubble while there is any, and only then the harvest.
+     *
+     * <p>Falling back to logs still matters: being stranded halfway up a tree
+     * because the ground was stone is worse than spending one log.</p>
+     */
+    private static String climbMaterial(SkillContext context) {
+        var inventory = context.citizen.getInventory();
+        var counts = ai.minecivilization.crafting.VanillaRecipeSource
+                .inventorySnapshot(inventory);
+        if (ai.minecivilization.navigation.ScaffoldMaterial.availableCheap(counts) > 0) {
+            for (String cheap : new String[]{"minecraft:dirt", "minecraft:coarse_dirt",
+                    "minecraft:gravel", "minecraft:sand", "minecraft:cobblestone",
+                    "minecraft:cobbled_deepslate", "minecraft:andesite",
+                    "minecraft:diorite", "minecraft:granite", "minecraft:tuff"}) {
+                if (inventory.count(cheap) > 0) return cheap;
+            }
+        }
+        return ai.minecivilization.navigation.ScaffoldMaterial.chooseAny(inventory, 1);
     }
 
     /**
@@ -269,7 +663,10 @@ public final class FellTreeSkill implements CitizenSkill {
             return null;
         }
 
-        context.level.destroyBlock(ground, true, context.citizen);
+        if (!context.level.destroyBlock(ground, true, context.citizen)) {
+            return SkillResult.RUNNING;
+        }
+        context.citizen.animateAction(WorkAnimation.MINE, ground);
         scaffoldDug++;
         collectNearbyDrops(context);
         context.startGameTime = context.level.getGameTime();
@@ -286,8 +683,9 @@ public final class FellTreeSkill implements CitizenSkill {
                     if (dx == 0 && dz == 0 && dy == -1) continue;  // not the floor we stand on
                     if (trunk != null && trunk.contains(pos)) continue;
                     BlockState state = context.level.getBlockState(pos);
-                    if (!state.is(BlockTags.DIRT) && !state.is(BlockTags.SAND)) continue;
-                    if (state.is(net.minecraft.world.level.block.Blocks.FARMLAND)) continue;
+                    if (!state.is(BlockTags.DIRT)
+                            || !new ai.minecivilization.navigation.LevelBlockView(context.level)
+                            .diggable(pos)) continue;
                     return pos;
                 }
             }
@@ -300,7 +698,9 @@ public final class FellTreeSkill implements CitizenSkill {
         var box = context.citizen.getBoundingBox().inflate(4.0);
         for (var item : context.level.getEntitiesOfClass(
                 net.minecraft.world.entity.item.ItemEntity.class, box)) {
-            if (!item.isAlive() || item.getItem().isEmpty()) continue;
+            if (!item.isAlive() || item.getItem().isEmpty()
+                    || !ai.minecivilization.navigation.ScaffoldMaterial.isExpendable(
+                    CitizenInventory.idOf(item.getItem()))) continue;
             int leftover = inventory.insert(item.getItem().copy());
             if (leftover <= 0) {
                 item.discard();
@@ -319,6 +719,7 @@ public final class FellTreeSkill implements CitizenSkill {
         sub = null;
         subContext = null;
         subIsTraverse = false;
+        climbing = false;
     }
 
     // ------------------------------------------------------------------ replanting
@@ -329,34 +730,130 @@ public final class FellTreeSkill implements CitizenSkill {
      * its job, and the drops from the canopy usually supply the next one.
      */
     private SkillResult finish(SkillContext context) {
+        context.navigator.stop();
+        context.citizen.setBracedPlacement(false);
         if (!replantAttempted) {
             replantAttempted = true;
+            dropCanopy(context);
             replant(context);
             rememberSpecies(context);
         }
         return SkillResult.COMPLETED;
     }
 
+    /**
+     * Bring down whatever canopy the citizen did not cut by hand.
+     *
+     * <p>With the trunk gone the leaves are already doomed — vanilla decays
+     * any leaf too far from a log — but decay rides on random ticks, which are
+     * sparse and only happen in chunks something is actually ticking. Left to
+     * itself a felled forest kept its canopies hanging in the air for a very
+     * long time, and in chunks nobody was ticking, forever.</p>
+     *
+     * <p>Asking for the tick explicitly makes the collapse prompt instead of
+     * eventual, and it is still vanilla decay doing the work: the leaves drop
+     * their saplings and apples exactly as they should.</p>
+     */
+    private void dropCanopy(SkillContext context) {
+        if (trunk == null) return;
+        var level = context.level;
+        int scheduled = 0;
+
+        for (BlockPos pos : trunk) {
+            if (scheduled >= MAX_DECAY_SCHEDULED) break;
+            if (!level.isLoaded(pos)) continue;
+            BlockState state = level.getBlockState(pos);
+            if (!state.is(BlockTags.LEAVES)) continue;
+            // Leaves a player placed are meant to stay; only the tree's own
+            // growth decays.
+            if (state.hasProperty(net.minecraft.world.level.block.LeavesBlock.PERSISTENT)
+                    && state.getValue(net.minecraft.world.level.block.LeavesBlock.PERSISTENT)) {
+                continue;
+            }
+            // Stagger them so a big canopy does not vanish in a single frame.
+            level.scheduleTick(pos, state.getBlock(), 1 + (scheduled % 20));
+            scheduled++;
+        }
+    }
+
+    /**
+     * Put the tree back — one on the stump, and a second beside it when the
+     * citizen has a sapling to spare.
+     *
+     * <p>Two rather than one because not every sapling survives to be a tree,
+     * and a forest that replaces each felled trunk with exactly one is a
+     * forest that slowly shrinks. Saplings come from the canopy the same job
+     * just took down, so replanting costs the colony nothing.</p>
+     */
     private void replant(SkillContext context) {
         if (base == null || logId == null) return;
         String sapling = TreeSpecies.saplingFor(logId);
         if (sapling == null) return;
 
-        CitizenInventory inventory = context.citizen.getInventory();
-        if (!inventory.containsAtLeast(sapling, 1)) return;
-        if (!context.level.getBlockState(base).canBeReplaced()) return;
+        int planted = 0;
+        for (BlockPos spot : replantSpots(context)) {
+            if (planted >= REPLANT_TARGET) break;
+            if (plantOne(context, spot, sapling)) planted++;
+        }
+    }
 
-        BlockState soil = context.level.getBlockState(base.below());
-        if (!soil.is(BlockTags.DIRT)) return;
+    /** The stump first, then the cells around it — spaced so both can grow. */
+    private List<BlockPos> replantSpots(SkillContext context) {
+        List<BlockPos> spots = new java.util.ArrayList<>();
+        spots.add(base);
+        // Two apart, so neither sapling is shaded out by the other's trunk.
+        for (Direction dir : Direction.Plane.HORIZONTAL) {
+            spots.add(base.relative(dir, 2));
+        }
+        return spots;
+    }
+
+    /** @return true when a sapling is now standing here */
+    private boolean plantOne(SkillContext context, BlockPos spot, String sapling) {
+        if (spot == null) return false;
+        if (ai.minecivilization.construction.ConstructionManager.get(context.level)
+                .protectsCell(spot)) return false;
+
+        CitizenInventory inventory = context.citizen.getInventory();
+        if (!inventory.containsAtLeast(sapling, 1)) return false;
+
+        // Follow the ground: a spot beside the stump may sit a block up or down.
+        BlockPos ground = groundAt(context, spot);
+        if (ground == null) return false;
+        if (!context.level.getBlockState(ground).canBeReplaced()) return false;
+        if (!context.level.getBlockState(ground.below()).is(BlockTags.DIRT)) return false;
 
         BlockState saplingState = ai.minecivilization.construction.ConstructionManager
                 .parseState(context.level, sapling);
-        if (saplingState == null || !saplingState.canSurvive(context.level, base)) return;
+        if (saplingState == null || !saplingState.canSurvive(context.level, ground)
+                || !PlacementSafety.canOccupy(context.level, context.citizen, ground, false)) {
+            return false;
+        }
 
         inventory.extract(sapling, 1);
-        context.level.setBlock(base, saplingState, 3);
+        if (!context.level.setBlock(ground, saplingState, 3)
+                || !context.level.getBlockState(ground).equals(saplingState)) {
+            inventory.insert(new net.minecraft.world.item.ItemStack(
+                    CitizenInventory.itemById(sapling)));
+            return false;
+        }
+        context.citizen.animateAction(WorkAnimation.PLANT, ground);
         context.citizen.getSkills().addXp("farming", 0.05f);
         context.citizen.onBlockPlaced(sapling);
+        return true;
+    }
+
+    /** The open cell on the soil at this column, within a block of the stump. */
+    private BlockPos groundAt(SkillContext context, BlockPos near) {
+        for (int dy = 1; dy >= -1; dy--) {
+            BlockPos candidate = near.above(dy);
+            if (!context.level.isLoaded(candidate)) continue;
+            if (context.level.getBlockState(candidate).canBeReplaced()
+                    && context.level.getBlockState(candidate.below()).is(BlockTags.DIRT)) {
+                return candidate;
+            }
+        }
+        return null;
     }
 
     /**
@@ -385,11 +882,16 @@ public final class FellTreeSkill implements CitizenSkill {
     public void cancel(SkillContext context) {
         endSub(context);
         context.navigator.stop();
+        if (!context.citizen.isOnOwnedScaffold()) {
+            context.citizen.setBracedPlacement(false);
+        }
     }
 
     @Override
     public String progressLabel(SkillContext context) {
         if (trunk == null) return "sizing up the tree";
-        return "felling " + Math.min(index + 1, trunk.size()) + "/" + trunk.size();
+        String what = index < logCount ? "felling" : "clearing the canopy";
+        return what + " " + Math.min(index + 1, trunk.size()) + "/" + trunk.size()
+                + (sweeps > 0 ? " (sweep " + sweeps + ")" : "");
     }
 }

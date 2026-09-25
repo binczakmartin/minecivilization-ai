@@ -31,6 +31,8 @@ public final class ConstructionProject {
 
     /** Absolute positions ("x,y,z") of blocks already physically placed. */
     public final Set<String> placed = new LinkedHashSet<>();
+    /** Absolute positions owned by this project, even if a player changed them. */
+    public final Set<String> ownedCells = new LinkedHashSet<>();
 
     public long createdAtGameTime;
 

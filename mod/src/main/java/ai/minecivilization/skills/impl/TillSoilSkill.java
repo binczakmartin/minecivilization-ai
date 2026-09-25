@@ -3,7 +3,9 @@ package ai.minecivilization.skills.impl;
 import ai.minecivilization.colony.Zone;
 import ai.minecivilization.colony.ZoneManager;
 import ai.minecivilization.colony.ZoneType;
+import ai.minecivilization.entity.WorkAnimation;
 import ai.minecivilization.inventory.CitizenInventory;
+import ai.minecivilization.navigation.PlacementSafety;
 import ai.minecivilization.skills.CitizenSkill;
 import ai.minecivilization.skills.SkillContext;
 import ai.minecivilization.skills.SkillFailure;
@@ -96,12 +98,19 @@ public final class TillSoilSkill implements CitizenSkill {
             if (arrival == SkillResult.RUNNING) return SkillResult.RUNNING;
         }
         context.navigator.stop();
+        if (!PlacementSafety.canOccupy(context.level, context.citizen, target, false)) {
+            context.fail(new SkillFailure("POSITION_OCCUPIED",
+                    "tilled plot intersects a living entity", true));
+            return SkillResult.FAILED;
+        }
 
-        if (!context.level.setBlock(target, Blocks.FARMLAND.defaultBlockState(), 3)) {
+        if (!context.level.setBlock(target, Blocks.FARMLAND.defaultBlockState(), 3)
+                || !context.level.getBlockState(target).equals(Blocks.FARMLAND.defaultBlockState())) {
             context.fail(new SkillFailure("BLOCK_PLACE_FAILED",
                     "the world rejected the tilled plot at " + target, true));
             return SkillResult.FAILED;
         }
+        context.citizen.animateAction(WorkAnimation.TILL, target);
         context.level.playSound(null, target, SoundEvents.HOE_TILL, SoundSource.BLOCKS, 1.0F, 1.0F);
         wearOutHoe(context, hoe);
         context.citizen.getSkills().addXp("farming", 0.03f);
@@ -136,6 +145,8 @@ public final class TillSoilSkill implements CitizenSkill {
 
     /** Dirt or grass with open sky above it, and nothing planted yet. */
     private static boolean isTillable(SkillContext context, BlockPos pos) {
+        if (ai.minecivilization.construction.ConstructionManager.get(context.level)
+                .protectsCell(pos)) return false;
         BlockState state = context.level.getBlockState(pos);
         if (!state.is(BlockTags.DIRT) || state.is(Blocks.FARMLAND)) return false;
         BlockPos below = pos.below();

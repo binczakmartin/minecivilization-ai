@@ -2,17 +2,23 @@ package ai.minecivilization.skills.impl;
 
 import java.util.Optional;
 
+import ai.minecivilization.citizen.CitizenTaskParams;
 import ai.minecivilization.construction.ConstructionManager;
+import ai.minecivilization.entity.WorkAnimation;
 import ai.minecivilization.construction.ConstructionProject;
 import ai.minecivilization.inventory.CitizenInventory;
+import ai.minecivilization.navigation.PlacementSafety;
+import ai.minecivilization.navigation.PlacementSupport;
 import ai.minecivilization.skills.CitizenSkill;
 import ai.minecivilization.skills.SkillContext;
 import ai.minecivilization.skills.SkillFailure;
 import ai.minecivilization.skills.SkillResult;
+import ai.minecivilization.skills.SkillRegistry;
 import ai.minecivilization.skills.SkillType;
 import ai.minecivilization.storage.StorageManager;
 import ai.minecivilization.storage.StorageNode;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.block.state.BlockState;
@@ -27,6 +33,10 @@ import net.minecraft.world.level.block.state.BlockState;
  * inventory.</p>
  */
 public final class BuildBlueprintSkill implements CitizenSkill {
+    private CitizenSkill siteMiner;
+    private SkillContext siteContext;
+    private SkillContext siteClaimContext;
+
     @Override
     public SkillType type() {
         return SkillType.BUILD_BLUEPRINT;
@@ -39,6 +49,7 @@ public final class BuildBlueprintSkill implements CitizenSkill {
 
     @Override
     public void start(SkillContext context) {
+        cancelSiteMiner();
         context.put("checkedStorage", false);
     }
 
@@ -51,13 +62,20 @@ public final class BuildBlueprintSkill implements CitizenSkill {
             return SkillResult.FAILED;
         }
         ConstructionManager manager = ConstructionManager.get(context.level);
-        var blueprint = ConstructionManager.blueprint(project.blueprintId);
+        // Rebuild the blueprint from its id when this session has not generated
+        // it yet, which is the normal state of affairs after a world reload.
+        var blueprint = ConstructionManager.ensureBlueprint(context.level, project.blueprintId);
         if (blueprint == null) {
+            // Genuinely unbuildable. Retire the project rather than handing it
+            // back to the next citizen to fail on in a tenth of a second.
+            project.status = ConstructionProject.Status.FAILED;
+            manager.setDirty();
             context.fail(new SkillFailure("UNKNOWN_BLUEPRINT",
-                    "blueprint " + project.blueprintId + " missing", false));
+                    "blueprint " + project.blueprintId + " cannot be rebuilt", false));
             return SkillResult.FAILED;
         }
 
+        manager.reconcile(context.level, project, blueprint);
         if (project.isFinished(blueprint)) {
             project.status = ConstructionProject.Status.COMPLETED;
             manager.setDirty();
@@ -71,6 +89,9 @@ public final class BuildBlueprintSkill implements CitizenSkill {
             return SkillResult.FAILED;
         }
         ConstructionManager.NextStep next = step.get();
+        if (next.clearExisting) {
+            return prepareNaturalSite(context, manager, project, next.pos);
+        }
         if (next.unsupported) {
             context.fail(new SkillFailure("UNSUPPORTED_BLOCK", next.detail, true));
             return SkillResult.FAILED;
@@ -81,10 +102,38 @@ public final class BuildBlueprintSkill implements CitizenSkill {
             context.fail(new SkillFailure("INVALID_BLOCK_STATE", next.blockState, false));
             return SkillResult.FAILED;
         }
+        BlockState existing = context.level.getBlockState(next.pos);
+        if (existing.equals(state)) {
+            // A world save or another worker may already have completed this
+            // exact step. Adopt it instead of trying to overwrite it.
+            String existingKey = project.key(next.pos.getX(), next.pos.getY(), next.pos.getZ());
+            project.placed.add(existingKey);
+            project.ownedCells.add(existingKey);
+            manager.setDirty();
+            return micro(context) ? SkillResult.COMPLETED : SkillResult.RUNNING;
+        }
+        if (!existing.canBeReplaced()) {
+            context.fail(new SkillFailure("POSITION_OCCUPIED",
+                    "blueprint cell is occupied by a different block", true));
+            return SkillResult.FAILED;
+        }
+        if (!PlacementSafety.canOccupy(context.level, context.citizen, next.pos, false)) {
+            SkillResult reposition = leaveOccupiedCell(context, next.pos);
+            if (reposition == SkillResult.RUNNING) return reposition;
+            context.fail(new SkillFailure("POSITION_OCCUPIED",
+                    "blueprint cell intersects a living entity", true));
+            return SkillResult.FAILED;
+        }
+        if (!PlacementSupport.canPlace(context.level, state, next.pos)) {
+            context.fail(new SkillFailure("UNSUPPORTED_BLOCK",
+                    "blueprint block has no physical support at " + next.pos, true));
+            return SkillResult.FAILED;
+        }
         if (ai.minecivilization.construction.AnimalPen.isPen(project.blueprintId)) {
-            var existing = context.level.getBlockState(next.pos);
             if (existing.is(state.getBlock())) {
-                project.placed.add(project.key(next.pos.getX(), next.pos.getY(), next.pos.getZ()));
+                String penKey = project.key(next.pos.getX(), next.pos.getY(), next.pos.getZ());
+                project.placed.add(penKey);
+                project.ownedCells.add(penKey);
                 manager.setDirty();
                 return SkillResult.RUNNING;
             }
@@ -123,25 +172,45 @@ public final class BuildBlueprintSkill implements CitizenSkill {
         double distSqr = context.citizen.distanceToSqr(
                 next.pos.getX() + 0.5, next.pos.getY() + 0.5, next.pos.getZ() + 0.5);
         if (distSqr > 25.0) {
+            context.citizen.clearWorkAnimation();
             SkillResult arrival = SkillNavigation.approach(context, next.pos, 25.0, "build.walk");
             if (arrival != SkillResult.COMPLETED) return arrival;
         }
         context.navigator.stop();
 
-        // Physically place: consume exactly one item, and refund it if the world
-        // rejects the write.  A project must never advance on a phantom block.
-        context.citizen.getInventory().extract(itemId, 1);
-        if (!context.level.setBlock(next.pos, state, 3)) {
+        // Physically place: claim the cell, consume exactly one item, and refund
+        // it if the world rejects the write.  A project must never advance on a
+        // phantom block or let two workers race the same cell.
+        if (!claimBuild(context, next.pos, "build")) {
+            context.fail(new SkillFailure("POSITION_OCCUPIED",
+                    "another worker already claimed this blueprint cell", true));
+            return SkillResult.FAILED;
+        }
+        if (context.citizen.getInventory().extract(itemId, 1) != 1) {
+            releaseBuild(context, "build");
+            context.fail(SkillFailure.missing("need " + itemId + " for " + project.name));
+            return SkillResult.FAILED;
+        }
+        boolean wrote = context.level.setBlock(next.pos, state, 3);
+        if (!wrote || !context.level.getBlockState(next.pos).equals(state)) {
+            if (wrote) {
+                context.level.setBlock(next.pos, existing, 3);
+            }
             context.citizen.getInventory().insert(new ItemStack(blockItem));
+            releaseBuild(context, "build");
             context.fail(new SkillFailure("BLOCK_PLACE_FAILED",
                     "the world rejected blueprint block at " + next.pos, true));
             return SkillResult.FAILED;
         }
+        context.citizen.animateAction(WorkAnimation.BUILD, next.pos);
         // A blueprint that includes chests registers them as it raises them.
         ai.minecivilization.storage.StorageDiscovery.onContainerPlaced(context.level, next.pos);
         ai.minecivilization.colony.LandmarkRegistry.get(context.level)
                 .notice(context.level, next.pos);
-        project.placed.add(project.key(next.pos.getX(), next.pos.getY(), next.pos.getZ()));
+        String placedKey = project.key(next.pos.getX(), next.pos.getY(), next.pos.getZ());
+        project.placed.add(placedKey);
+        project.ownedCells.add(placedKey);
+        releaseBuild(context, "build");
         context.citizen.getSkills().addXp("building", 0.05f);
         context.citizen.onBlockPlaced(itemId);
         manager.setDirty();
@@ -150,6 +219,7 @@ public final class BuildBlueprintSkill implements CitizenSkill {
         context.startGameTime = context.level.getGameTime();
 
         context.citizen.onProjectProgress(project);
+        manager.reconcile(context.level, project, blueprint);
         if (project.isFinished(blueprint)) {
             project.status = ConstructionProject.Status.COMPLETED;
             manager.setDirty();
@@ -158,7 +228,148 @@ public final class BuildBlueprintSkill implements CitizenSkill {
             context.citizen.onProjectCompleted(project);
             return SkillResult.COMPLETED;
         }
+        if (micro(context)) return SkillResult.COMPLETED;
         return SkillResult.RUNNING;
+    }
+
+    private SkillResult prepareNaturalSite(SkillContext context, ConstructionManager manager,
+                                           ConstructionProject project, BlockPos target) {
+        if (siteMiner != null) {
+            SkillResult result = siteMiner.tick(siteContext);
+            if (result == SkillResult.RUNNING) return SkillResult.RUNNING;
+            SkillFailure failure = siteContext.failure;
+            cancelSiteMiner();
+            if (result != SkillResult.COMPLETED) {
+                context.fail(failure == null ? new SkillFailure("SITE_CLEAR_FAILED",
+                        "could not clear the construction site", true) : failure);
+                return SkillResult.FAILED;
+            }
+            context.startGameTime = context.level.getGameTime();
+            return SkillResult.RUNNING;
+        }
+
+        if (!manager.ownsCell(project.id, target)
+                || !ConstructionManager.isNaturalSiteBlock(context.level,
+                context.level.getBlockState(target), target)) {
+            context.fail(new SkillFailure("POSITION_OCCUPIED",
+                    "construction site is occupied by a protected or non-natural block", true));
+            return SkillResult.FAILED;
+        }
+        if (target.equals(context.citizen.blockPosition())) {
+            return leaveOccupiedCell(context, target);
+        }
+        if (!context.level.getEntities(context.citizen,
+                new net.minecraft.world.phys.AABB(target)).isEmpty()) {
+            context.fail(new SkillFailure("POSITION_OCCUPIED",
+                    "a living entity is inside the construction site cell", true));
+            return SkillResult.FAILED;
+        }
+        double distance = context.citizen.distanceToSqr(target.getX() + 0.5,
+                target.getY() + 0.5, target.getZ() + 0.5);
+        if (distance > 20.0) {
+            BlockPos stand = findSiteStand(context, target);
+            if (stand == null) {
+                context.fail(new SkillFailure("POSITION_OCCUPIED",
+                        "no safe stand cell beside the construction site", true));
+                return SkillResult.FAILED;
+            }
+            context.citizen.clearWorkAnimation();
+            return SkillNavigation.approach(context, stand, 20.0,
+                    "build.prepare-site");
+        }
+
+        if (!claimBuild(context, target, "site")) {
+            context.fail(new SkillFailure("POSITION_OCCUPIED",
+                    "another worker already claimed this construction site cell", true));
+            return SkillResult.FAILED;
+        }
+        siteClaimContext = context;
+        CitizenTaskParams params = new CitizenTaskParams();
+        params.position = new int[]{target.getX(), target.getY(), target.getZ()};
+        params.projectId = project.id;
+        params.extra.put("authorizedProject", project.id);
+        params.extra.put("workAnimation", "mine");
+        siteContext = new SkillContext(context.citizen, context.level, context.navigator, params);
+        siteContext.timeoutTicks = context.timeoutTicks;
+        siteContext.startGameTime = context.level.getGameTime();
+        siteMiner = SkillRegistry.create(SkillType.MINE_BLOCK);
+        siteMiner.start(siteContext);
+        return SkillResult.RUNNING;
+    }
+
+    private BlockPos findSiteStand(SkillContext context, BlockPos target) {
+        for (int radius = 1; radius <= 3; radius++) {
+            for (int dx = -radius; dx <= radius; dx++) {
+                for (int dz = -radius; dz <= radius; dz++) {
+                    if (Math.max(Math.abs(dx), Math.abs(dz)) != radius) continue;
+                    for (int dy = -1; dy <= 1; dy++) {
+                        BlockPos stand = target.offset(dx, dy, dz);
+                        if (levelLoaded(context, stand)
+                                && PlacementSafety.canStand(context.level, context.citizen, stand)) {
+                            return stand;
+                        }
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    private static boolean levelLoaded(SkillContext context, BlockPos pos) {
+        return context.level.isLoaded(pos);
+    }
+
+    private boolean claimBuild(SkillContext context, BlockPos pos, String kind) {
+        String owner = context.citizen.getIdentity().citizenId.toString();
+        boolean claimed = ai.minecivilization.construction.WorkClaimStore.claim(
+                context.level, owner, pos, kind, context.level.getGameTime(), 240);
+        if (claimed) context.put("claim." + kind, pos);
+        return claimed;
+    }
+
+    private void releaseBuild(SkillContext context, String kind) {
+        BlockPos pos = context.get("claim." + kind, (BlockPos) null);
+        if (pos == null) return;
+        String owner = context.citizen.getIdentity().citizenId.toString();
+        ai.minecivilization.construction.WorkClaimStore.release(
+                context.level, owner, pos, kind);
+        context.data.remove("claim." + kind);
+    }
+
+    private void cancelSiteMiner() {
+        if (siteMiner != null && siteContext != null) siteMiner.cancel(siteContext);
+        if (siteContext != null) releaseBuild(siteContext, "site");
+        if (siteClaimContext != null) releaseBuild(siteClaimContext, "site");
+        siteMiner = null;
+        siteContext = null;
+        siteClaimContext = null;
+    }
+
+    private static boolean micro(SkillContext context) {
+        return Boolean.parseBoolean(context.params.extra.getOrDefault("micro", "false"));
+    }
+
+    private SkillResult leaveOccupiedCell(SkillContext context, BlockPos target) {
+        BlockPos current = context.citizen.blockPosition();
+        for (Direction direction : Direction.Plane.HORIZONTAL) {
+            BlockPos stand = current.relative(direction);
+            if (!PlacementSafety.canStand(context.level, context.citizen, stand)) continue;
+            BlockPos requested = context.get("build.reposition", (BlockPos) null);
+            if (!stand.equals(requested)) {
+                context.put("build.reposition", stand);
+                SkillResult navigation = SkillNavigation.approach(context, stand, 1.5,
+                        "build.reposition");
+                if (navigation == SkillResult.FAILED) {
+                    context.failure = null;
+                    context.data.remove("build.reposition");
+                    context.data.remove("build.reposition.ctx");
+                    continue;
+                }
+                return SkillResult.RUNNING;
+            }
+            if (current.equals(stand)) return SkillResult.RUNNING;
+        }
+        return SkillResult.FAILED;
     }
 
     private SkillResult tryWithdrawFromStorage(SkillContext context, String itemId) {
@@ -171,6 +382,7 @@ public final class BuildBlueprintSkill implements CitizenSkill {
         double distSqr = context.citizen.distanceToSqr(storage.containerPos().getX() + 0.5,
                 storage.containerPos().getY() + 0.5, storage.containerPos().getZ() + 0.5);
         if (distSqr > 12.0) {
+            context.citizen.clearWorkAnimation();
             SkillResult arrival = SkillNavigation.approach(context, storage.containerPos(),
                     12.0, "build.withdraw");
             if (arrival != SkillResult.COMPLETED) return arrival;
@@ -193,6 +405,7 @@ public final class BuildBlueprintSkill implements CitizenSkill {
 
     @Override
     public void cancel(SkillContext context) {
+        cancelSiteMiner();
         context.navigator.stop();
     }
 

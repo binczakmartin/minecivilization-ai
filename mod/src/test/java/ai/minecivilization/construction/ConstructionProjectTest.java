@@ -57,6 +57,16 @@ class ConstructionProjectTest {
     }
 
     @Test
+    void ownershipCanOutliveProgressAfterAPlayerEditsACell() {
+        ConstructionProject p = new ConstructionProject("p1", "House", "blueprint", 0, 0, 0);
+        p.placed.add("0,0,0");
+        p.ownedCells.add("0,0,0");
+        p.placed.clear();
+        assertTrue(p.ownedCells.contains("0,0,0"));
+        assertEquals(0.0, p.progress(threeBlocks()));
+    }
+
+    @Test
     void emptyBlueprintIsAlwaysComplete() {
         ConstructionProject p = new ConstructionProject("p1", "Nothing", "empty", 0, 0, 0);
         Blueprint empty = new Blueprint("empty", "Empty", 1, 1, 1, List.of());

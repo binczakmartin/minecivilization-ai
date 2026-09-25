@@ -23,4 +23,18 @@ public interface BlockView {
 
     /** Inside the buildable world and inside a loaded chunk. */
     boolean inBounds(BlockPos pos);
+
+    /**
+     * True when this cell is water a citizen can swim through.
+     *
+     * <p>Water is the one medium that is neither ground nor obstacle: there is
+     * nothing to stand on, yet a citizen can move through it in any direction
+     * including straight up. Treating it as "passable but with no floor" made
+     * every route across a lake a bridge-building project, and every route
+     * that ended in water unreachable — which is why a citizen that fell in a
+     * river stayed in it.</p>
+     */
+    default boolean swimmable(BlockPos pos) {
+        return false;
+    }
 }

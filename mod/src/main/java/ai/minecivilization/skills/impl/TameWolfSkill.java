@@ -1,6 +1,7 @@
 package ai.minecivilization.skills.impl;
 
 import ai.minecivilization.config.ModConfig;
+import ai.minecivilization.entity.WorkAnimation;
 import ai.minecivilization.livestock.*;
 import ai.minecivilization.skills.*;
 import net.minecraft.world.entity.animal.Wolf;
@@ -23,15 +24,20 @@ public final class TameWolfSkill implements CitizenSkill {
         if (wolf == null) { c.fail(SkillFailure.notFound("no wild wolf nearby")); return SkillResult.FAILED; }
         if (!wolf.isAlive() || wolf.isTame() || wolf.isAngry() || wolf.isLeashed()) return SkillResult.COMPLETED;
         if (c.citizen.distanceToSqr(wolf) > 9) {
+            c.citizen.clearWorkAnimation();
             c.navigator.moveTo(wolf, 1); c.navigator.tick();
             if (c.navigator.hasFailed()) { c.fail(c.navigator.failure()); return SkillResult.FAILED; }
             return SkillResult.RUNNING;
         }
         c.navigator.stop();
-        if (c.level.getGameTime() < nextOffer) return SkillResult.RUNNING;
+        if (c.level.getGameTime() < nextOffer) {
+            c.citizen.clearWorkAnimation();
+            return SkillResult.RUNNING;
+        }
         if (!c.citizen.getInventory().containsAtLeast("minecraft:bone", 1)) {
             c.fail(SkillFailure.missing("wolf taming needs bones")); return SkillResult.FAILED;
         }
+        c.citizen.animateAction(WorkAnimation.REACH, wolf.blockPosition());
         c.citizen.getInventory().extract("minecraft:bone", 1); nextOffer = c.level.getGameTime() + 20;
         if (c.level.random.nextInt(3) != 0) { c.level.broadcastEntityEvent(wolf, (byte) 6); return SkillResult.RUNNING; }
         wolf.setTame(true, true); wolf.setOwnerUUID(c.citizen.getUUID()); wolf.setOrderedToSit(false);

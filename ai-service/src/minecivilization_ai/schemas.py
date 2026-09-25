@@ -54,6 +54,10 @@ class TaskType(str, Enum):
     COLLECT = "COLLECT"
     HERD = "HERD"            # lead an animal home to the pasture
     BREED = "BREED"          # feed a pair so the herd grows
+    ESCAPE = "ESCAPE"        # cut a staircase to the surface — the last resort when stranded
+    SIGN = "SIGN"            # put up a signpost naming a place
+    ROADWORK = "ROADWORK"    # lay, light or widen a stretch of the colony's roads
+    EXPLORE = "EXPLORE"      # survey unknown ground and bring back what is there
 
 
 class SkillType(str, Enum):
@@ -66,13 +70,16 @@ class SkillType(str, Enum):
     MINE_AREA = "MINE_AREA"
     FELL_TREE = "FELL_TREE"
     DIG_MINE = "DIG_MINE"
+    DIG_TO_SURFACE = "DIG_TO_SURFACE"   # the escape that always works
     PICKUP_ITEM = "PICKUP_ITEM"
     PLACE_BLOCK = "PLACE_BLOCK"
+    PLACE_SIGN = "PLACE_SIGN"
     HARVEST_CROP = "HARVEST_CROP"
     PLANT_CROP = "PLANT_CROP"
     CULTIVATE = "CULTIVATE"
     LIGHT_FARM = "LIGHT_FARM"
     FORAGE = "FORAGE"
+    EXPLORE = "EXPLORE"
     TILL_SOIL = "TILL_SOIL"
     TEND_LIVESTOCK = "TEND_LIVESTOCK"
     PREPARE_PEN = "PREPARE_PEN"
@@ -217,6 +224,23 @@ class CivilizationSummary(BaseModel):
     # Largest stockpiles in the settlement's registered containers. Lets a
     # policy answer "do we already own this?" before sending anyone mining.
     stock: dict[str, int] = {}
+    # What the settlement physically is, as opposed to what it owns. Without
+    # these a policy cannot tell a colony that has built a town from one that
+    # has merely accumulated a very large pile of logs.
+    buildings_complete: int = 0
+    buildings_underway: int = 0
+    districts: int = 0
+    roads_known: int = 0
+    roads_built: int = 0
+    signs: int = 0
+    # Share of citizens doing something useful, 0..100. The single number that
+    # says whether the colony is working or waiting.
+    productive_percent: int = 100
+    citizens_idle: int = 0
+    citizens_stuck: int = 0
+    citizens_lost: int = 0
+    # Materials an unfinished building is waiting for, as "24x oak planks".
+    awaiting_materials: list[str] = []
 
 
 class ObservationCitizen(BaseModel):

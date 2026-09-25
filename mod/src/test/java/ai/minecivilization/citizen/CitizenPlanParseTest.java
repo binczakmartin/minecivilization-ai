@@ -178,4 +178,11 @@ class CitizenPlanParseTest {
         assertNotNull(plan);
         assertTrue(plan.tasks.isEmpty());
     }
+
+    @Test
+    void rejectsNonRestGoalWithNoExecutableTask() {
+        assertNull(parse("""
+                {"reasoning_summary": "x", "goal": {"type": "GATHER_RESOURCE",
+                 "resource": "minecraft:oak_log"}}"""));
+    }
 }

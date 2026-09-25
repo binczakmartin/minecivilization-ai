@@ -47,6 +47,17 @@ public final class TerrainPlanner {
      * favour of staying level.
      */
     static final int COST_CLIMB = 3;
+    /**
+     * Swimming a block. Dearer than walking — it is slower and you cannot
+     * carry on working while you do it — but far cheaper than bridging, so a
+     * citizen crosses a pond rather than paving it.
+     */
+    static final int COST_SWIM = 18;
+
+    /** Room either side of a journey to walk around what is in the way. */
+    private static final int DETOUR_MARGIN = 24;
+    /** Smallest search box, so a very short journey can still detour. */
+    private static final int MIN_SEARCH_BOX = 12;
 
     /** Tuning knobs, all bounded so planning can never stall a server tick. */
     public static final class Options {
@@ -68,6 +79,21 @@ public final class TerrainPlanner {
         public int searchBox = 64;
         /** Vertical half-size of the search box. */
         public int searchHeight = 40;
+
+        /** A copy, so the planner can narrow a caller's options without mutating them. */
+        public Options copy() {
+            Options out = new Options();
+            out.maxNodes = this.maxNodes;
+            out.maxOps = this.maxOps;
+            out.maxPlacements = this.maxPlacements;
+            out.arrivalRadius = this.arrivalRadius;
+            out.allowDig = this.allowDig;
+            out.allowPlace = this.allowPlace;
+            out.maxDrop = this.maxDrop;
+            out.searchBox = this.searchBox;
+            out.searchHeight = this.searchHeight;
+            return out;
+        }
 
         public Options maxOps(int n) {
             this.maxOps = n;
@@ -109,6 +135,7 @@ public final class TerrainPlanner {
         if (arrived(from, goal, opts)) {
             return new TerrainPlan(List.of());
         }
+        opts = withFittedBox(opts, from, goal);
 
         Map<BlockPos, Node> best = new HashMap<>();
         PriorityQueue<Node> open = new PriorityQueue<>(Comparator.comparingInt((Node n) -> n.f)
@@ -150,6 +177,30 @@ public final class TerrainPlanner {
         return null;
     }
 
+    /**
+     * Narrow the search box to the journey actually being planned.
+     *
+     * <p>A fixed sixty-four block box means a goal two blocks away and twelve
+     * blocks up is searched across sixteen thousand cells of irrelevant flat
+     * ground — more than the node budget allows, so the search dies before it
+     * ever climbs. The box only has to be wide enough to walk around whatever
+     * is in the way, and long journeys are already split into legs before they
+     * reach the planner.</p>
+     *
+     * <p>Never widens a caller's box, so a deliberately small search stays
+     * small.</p>
+     */
+    private static Options withFittedBox(Options opts, BlockPos from, BlockPos goal) {
+        int horizontal = Math.max(Math.abs(from.getX() - goal.getX()),
+                Math.abs(from.getZ() - goal.getZ()));
+        int fitted = Math.max(MIN_SEARCH_BOX, horizontal + DETOUR_MARGIN);
+        if (fitted >= opts.searchBox) return opts;
+
+        Options narrowed = opts.copy();
+        narrowed.searchBox = fitted;
+        return narrowed;
+    }
+
     /** Convenience: default options. */
     public static TerrainPlan plan(BlockPos start, BlockPos goal, BlockView view) {
         return plan(start, goal, view, new Options());
@@ -188,7 +239,32 @@ public final class TerrainPlanner {
         int dx = Math.abs(pos.getX() - goal.getX());
         int dy = Math.abs(pos.getY() - goal.getY());
         int dz = Math.abs(pos.getZ() - goal.getZ());
-        return COST_WALK * Math.max(dx, Math.max(dy, dz));
+        // Height is not free, and gaining it in open air is expensive: there is
+        // nothing to walk up, so every block of climb is a block placed under
+        // your own feet.
+        //
+        // Pricing a block of climb the same as a block of walking is what made
+        // high targets unreachable. The search would fan out across the flat
+        // ground near the goal — thousands of cheap, useless cells, and from
+        // each of them a whole plane of bridgeable air — and exhaust its node
+        // budget before it ever went up. A branch twelve blocks overhead came
+        // back "no route even after digging and bridging" over open ground.
+        //
+        // Charging the climb what it actually costs makes the estimate hold
+        // steady along a pillar, so the search goes straight up instead of
+        // sideways. Where real terrain can be walked up instead, the estimate
+        // now overshoots, which makes f *fall* as the citizen climbs the hill —
+        // so a staircase is still strongly preferred over a tower.
+        // Descending has the same shape: through rock, every block down is a
+        // block mined. Left at walking price, a seam fourteen blocks under the
+        // citizen was as unreachable as a branch fourteen above it, and for
+        // exactly the same reason.
+        int up = Math.max(0, goal.getY() - pos.getY());
+        int down = Math.max(0, pos.getY() - goal.getY());
+        return COST_WALK * Math.max(dx, Math.max(dy, dz))
+                + COST_CLIMB * dy
+                + COST_PLACE * up
+                + COST_DIG * down;
     }
 
     // ------------------------------------------------------------------ move generation
@@ -232,7 +308,53 @@ public final class TerrainPlanner {
         Move down = digDown(p, view, opts, searchOrigin, goal);
         if (down != null) out.add(down);
 
+        // 5. Swimming. Water is neither ground nor obstacle: there is nothing
+        //    to stand on, yet every direction is open including straight up.
+        //    Without this a stream was a wall, a lake was the edge of the
+        //    world, and a citizen that fell into either could not path out of
+        //    the cell it was floating in.
+        for (int[] d : CARDINAL) {
+            for (int dy = 1; dy >= -1; dy--) {
+                Move swim = swim(p, d[0], dy, d[1], view, opts, searchOrigin, goal);
+                if (swim != null) out.add(swim);
+            }
+        }
+        // Straight up, which is how a citizen gets its head above water.
+        Move surface = swim(p, 0, 1, 0, view, opts, searchOrigin, goal);
+        if (surface != null) out.add(surface);
+
         return out;
+    }
+
+    /**
+     * Move through water.
+     *
+     * <p>Valid when the citizen is in water now, or the destination is — a
+     * swimmer entering, crossing or leaving. No floor is required and none is
+     * built: swimming across a lake must not turn into a bridge-building
+     * project, and climbing out of a river must not require pillaring.</p>
+     */
+    private static Move swim(BlockPos p, int dx, int dy, int dz, BlockView view,
+                             Options opts, BlockPos searchOrigin, BlockPos searchGoal) {
+        BlockPos dest = p.offset(dx, dy, dz);
+        if (!view.inBounds(dest) || !inSearchBox(searchOrigin, searchGoal, dest, opts)) {
+            return null;
+        }
+        // At least one end must be water, otherwise this is an ordinary step
+        // and the walking rules — which check for a floor — should own it.
+        boolean inWater = view.swimmable(p) || view.swimmable(p.above());
+        boolean intoWater = view.swimmable(dest);
+        if (!inWater && !intoWater) return null;
+
+        // The body still needs room: water or air, but not rock.
+        if (!view.passable(dest) || !view.passable(dest.above())) return null;
+
+        // Leaving the water onto dry land needs something to climb out onto.
+        if (!intoWater && !view.swimmable(dest.above()) && !view.sturdy(dest.below())) {
+            return null;
+        }
+        return new Move(dest, TerrainPlan.MoveKind.SWIM, List.of(),
+                COST_SWIM + (dy != 0 ? COST_CLIMB : 0));
     }
 
     /**
@@ -282,7 +404,8 @@ public final class TerrainPlanner {
             // the deck must be real ground; otherwise reject this route rather
             // than handing PlaceBlockSkill a placement it can never survive.
             if (!view.sturdy(floor.below())) return null;
-            ops.add(new TerrainPlan.Op(TerrainPlan.OpKind.PLACE, floor));
+            String variant = dy > 0 ? "stair:" + stairFacing(dx, dz) : "";
+            ops.add(new TerrainPlan.Op(TerrainPlan.OpKind.PLACE, floor, variant));
             cost += COST_PLACE;
         }
 
@@ -374,13 +497,25 @@ public final class TerrainPlanner {
                 COST_WALK + COST_CLIMB + COST_DIG);
     }
 
+    private static String stairFacing(int dx, int dz) {
+        if (Math.abs(dx) >= Math.abs(dz)) {
+            return dx >= 0 ? "east" : "west";
+        }
+        return dz >= 0 ? "south" : "north";
+    }
+
     private static TerrainPlan.MoveKind kindOf(int dy, List<TerrainPlan.Op> ops) {
         boolean digs = false;
         boolean places = false;
+        boolean stair = false;
         for (TerrainPlan.Op op : ops) {
             if (op.kind == TerrainPlan.OpKind.DIG) digs = true;
-            else places = true;
+            else {
+                places = true;
+                stair |= op.variant.startsWith("stair:");
+            }
         }
+        if (places && dy > 0 && stair) return TerrainPlan.MoveKind.STAIR_UP;
         if (places) return TerrainPlan.MoveKind.BRIDGE;
         if (digs) return TerrainPlan.MoveKind.DIG_THROUGH;
         if (dy > 0) return TerrainPlan.MoveKind.STEP_UP;

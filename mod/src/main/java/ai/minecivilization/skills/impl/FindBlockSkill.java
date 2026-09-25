@@ -26,11 +26,79 @@ import java.util.function.Predicate;
  * how server omniscience is kept out of civilization knowledge.</p>
  */
 public final class FindBlockSkill implements CitizenSkill {
-    private static final int SLICE_PER_TICK = 3000;
+    /**
+     * Block lookups per tick.
+     *
+     * <p>Raised a long way from three thousand. Reading a block state out of a
+     * loaded chunk costs almost nothing; the old budget made a wide search
+     * take a quarter of a minute of standing still, and measurement showed a
+     * third of all colony time going into searching alone.</p>
+     */
+    private static final int SLICE_PER_TICK = 16000;
+    /**
+     * How far above and below the citizen a search looks.
+     *
+     * <p>Almost everything a citizen is sent for sits in a thin band around
+     * the surface it is standing on: trees, crops, soil, exposed stone. The
+     * search was a full cube, so at its widest it examined nine hundred
+     * thousand cells to find a tree twenty blocks away — and ninety per cent
+     * of those cells were sky or deep rock. Ore is the exception, and a miner
+     * reaches it by digging down rather than by searching for it from the
+     * surface.</p>
+     */
+    private static final int VERTICAL_BAND = 12;
+
+    /**
+     * How long a citizen holds the resource it is walking to.
+     *
+     * <p>Long enough to get there and work it; short enough that a worker
+     * which dies or is called away does not reserve a tree for the afternoon.</p>
+     */
+    private static final int TARGET_CLAIM_TICKS = 400;
+    /**
+     * Size of the patch one citizen reserves, in blocks.
+     *
+     * <p>Claiming a single block would reserve one log of a tree and leave the
+     * trunk beside it free for somebody else, which is the same collision one
+     * block over. A small patch reserves the whole tree, or the corner of the
+     * seam, which is what a job actually is.</p>
+     */
+    private static final int CLAIM_PATCH = 3;
 
     @Override
     public SkillType type() {
         return SkillType.FIND_BLOCK;
+    }
+
+    /**
+     * Reserve a resource block for this citizen.
+     *
+     * <p>A whole tree is one job, so claiming the trunk block a citizen walks
+     * to is enough to keep two lumberjacks off the same oak.</p>
+     */
+    private static boolean claimTarget(SkillContext context, BlockPos pos) {
+        String owner = String.valueOf(context.citizen.getIdentity().citizenId);
+        BlockPos patch = patchOf(pos);
+        boolean claimed = ai.minecivilization.construction.WorkClaimStore.claim(
+                context.level, owner, patch, "resource",
+                context.level.getGameTime(), TARGET_CLAIM_TICKS);
+        if (claimed) context.put("resource.claim", patch);
+        return claimed;
+    }
+
+    /** The patch a block belongs to — one claim covers a whole tree. */
+    private static BlockPos patchOf(BlockPos pos) {
+        return new BlockPos(Math.floorDiv(pos.getX(), CLAIM_PATCH),
+                0, Math.floorDiv(pos.getZ(), CLAIM_PATCH));
+    }
+
+    /** Release the resource when the search's owner is done with it. */
+    static void releaseTarget(SkillContext context) {
+        BlockPos pos = context.get("resource.claim", (BlockPos) null);
+        if (pos == null) return;
+        ai.minecivilization.construction.WorkClaimStore.release(context.level,
+                String.valueOf(context.citizen.getIdentity().citizenId), pos, "resource");
+        context.data.remove("resource.claim");
     }
 
     @Override
@@ -40,11 +108,9 @@ public final class FindBlockSkill implements CitizenSkill {
 
     private Block resolveBlock(SkillContext context) {
         String blockId = context.params.block;
-        if (blockId == null && context.params.resource != null) {
-            var item = ai.minecivilization.inventory.CitizenInventory.itemById(context.params.resource);
-            Block byItem = Block.byItem(item);
-            blockId = byItem == null ? null
-                    : ForgeRegistries.BLOCKS.getKey(byItem).toString();
+        if ((blockId == null || blockId.equals("minecraft:air")) && context.params.resource != null) {
+            var sources = ai.minecivilization.forestry.ResourceFamily.sourceBlocks(context.params.resource);
+            if (!sources.isEmpty()) blockId = sources.getFirst();
         }
         if (blockId == null) return null;
         return ForgeRegistries.BLOCKS.getValue(net.minecraft.resources.ResourceLocation.parse(blockId));
@@ -123,6 +189,9 @@ public final class FindBlockSkill implements CitizenSkill {
         // Nearest cells first: a raster scan starts in the far bottom corner, so
         // a tree five blocks away used to wait behind half a million empty cells.
         while (processed < SLICE_PER_TICK && cursor.next(radius, offset)) {
+            // Cells outside the band cost a step of cheap arithmetic, not a
+            // block lookup, so they must not spend the tick's budget either.
+            if (Math.abs(offset[1]) > VERTICAL_BAND) continue;
             processed++;
             BlockPos pos = origin.offset(offset[0], offset[1], offset[2]);
             if (pos.getY() < context.level.getMinBuildHeight()
@@ -130,6 +199,7 @@ public final class FindBlockSkill implements CitizenSkill {
             if (!context.level.isLoaded(pos)) continue;
             BlockState state = context.level.getBlockState(pos);
             if (!accepted.contains(state.getBlock())) continue;
+            if (!new ai.minecivilization.navigation.LevelBlockView(context.level).diggable(pos)) continue;
             if (state.is(net.minecraft.world.level.block.Blocks.FARMLAND)
                     && !context.level.getBlockState(pos.above()).isAir()) continue;
             if (maxAge) {
@@ -140,6 +210,14 @@ public final class FindBlockSkill implements CitizenSkill {
             if (!Reachability.canInteractFrom(pos, bodyFree, sturdyFloor)) {
                 continue; // unreachable: keep scanning for one the citizen can stand by
             }
+            if (!context.level.getEntities(context.citizen,
+                    new net.minecraft.world.phys.AABB(pos)).isEmpty()) continue;
+            // Somebody else's tree is not this citizen's tree. Without a claim
+            // the nearest block is the nearest block for everybody, so the
+            // whole shift converges on one trunk, jams each other out of arm's
+            // reach and reports it unreachable. Keep scanning for one that is
+            // genuinely free — there is always another tree.
+            if (!claimTarget(context, pos)) continue;
             context.params.position = new int[]{pos.getX(), pos.getY(), pos.getZ()};
             // Tell the rest of the task what was actually found: a spruce trunk
             // must be felled as spruce, not as the oak that was asked for.
@@ -154,11 +232,21 @@ public final class FindBlockSkill implements CitizenSkill {
                             + " (or any substitute) within " + radius + " blocks."));
             return SkillResult.FAILED;
         }
+        // Searching is work, and it is done standing perfectly still. Without
+        // saying so, a citizen part-way through a wide search looked identical
+        // to one that had simply stopped — and had its job taken away for
+        // being motionless. The cursor running out still bounds it, so this
+        // cannot hide a genuine stall.
+        if (processed > 0) context.startGameTime = context.level.getGameTime();
         return SkillResult.RUNNING;
     }
 
     @Override
     public void cancel(SkillContext context) {
+        // Give the tree back. The claim would lapse on its own, but a patch
+        // nobody is working is a patch the next citizen should be allowed to
+        // take — especially in a camp with only a handful of trees.
+        releaseTarget(context);
     }
 
     @Override

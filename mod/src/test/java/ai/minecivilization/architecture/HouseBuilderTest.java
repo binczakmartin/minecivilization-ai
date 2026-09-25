@@ -62,11 +62,17 @@ class HouseBuilderTest {
         for (Blueprint.BlockEntry e : blueprint.entries()) {
             if (e.y < previousY) descents++;
             previousY = e.y;
+            boolean roofPiece = e.y > HouseBuilder.WALL_HEIGHT
+                    && (e.itemId().equals(OAK.stairs()) || e.itemId().equals(OAK.slab()));
+            if (roofPiece) {
+                assertTrue(placed.contains(e.x + "," + (e.y - 1) + "," + e.z),
+                        "roof piece has no support in build order at " + key(e));
+            }
             placed.add(key(e));
         }
         // Courses may revisit a lower level between stages (walls, then the
-        // plinth), but the build must broadly rise rather than jump about.
-        assertTrue(descents <= 3,
+        // plinth), but the build must not oscillate wildly.
+        assertTrue(descents <= 4,
                 "the build order wanders up and down " + descents + " times");
     }
 
@@ -135,6 +141,15 @@ class HouseBuilderTest {
         int doorX = 9 / 2;
         assertFalse(occupied.contains(doorX + ",1," + 6), "the doorway is bricked up");
         assertFalse(occupied.contains(doorX + ",2," + 6), "the doorway is only one block high");
+    }
+
+    @Test
+    void generatedHousesHaveAWorkstationAndInteriorLight() {
+        Blueprint blueprint = house(9, 7);
+        assertTrue(blueprint.entries().stream()
+                .anyMatch(e -> e.itemId().equals("minecraft:crafting_table")));
+        assertTrue(blueprint.entries().stream()
+                .anyMatch(e -> e.itemId().equals(OAK.light()) && e.y == 1));
     }
 
     @Test

@@ -3,6 +3,7 @@ package ai.minecivilization.skills.impl;
 import java.util.ArrayList;
 import java.util.List;
 
+import ai.minecivilization.entity.WorkAnimation;
 import ai.minecivilization.inventory.CitizenInventory;
 import ai.minecivilization.skills.CitizenSkill;
 import ai.minecivilization.skills.SkillContext;
@@ -110,6 +111,7 @@ public final class CraftItemSkill implements CitizenSkill {
 
     /** @return RUNNING = searching/walking, COMPLETED = ready to craft, FAILED = abort. */
     private SkillResult ensureStation(SkillContext context) {
+        context.citizen.clearWorkAnimation();
         BlockPos station = context.get("pos", (BlockPos) null);
         if (station == null) {
             station = BlockScanner.find(context, Blocks.CRAFTING_TABLE);
@@ -176,6 +178,8 @@ public final class CraftItemSkill implements CitizenSkill {
                     "no room for crafted " + target, true));
             return SkillResult.FAILED;
         }
+        context.citizen.animateAction(WorkAnimation.CRAFT,
+                context.get("pos", (BlockPos) null));
         context.startGameTime = context.level.getGameTime();
         return SkillResult.RUNNING;
     }
@@ -314,6 +318,10 @@ public final class CraftItemSkill implements CitizenSkill {
     @Override
     public void cancel(SkillContext context) {
         context.navigator.stop();
+        // Hand the workbench back. The claim would lapse on its own, but a
+        // minute of a station nobody is standing at is a minute the colony
+        // queues behind it.
+        BlockScanner.releaseStation(context);
     }
 
     @Override

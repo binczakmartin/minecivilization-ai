@@ -59,6 +59,19 @@ class BlueprintTest {
     }
 
     @Test
+    void footprintBoundsIncludeGeneratedOverhangs() {
+        Blueprint bp = new Blueprint("overhang", "Overhang", 2, 2, 2, List.of(
+                new Blueprint.BlockEntry(-1, 0, 0, "minecraft:stone"),
+                new Blueprint.BlockEntry(1, 0, 1, "minecraft:stone")));
+        assertEquals(-1, bp.minX);
+        assertEquals(1, bp.maxX);
+        assertEquals(3, bp.footprintWidth());
+        assertEquals(2, bp.footprintDepth());
+        assertTrue(bp.containsRelative(-1, 0, 0));
+        assertTrue(!bp.containsRelative(2, 0, 0));
+    }
+
+    @Test
     void metadataRoundTrips() {
         Blueprint bp = sample();
         assertEquals("test", bp.id);

@@ -34,6 +34,26 @@ Return only these task types; anything else is rejected.
 - `CRAFT` — craft `quantity` of `resource` from the items in your inventory
 - `SMELT` — smelt `quantity` of `resource` (the produced item) in a furnace near you
 - `MOVE` / `INSPECT` / `IDLE` / `REST`
+- `SIGN` — put up a signpost. `resource` is the whole line (`ROAD -> IRON MINE`), `target` is the kind (`TOWN_HALL`, `DISTRICT`, `MINE`, `WAREHOUSE`, `ROAD`, `DANGER`, `CAVE`, `PROJECT`, `NOTICE`), `position` is where the post goes
+- `ROADWORK` — lay, light or widen one stretch of road: `block` is the material, `position` is the cell
+- `EXPLORE` — survey unknown ground and bring back what is there; optional `position` aims the expedition
+- `ESCAPE` — cut a staircase to daylight. Only worth asking for when a citizen is sealed underground; the local layer already does this by itself
+
+## What the local layer already does without you
+
+These run deterministically, every tick, whether or not the service answers. Do not
+spend decisions on them:
+
+- eating, fleeing, fighting, and getting home when lost — including digging out of a
+  sealed cave
+- picking up the highest-priority unclaimed job from the colony's work board: supplying
+  and building projects, making missing tools, emptying a full pack into the warehouse,
+  signposting unlabelled places, improving well-walked roads, and exploring
+- remembering journeys and turning the busy ones into roads
+
+Your job is the part the local layer cannot do: **what the colony should become**. Which
+building to start next, where a district belongs, which resource the settlement is about
+to run short of, when to expand, and which long project is worth the materials.
 
 ## Organization
 

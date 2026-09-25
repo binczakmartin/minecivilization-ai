@@ -1,5 +1,7 @@
 package ai.minecivilization.skills.impl;
 
+import ai.minecivilization.entity.WorkAnimation;
+import ai.minecivilization.navigation.LevelBlockView;
 import ai.minecivilization.skills.CitizenSkill;
 import ai.minecivilization.skills.SkillContext;
 import ai.minecivilization.skills.SkillFailure;
@@ -39,6 +41,12 @@ public final class MineBlockSkill implements CitizenSkill {
         } else if (state.getDestroySpeed(context.level, pos) < 0f) {
             context.fail(new SkillFailure("UNBREAKABLE_BLOCK",
                     "Target block cannot be mined.", false));
+        } else {
+            // Capture the exact state found by the search.  A player or another
+            // worker can replace a natural block with a building block while
+            // the mining progress is running; the old implementation happily
+            // destroyed whatever happened to occupy the coordinate at the end.
+            context.put("expectedState", state);
         }
     }
 
@@ -57,6 +65,18 @@ public final class MineBlockSkill implements CitizenSkill {
                     "Target block was already mined.", true));
             return SkillResult.FAILED;
         }
+        BlockState expected = context.get("expectedState", (BlockState) null);
+        if (expected != null && !state.equals(expected)) {
+            context.fail(new SkillFailure("TARGET_CHANGED",
+                    "the target block changed while the citizen was working", true));
+            return SkillResult.FAILED;
+        }
+        if (!new LevelBlockView(context.level).diggable(pos)
+                && !authorizedProjectCell(context, pos)) {
+            context.fail(new SkillFailure("UNBREAKABLE_BLOCK",
+                    "Target became protected, fluid-filled or unbreakable.", true));
+            return SkillResult.FAILED;
+        }
 
         // must be close enough to physically reach
         if (context.citizen.distanceToSqr(pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5) > 20.0) {
@@ -64,12 +84,20 @@ public final class MineBlockSkill implements CitizenSkill {
             return SkillResult.FAILED;
         }
 
+        WorkAnimation animation = "chop".equals(context.params.extra.get("workAnimation"))
+                ? WorkAnimation.CHOP : WorkAnimation.MINE;
+        context.citizen.animateAction(animation, pos);
         float hardness = state.getDestroySpeed(context.level, pos);
         float speed = (float) (1.0 / (Math.max(hardness, 0.05) * 30.0 + 1.0));
         speed *= (1.0f + context.citizen.getSkills().mining * 0.005f); // competence, not magic
         speed *= toolSpeedBonus(context, state);                      // real tools mine faster
         float progress = context.get("progress", 0f) + speed;
         context.put("progress", progress);
+        // Swinging at a block is work, and it is done standing perfectly
+        // still. Without saying so, a citizen part-way through a block of
+        // deepslate looked identical to one that had stopped, and had its job
+        // taken away for being motionless.
+        context.startGameTime = context.level.getGameTime();
 
         if (progress >= 1.0f) {
             Block block = state.getBlock();
@@ -83,6 +111,13 @@ public final class MineBlockSkill implements CitizenSkill {
             return SkillResult.COMPLETED;
         }
         return SkillResult.RUNNING;
+    }
+
+    private boolean authorizedProjectCell(SkillContext context, BlockPos pos) {
+        String projectId = context.params.extra.get("authorizedProject");
+        return projectId != null
+                && ai.minecivilization.construction.ConstructionManager
+                .get(context.level).ownsCell(projectId, pos);
     }
 
     /**

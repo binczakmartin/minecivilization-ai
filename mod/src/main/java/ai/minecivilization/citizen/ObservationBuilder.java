@@ -123,6 +123,7 @@ public final class ObservationBuilder {
         JsonArray bottlenecks = new JsonArray();
         for (String b : projectBottlenecks(level)) bottlenecks.add(b);
         civ.add("bottlenecks", bottlenecks);
+        addSettlementState(civ, level);
         root.add("civilization", civ);
         root.add("colony", colonySpace(self, level));
 
@@ -144,6 +145,58 @@ public final class ObservationBuilder {
         // NOTE: no "reason" key here — the Python Observation schema is
         // extra="forbid"; the reason travels in the DecisionRequest instead.
         return root.toString();
+    }
+
+    /**
+     * What the settlement physically is, as opposed to what it owns.
+     *
+     * <p>Without these numbers a policy cannot tell a colony that has built a
+     * town from one that has merely accumulated a very large pile of logs —
+     * which is exactly the failure this whole pass exists to fix. Giving the
+     * strategic layer the building count, the road network, the signage and
+     * the idle rate is what lets it notice that nothing is being built and say
+     * so.</p>
+     */
+    private static void addSettlementState(JsonObject civ, ServerLevel level) {
+        int complete = 0;
+        int underway = 0;
+        JsonArray awaiting = new JsonArray();
+        for (ConstructionProject project : ConstructionManager.get(level).all()) {
+            if (project.status == ConstructionProject.Status.COMPLETED) {
+                complete++;
+                continue;
+            }
+            if (project.status == ConstructionProject.Status.FAILED) continue;
+            underway++;
+            if (project.status == ConstructionProject.Status.WAITING_FOR_RESOURCES
+                    && awaiting.size() < 6) {
+                var missing = ai.minecivilization.work.ConstructionSupply
+                        .remainingMaterials(level, project);
+                missing.entrySet().stream()
+                        .max(java.util.Map.Entry.comparingByValue())
+                        .ifPresent(entry -> awaiting.add(entry.getValue() + "x "
+                                + ai.minecivilization.work.ColonyWork.shortName(entry.getKey())));
+            }
+        }
+        civ.addProperty("buildings_complete", complete);
+        civ.addProperty("buildings_underway", underway);
+        civ.add("awaiting_materials", awaiting);
+
+        civ.addProperty("districts", ZoneManager.get(level).all().size());
+
+        var roads = ai.minecivilization.roads.PathMemory.get(level);
+        civ.addProperty("roads_known", roads.count());
+        civ.addProperty("roads_built", roads.builtCount());
+        civ.addProperty("signs", ai.minecivilization.colony.SignRegistry.get(level).size());
+
+        var census = ai.minecivilization.work.ProductivityMonitor.census();
+        civ.addProperty("productive_percent", census.busyPercent());
+        civ.addProperty("citizens_idle",
+                census.count(ai.minecivilization.work.ProductivityMonitor.State.IDLE));
+        civ.addProperty("citizens_stuck",
+                census.count(ai.minecivilization.work.ProductivityMonitor.State.STUCK));
+        civ.addProperty("citizens_lost",
+                census.count(ai.minecivilization.work.ProductivityMonitor.State.LOST));
     }
 
     private static java.util.List<String> memoryKeysForBrain(CitizenEntity self) {

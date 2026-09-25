@@ -53,6 +53,19 @@ class ScaffoldMaterialTest {
     }
 
     @Test
+    void anyMaterialPrefersAStackThatCoversTheWholePlacementBudget() {
+        assertEquals("minecraft:cobblestone_stairs", ScaffoldMaterial.chooseAny(
+                Map.of("minecraft:dirt", 1, "minecraft:cobblestone_stairs", 4), 3));
+    }
+
+    @Test
+    void stairsCanBeSelectedForAClimbWithoutBecomingFloatingBridgeBlocks() {
+        assertEquals("minecraft:cobblestone_stairs", ScaffoldMaterial.chooseStair(
+                Map.of("minecraft:cobblestone_stairs", 3), 2));
+        assertTrue(ScaffoldMaterial.isExpendable("minecraft:cobblestone_stairs"));
+    }
+
+    @Test
     void logsAreAStableLastResortScaffold() {
         assertEquals("minecraft:spruce_log", ScaffoldMaterial.choose(
                 Map.of("minecraft:spruce_log", 4), 4));

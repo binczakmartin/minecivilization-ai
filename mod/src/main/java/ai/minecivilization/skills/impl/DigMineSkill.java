@@ -7,6 +7,9 @@ import ai.minecivilization.colony.Signpost;
 import ai.minecivilization.construction.ConstructionManager;
 import ai.minecivilization.inventory.CitizenInventory;
 import ai.minecivilization.mining.MineLayout;
+import ai.minecivilization.entity.WorkAnimation;
+import ai.minecivilization.navigation.LevelBlockView;
+import ai.minecivilization.navigation.PlacementSafety;
 import ai.minecivilization.navigation.PlacementSupport;
 import ai.minecivilization.mining.MineWorks;
 import ai.minecivilization.skills.CitizenSkill;
@@ -127,10 +130,12 @@ public final class DigMineSkill implements CitizenSkill {
         boolean cutSomething = false;
         for (BlockPos cell : new BlockPos[]{feet, feet.above()}) {
             if (context.level.getBlockState(cell).isAir()) continue;
-            if (context.level.getBlockState(cell).getDestroySpeed(context.level, cell) < 0) {
-                continue;   // bedrock: go around, not through
+            if (!new LevelBlockView(context.level).diggable(cell)
+                    || context.level.getBlockState(cell).getDestroySpeed(context.level, cell) < 0) {
+                continue;   // bedrock/property: go around, not through
             }
-            context.level.destroyBlock(cell, true, context.citizen);
+            if (!context.level.destroyBlock(cell, true, context.citizen)) continue;
+            context.citizen.animateAction(WorkAnimation.MINE, cell);
             cutSomething = true;
             break;          // one block per tick keeps mining physical
         }
@@ -163,9 +168,11 @@ public final class DigMineSkill implements CitizenSkill {
             }
             for (BlockPos probe : new BlockPos[]{feet, feet.above()}) {
                 if (context.level.getBlockState(probe).isAir()) continue;
-                if (context.level.getBlockState(probe)
+                if (!new LevelBlockView(context.level).diggable(probe)
+                        || context.level.getBlockState(probe)
                         .getDestroySpeed(context.level, probe) < 0) continue;
-                context.level.destroyBlock(probe, true, context.citizen);
+                if (!context.level.destroyBlock(probe, true, context.citizen)) continue;
+                context.citizen.animateAction(WorkAnimation.MINE, probe);
                 collectDrops(context);
                 context.startGameTime = context.level.getGameTime();
                 return SkillResult.RUNNING;
@@ -223,19 +230,24 @@ public final class DigMineSkill implements CitizenSkill {
 
     /** Place a block from the citizen's own stock, and tell the colony it is there. */
     private void place(SkillContext context, BlockPos pos, String blockId) {
+        if (ai.minecivilization.construction.ConstructionManager.get(context.level)
+                .protectsCell(pos)) return;
         if (!context.level.getBlockState(pos).canBeReplaced()) return;
         CitizenInventory inventory = context.citizen.getInventory();
         if (!inventory.containsAtLeast(blockId, 1)) return;
 
         BlockState state = ConstructionManager.parseState(context.level, blockId);
-        if (state == null || !PlacementSupport.canPlace(context.level, state, pos)) return;
+        if (state == null || !PlacementSupport.canPlace(context.level, state, pos)
+                || !PlacementSafety.canOccupy(context.level, context.citizen, pos, false)) return;
 
         inventory.extract(blockId, 1);
-        if (!context.level.setBlock(pos, state, 3)) {
+        if (!context.level.setBlock(pos, state, 3)
+                || !context.level.getBlockState(pos).equals(state)) {
             inventory.insert(new net.minecraft.world.item.ItemStack(
                     CitizenInventory.itemById(blockId)));
             return;
         }
+        context.citizen.animateAction(WorkAnimation.BUILD, pos);
         context.citizen.onBlockPlaced(blockId);
         LandmarkRegistry.get(context.level).notice(context.level, pos);
         ai.minecivilization.storage.StorageDiscovery.onContainerPlaced(context.level, pos);
@@ -246,7 +258,8 @@ public final class DigMineSkill implements CitizenSkill {
         var box = context.citizen.getBoundingBox().inflate(4.0);
         for (var item : context.level.getEntitiesOfClass(
                 net.minecraft.world.entity.item.ItemEntity.class, box)) {
-            if (!item.isAlive() || item.getItem().isEmpty()) continue;
+            if (!item.isAlive() || item.getItem().isEmpty()
+                    || item.getItem().isDamageableItem()) continue;
             int leftover = inventory.insert(item.getItem().copy());
             if (leftover <= 0) {
                 item.discard();

@@ -1,0 +1,67 @@
+#Verbose logging of skill/goal transitions (do not log every tick)
+debug = false
+
+[ai]
+	#Allow citizens to request decisions from the local AI service
+	enabled = true
+	#HTTP timeout for AI requests (never blocks the tick thread)
+	#Range: 500 ~ 60000
+	timeoutMs = 8000
+	#Minimum ticks between *periodic* cognition requests per citizen.
+	#Does not apply when a citizen has nothing to do: finishing a goal,
+	#failing a task or starting idle all ask again immediately. Throttling
+	#those was why citizens spent more than half their time standing still.
+	#Range: 20 ~ 72000
+	reflectionCooldownTicks = 100
+
+[skills]
+	#Default per-skill timeout in ticks
+	#Range: 40 ~ 20000
+	timeoutTicks = 1200
+	#Navigation timeout before a repath is attempted
+	#Range: 20 ~ 2000
+	moveTimeoutTicks = 200
+	#Repath attempts before TARGET_UNREACHABLE.
+	#Three was a hair-trigger on broken ground and produced most of the
+	#unreachable failures in play; terrain modification only gets a chance
+	#once ordinary navigation has genuinely run out of ideas.
+	#Range: 1 ~ 16
+	repathAttempts = 6
+
+[combat]
+	#Citizens defend themselves against hostile mobs (deterministic local reflex)
+	enabled = true
+	#Base radius (blocks) in which citizens engage hostile mobs;
+	#scaled per citizen by personality risk tolerance (0.5x..1.5x)
+	#Range: 2.0 ~ 32.0
+	triggerRadius = 12.0
+	#Ticks between melee attacks
+	#Range: 4 ~ 200
+	attackIntervalTicks = 16
+	#Ticks without a landed hit before an unreachable target is abandoned
+	#Range: 20 ~ 2000
+	chaseTimeoutTicks = 200
+
+[colony]
+	#Keep the colony's chunks loaded so it keeps living when no player is nearby.
+	#Without this a dedicated server unloads the settlement the moment you walk
+	#away or log out, and the colony silently stops instead of carrying on.
+	keepLoaded = true
+	#How many chunks either side of the town centre to keep loaded.
+	#Every forced chunk ticks forever, so this is a real cost: 4 covers a
+	#144-block-wide town in 81 chunks.
+	#Range: 0 ~ 12
+	keepLoadedRadius = 4
+
+[livestock]
+	#Maximum colony livestock per species, including babies
+	#Range: 2 ~ 100
+	maxPerSpecies = 10
+	#Maximum colony-owned wolves across all dimensions, including unloaded wolves
+	#Range: 0 ~ 200
+	maxWolves = 50
+
+[simulation]
+	#Seed for deterministic personality derivation
+	#Range: > 0
+	seed = 42

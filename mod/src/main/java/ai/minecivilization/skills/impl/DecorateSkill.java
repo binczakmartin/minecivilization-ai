@@ -3,6 +3,8 @@ package ai.minecivilization.skills.impl;
 import java.util.ArrayList;
 import java.util.List;
 
+import ai.minecivilization.entity.WorkAnimation;
+import ai.minecivilization.navigation.PlacementSafety;
 import ai.minecivilization.navigation.PlacementSupport;
 import ai.minecivilization.colony.DecorPlan;
 import ai.minecivilization.colony.Zone;
@@ -147,6 +149,7 @@ public final class DecorateSkill implements CitizenSkill {
     /** True when this spot is still empty, still affordable and still standable. */
     private boolean stillWanted(SkillContext context, DecorPlan.Spot spot) {
         if (!context.citizen.getInventory().containsAtLeast(spot.block(), 1)) return false;
+        if (ConstructionManager.get(context.level).protectsCell(groundAt(context, spot.pos()))) return false;
         BlockPos ground = groundAt(context, spot.pos());
         return context.level.getBlockState(ground).canBeReplaced();
     }
@@ -160,18 +163,22 @@ public final class DecorateSkill implements CitizenSkill {
 
     private boolean place(SkillContext context, DecorPlan.Spot spot) {
         BlockPos pos = groundAt(context, spot.pos());
+        if (ConstructionManager.get(context.level).protectsCell(pos)) return false;
         BlockState state = ConstructionManager.parseState(context.level, spot.block());
-        if (state == null || !PlacementSupport.canPlace(context.level, state, pos)) return false;
+        if (state == null || !PlacementSupport.canPlace(context.level, state, pos)
+                || !PlacementSafety.canOccupy(context.level, context.citizen, pos, false)) return false;
         if (!context.level.getBlockState(pos).canBeReplaced()) return false;
 
         CitizenInventory inventory = context.citizen.getInventory();
         if (!inventory.containsAtLeast(spot.block(), 1)) return false;
 
         inventory.extract(spot.block(), 1);
-        if (!context.level.setBlock(pos, state, 3)) {
+        if (!context.level.setBlock(pos, state, 3)
+                || !context.level.getBlockState(pos).equals(state)) {
             inventory.insert(new ItemStack(CitizenInventory.itemById(spot.block())));
             return false;
         }
+        context.citizen.animateAction(WorkAnimation.PLACE, pos);
         context.citizen.onBlockPlaced(spot.block());
         return true;
     }

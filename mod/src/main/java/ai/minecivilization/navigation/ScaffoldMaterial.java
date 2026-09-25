@@ -53,6 +53,24 @@ public final class ScaffoldMaterial {
             "minecraft:mangrove_log",
             "minecraft:cherry_log");
 
+    /** Stair blocks used when a route needs a climb rather than a full pillar. */
+    static final List<String> STAIR_PREFERRED = List.of(
+            "minecraft:oak_stairs",
+            "minecraft:spruce_stairs",
+            "minecraft:birch_stairs",
+            "minecraft:jungle_stairs",
+            "minecraft:acacia_stairs",
+            "minecraft:dark_oak_stairs",
+            "minecraft:cobblestone_stairs",
+            "minecraft:stone_stairs",
+            "minecraft:andesite_stairs",
+            "minecraft:granite_stairs",
+            "minecraft:diorite_stairs",
+            "minecraft:cobbled_deepslate_stairs",
+            "minecraft:deepslate_stairs",
+            "minecraft:tuff_stairs",
+            "minecraft:netherrack_stairs");
+
     /**
      * Never spent on scaffolding: gravity blocks fall out from under the
      * builder, and the rest are worth more than a shortcut.
@@ -100,7 +118,111 @@ public final class ScaffoldMaterial {
         return bestPartial;
     }
 
-    /** How many blocks the citizen could place in total, across all usable materials. */
+    /** Best usable construction block, including stairs. */
+    /**
+     * Rubble: material worth nothing, which is what a pillar should be made of.
+     *
+     * <p>A citizen that has just felled a tree is holding logs, and spending
+     * one as a stepping stone costs the colony a plank's worth of building
+     * material to save itself digging a block of dirt. Dirt is underfoot
+     * everywhere and worth nothing; the logs are the entire point of the
+     * job.</p>
+     */
+    private static final List<String> CHEAP = List.of(
+            "minecraft:dirt",
+            "minecraft:coarse_dirt",
+            "minecraft:gravel",
+            "minecraft:sand",
+            "minecraft:cobblestone",
+            "minecraft:cobbled_deepslate",
+            "minecraft:andesite",
+            "minecraft:diorite",
+            "minecraft:granite",
+            "minecraft:tuff",
+            "minecraft:netherrack");
+
+    /** How much expendable rubble the citizen is carrying. */
+    public static int availableCheap(Map<String, Integer> counts) {
+        if (counts == null) return 0;
+        int total = 0;
+        for (String candidate : CHEAP) {
+            total += Math.max(0, counts.getOrDefault(candidate, 0));
+        }
+        return total;
+    }
+
+    public static int availableCheap(CitizenInventory inventory) {
+        return availableCheap(snapshot(inventory));
+    }
+
+    /** True for material a colony would rather build with than stand on. */
+    public static boolean isPrecious(String itemId) {
+        return itemId != null && !CHEAP.contains(itemId);
+    }
+
+    public static String chooseAny(Map<String, Integer> counts, int needed) {
+        if (counts == null || counts.isEmpty()) return null;
+        int want = Math.max(1, needed);
+        String full = choose(counts, want);
+        if (full != null && counts.getOrDefault(full, 0) >= want) return full;
+        String stair = chooseStair(counts, want);
+        if (stair != null && counts.getOrDefault(stair, 0) >= want) return stair;
+        return full != null ? full : stair;
+    }
+
+    public static String chooseAny(CitizenInventory inventory, int needed) {
+        return chooseAny(snapshot(inventory), needed);
+    }
+
+    public static int availableAny(Map<String, Integer> counts) {
+        return available(counts) + availableStairs(counts);
+    }
+
+    public static int availableAny(CitizenInventory inventory) {
+        return availableAny(snapshot(inventory));
+    }
+
+    private static int availableStairs(Map<String, Integer> counts) {
+        if (counts == null) return 0;
+        int total = 0;
+        for (String candidate : STAIR_PREFERRED) {
+            total += Math.max(0, counts.getOrDefault(candidate, 0));
+        }
+        return total;
+    }
+
+    /** Best stair material currently carried, or null when only full blocks are available. */
+    public static String chooseStair(Map<String, Integer> counts, int needed) {
+        if (counts == null || counts.isEmpty()) return null;
+        int want = Math.max(1, needed);
+        for (String candidate : STAIR_PREFERRED) {
+            if (counts.getOrDefault(candidate, 0) >= want) return candidate;
+        }
+        String bestPartial = null;
+        int bestPartialCount = 0;
+        for (String candidate : STAIR_PREFERRED) {
+            int held = counts.getOrDefault(candidate, 0);
+            if (held > bestPartialCount) {
+                bestPartialCount = held;
+                bestPartial = candidate;
+            }
+        }
+        return bestPartial;
+    }
+
+    public static String chooseStair(CitizenInventory inventory, int needed) {
+        return chooseStair(snapshot(inventory), needed);
+    }
+
+    public static int availableStairs(CitizenInventory inventory) {
+        Map<String, Integer> counts = snapshot(inventory);
+        int total = 0;
+        for (String candidate : STAIR_PREFERRED) {
+            total += Math.max(0, counts.getOrDefault(candidate, 0));
+        }
+        return total;
+    }
+
     public static int available(Map<String, Integer> counts) {
         if (counts == null) return 0;
         int total = 0;
@@ -112,7 +234,8 @@ public final class ScaffoldMaterial {
 
     /** True when this item may be spent on throwaway construction. */
     public static boolean isExpendable(String itemId) {
-        return itemId != null && !NEVER.contains(itemId) && PREFERRED.contains(itemId);
+        return itemId != null && !NEVER.contains(itemId)
+                && (PREFERRED.contains(itemId) || STAIR_PREFERRED.contains(itemId));
     }
 
     // ------------------------------------------------------------------ world adapter

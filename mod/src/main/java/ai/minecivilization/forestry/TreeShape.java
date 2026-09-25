@@ -1,6 +1,7 @@
 package ai.minecivilization.forestry;
 
 import java.util.ArrayDeque;
+import java.util.Collection;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.Deque;
@@ -38,6 +39,16 @@ public final class TreeShape {
     public static final int MAX_HEIGHT = 40;
     /** Leaves that must touch the region before it counts as a tree, not a wall. */
     public static final int MIN_LEAVES = 4;
+    /** Leaves taken with one tree before the canopy is called done. */
+    public static final int MAX_CANOPY = 512;
+    /**
+     * How far a leaf may sit from the nearest log and still belong to the tree.
+     *
+     * <p>Vanilla leaves decay beyond distance 7 from a log, so anything further
+     * than that was never this tree's. Five is tighter still, which keeps a
+     * lumberjack from eating half a jungle through touching canopies.</p>
+     */
+    public static final int LEAF_REACH = 5;
 
     private TreeShape() {
     }
@@ -105,6 +116,131 @@ public final class TreeShape {
                 .thenComparingInt(BlockPos::getX)
                 .thenComparingInt(BlockPos::getZ));
         return ordered;
+    }
+
+    /**
+     * The leaves belonging to a felled tree.
+     *
+     * <p>Felling only the logs leaves a canopy hanging in the air. Vanilla
+     * decay eventually removes the ones it placed, slowly and only within
+     * distance seven of a log — and never the persistent ones — so a worked
+     * forest fills up with floating green. Taking the canopy down with the
+     * trunk is what makes felling leave no trace, and it is also where the
+     * saplings for replanting come from.</p>
+     *
+     * <p>Grown outward from the logs rather than collected by box, so a tree
+     * standing against a cliff of leaves takes its own canopy and not the
+     * cliff. Bounded by {@link #LEAF_REACH} and {@link #MAX_CANOPY}, because
+     * touching canopies in a jungle are otherwise one connected region the
+     * size of the biome.</p>
+     */
+    public static List<BlockPos> canopy(Collection<BlockPos> logs, Predicate<BlockPos> isLeaf) {
+        List<BlockPos> ordered = new ArrayList<>();
+        if (logs == null || logs.isEmpty() || isLeaf == null) return ordered;
+
+        Set<BlockPos> trunk = new HashSet<>(logs);
+        Set<BlockPos> leaves = new HashSet<>();
+        Deque<BlockPos> frontier = new ArrayDeque<>();
+
+        // Seed from every leaf touching a log, then grow through the canopy.
+        for (BlockPos log : trunk) {
+            for (BlockPos neighbour : around(log)) {
+                if (trunk.contains(neighbour) || leaves.contains(neighbour)) continue;
+                if (!isLeaf.test(neighbour)) continue;
+                leaves.add(neighbour);
+                frontier.add(neighbour);
+            }
+        }
+        while (!frontier.isEmpty() && leaves.size() < MAX_CANOPY) {
+            BlockPos current = frontier.poll();
+            for (BlockPos neighbour : around(current)) {
+                if (trunk.contains(neighbour) || leaves.contains(neighbour)) continue;
+                if (!isLeaf.test(neighbour)) continue;
+                if (nearestLogDistance(trunk, neighbour) > LEAF_REACH) continue;
+                leaves.add(neighbour);
+                frontier.add(neighbour);
+            }
+        }
+
+        ordered.addAll(leaves);
+        ordered.sort(fellingComparator(baseOfAll(trunk)));
+        return ordered;
+    }
+
+    /**
+     * Logs and leaves in one work order: lowest first, trunk before canopy at
+     * the same height.
+     *
+     * <p>Bottom-up because that is the order a citizen can physically reach —
+     * it climbs the trunk it has not felled yet. Logs before leaves at a given
+     * height because the log is what the next climb stands on.</p>
+     */
+    public static List<BlockPos> fellingOrder(List<BlockPos> logs, List<BlockPos> leaves) {
+        List<BlockPos> out = new ArrayList<>();
+        if (logs != null) out.addAll(logs);
+        if (leaves == null || leaves.isEmpty()) return out;
+
+        Set<BlockPos> logSet = new HashSet<>(out);
+        BlockPos base = baseOfAll(logSet);
+
+        // Every log first, then the canopy — not interleaved by height.
+        //
+        // Interleaving looks tidier and is much worse: an acacia's canopy sits
+        // at the same height as its upper trunk, so a citizen that wanted one
+        // log for a sword spent four minutes on a hundred and forty leaves
+        // before finishing the tree. Taking the trunk out first means the tree
+        // is *down* in seconds, vanilla decay starts on the foliage
+        // immediately, and whatever the citizen clears afterwards is a bonus
+        // rather than a toll.
+        List<BlockPos> canopy = new ArrayList<>();
+        for (BlockPos leaf : leaves) {
+            if (!logSet.contains(leaf)) canopy.add(leaf);
+        }
+        canopy.sort(fellingComparator(base));
+        out.sort(fellingComparator(base));
+        out.addAll(canopy);
+        return out;
+    }
+
+    /** How many of a felling order are logs — the part that must be finished. */
+    public static int logCount(List<BlockPos> order, Set<BlockPos> logs) {
+        if (order == null || logs == null) return 0;
+        int count = 0;
+        for (BlockPos pos : order) {
+            if (!logs.contains(pos)) break;
+            count++;
+        }
+        return count;
+    }
+
+    private static Comparator<BlockPos> fellingComparator(BlockPos base) {
+        return Comparator
+                .comparingInt((BlockPos p) -> p.getY())
+                .thenComparingInt(p -> horizontalDistSqr(base, p))
+                .thenComparingInt(BlockPos::getX)
+                .thenComparingInt(BlockPos::getZ);
+    }
+
+    /** Chebyshev distance from a cell to the nearest log of the tree. */
+    private static int nearestLogDistance(Set<BlockPos> logs, BlockPos pos) {
+        int best = Integer.MAX_VALUE;
+        for (BlockPos log : logs) {
+            int d = Math.max(Math.abs(log.getX() - pos.getX()),
+                    Math.max(Math.abs(log.getY() - pos.getY()),
+                            Math.abs(log.getZ() - pos.getZ())));
+            if (d < best) best = d;
+            if (best <= 1) break;
+        }
+        return best;
+    }
+
+    /** The lowest, most central log — the stump, for ordering and replanting. */
+    private static BlockPos baseOfAll(Set<BlockPos> logs) {
+        BlockPos best = null;
+        for (BlockPos log : logs) {
+            if (best == null || log.getY() < best.getY()) best = log;
+        }
+        return best == null ? BlockPos.ZERO : best;
     }
 
     /**

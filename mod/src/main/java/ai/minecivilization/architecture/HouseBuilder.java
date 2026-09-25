@@ -1,7 +1,10 @@
 package ai.minecivilization.architecture;
 
 import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 import ai.minecivilization.construction.Blueprint;
 
@@ -74,12 +77,78 @@ public final class HouseBuilder {
         // camp layout spaces buildings by this, and a roof that overhangs into
         // the neighbour's plot is how a village turns into a pile-up.
         int height = SKIRT_DEPTH + WALL_HEIGHT + ridgeHeight(d) + 2;
-        return new Blueprint(id, name, w + 2 * OVERHANG, height, d + 2 * OVERHANG, out);
+        return new Blueprint(id, name, w + 2 * OVERHANG, height, d + 2 * OVERHANG,
+                withRoofSupports(out, p));
     }
 
     /** Total blueprint height above the floor, for sizing. */
     static int ridgeHeight(int depth) {
         return (depth + 1) / 2;
+    }
+
+    /**
+     * Re-order the generated plan so every roof piece has a real vertical
+     * support chain.  A local canPlace check only sees the cell immediately
+     * below; without this pass an overhang stair and a ridge slab are valid
+     * blueprint entries that remain permanently deferred in the world.
+     * Existing house geometry is not changed: the pass adds only missing
+     * foundation cells and emits them before the roof.
+     */
+    private static List<Blueprint.BlockEntry> withRoofSupports(List<Blueprint.BlockEntry> original,
+                                                                Palette p) {
+        Set<String> all = new HashSet<>();
+        for (Blueprint.BlockEntry entry : original) {
+            all.add(key(entry.x, entry.y, entry.z));
+        }
+        Set<String> supports = new HashSet<>();
+        for (Blueprint.BlockEntry entry : original) {
+            if (!isRoofPiece(entry, p)) continue;
+            for (int y = entry.y - 1; y >= 0; y--) {
+                String below = key(entry.x, y, entry.z);
+                if (all.contains(below) || supports.contains(below)) break;
+                supports.add(below);
+            }
+        }
+
+        List<Blueprint.BlockEntry> ordered = new ArrayList<>(original.size() + supports.size());
+        for (Blueprint.BlockEntry entry : original) {
+            if (!isRoofPiece(entry, p)) ordered.add(entry);
+        }
+        List<String> supportKeys = new ArrayList<>(supports);
+        supportKeys.sort(Comparator.comparingInt(HouseBuilder::supportY)
+                .thenComparingInt(HouseBuilder::supportX)
+                .thenComparingInt(HouseBuilder::supportZ));
+        for (String support : supportKeys) {
+            String[] parts = support.split(",");
+            ordered.add(new Blueprint.BlockEntry(Integer.parseInt(parts[0]),
+                    Integer.parseInt(parts[1]), Integer.parseInt(parts[2]), p.foundation()));
+        }
+        for (Blueprint.BlockEntry entry : original) {
+            if (isRoofPiece(entry, p)) ordered.add(entry);
+        }
+        return ordered;
+    }
+
+    private static boolean isRoofPiece(Blueprint.BlockEntry entry, Palette p) {
+        return entry.y > WALL_HEIGHT
+                && (entry.itemId().equals(p.stairs()) || entry.itemId().equals(p.slab()));
+    }
+
+    private static String key(int x, int y, int z) {
+        return x + "," + y + "," + z;
+    }
+
+    private static int supportX(String key) {
+        return Integer.parseInt(key.substring(0, key.indexOf(',')));
+    }
+
+    private static int supportY(String key) {
+        int comma = key.indexOf(',');
+        return Integer.parseInt(key.substring(comma + 1, key.lastIndexOf(',')));
+    }
+
+    private static int supportZ(String key) {
+        return Integer.parseInt(key.substring(key.lastIndexOf(',') + 1));
     }
 
     // ------------------------------------------------------------------ base
@@ -110,6 +179,10 @@ public final class HouseBuilder {
     private static void floor(List<Blueprint.BlockEntry> out, int w, int d, Palette p) {
         for (int x = 1; x < w - 1; x++) {
             for (int z = 1; z < d - 1; z++) {
+                // The workstation replaces this one interior floor cell; its
+                // foundation block below remains the support, so a table never
+                // gets planned twice.
+                if (x == 1 && z <= 2) continue;
                 out.add(new Blueprint.BlockEntry(x, 1, z, p.wall()));
             }
         }
@@ -266,6 +339,14 @@ public final class HouseBuilder {
     /** The small things: a lit doorway and a stone course at the base. */
     private static void details(List<Blueprint.BlockEntry> out, int w, int d, Palette p) {
         int doorX = w / 2;
+        // A real workstation belongs to the house plan, not to a random citizen
+        // that happens to pass through it.  It sits on the y=0 foundation/floor
+        // and leaves the doorway and the front approach clear.
+        out.add(new Blueprint.BlockEntry(1, 1, 1, "minecraft:crafting_table"));
+        // A floor-standing interior light is supported by the same foundation as
+        // the table; unlike a wall torch it cannot be stranded on an unbuilt
+        // facade.  The outside lights below still mark the entrance.
+        out.add(new Blueprint.BlockEntry(1, 1, 2, p.light()));
         // Lights either side of the threshold, standing on the plinth outside
         // the wall. Putting them *in* the wall line simply deleted the wall.
         out.add(new Blueprint.BlockEntry(doorX - 1, 2, d, p.light()));

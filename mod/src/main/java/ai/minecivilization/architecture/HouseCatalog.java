@@ -47,13 +47,28 @@ public final class HouseCatalog {
         String species = dominantSpecies(level);
         int[] size = FOOTPRINTS[Math.floorMod(index, FOOTPRINTS.length)];
         String id = ID_PREFIX + species + "_" + size[0] + "x" + size[1] + "_v" + (index % 4);
+        return ensureRegistered(level, id);
+    }
 
+    /**
+     * Re-register a generated house id after a restart.  House blueprints are
+     * deterministic, so the id contains enough information to rebuild the
+     * geometry without inventing a new project or moving its cells.
+     */
+    public static Blueprint ensureRegistered(ServerLevel level, String id) {
+        if (id == null || !id.startsWith(ID_PREFIX)) return null;
         Blueprint existing = ConstructionManager.blueprint(id);
         if (existing != null) return existing;
-
+        var matcher = java.util.regex.Pattern.compile(
+                "^house_(.+)_(\\d+)x(\\d+)_v(\\d+)$").matcher(id);
+        if (!matcher.matches()) return null;
+        String species = matcher.group(1);
+        int width = Integer.parseInt(matcher.group(2));
+        int depth = Integer.parseInt(matcher.group(3));
+        int variant = Integer.parseInt(matcher.group(4));
         Blueprint house = HouseBuilder.house(id,
-                capitalise(species) + " House", size[0], size[1],
-                Palette.forSpecies(species), index);
+                capitalise(species) + " House", width, depth,
+                Palette.forSpecies(species), variant);
         ConstructionManager.registerBlueprint(house);
         return house;
     }

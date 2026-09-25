@@ -2,6 +2,7 @@ package ai.minecivilization.skills.impl;
 
 import java.util.List;
 
+import ai.minecivilization.entity.WorkAnimation;
 import ai.minecivilization.skills.CitizenSkill;
 import ai.minecivilization.skills.SkillContext;
 import ai.minecivilization.skills.SkillFailure;
@@ -41,6 +42,16 @@ public final class PickupItemSkill implements CitizenSkill {
         AABB box = context.citizen.getBoundingBox().inflate(RADIUS);
         List<ItemEntity> items = context.level.getEntitiesOfClass(ItemEntity.class, box);
         for (ItemEntity item : items) {
+            ItemStack candidate = item.getItem();
+            if (candidate.isEmpty() || candidate.isDamageableItem()) continue;
+            if (context.params.resource != null) {
+                String id = ai.minecivilization.inventory.CitizenInventory.idOf(candidate);
+                boolean wanted = ai.minecivilization.forestry.ResourceFamily.satisfies(
+                        context.params.resource, id)
+                        || ai.minecivilization.forestry.ResourceFamily.sourceBlocks(
+                        context.params.resource).contains(id);
+                if (!wanted) continue;
+            }
             double d = item.distanceToSqr(context.citizen);
             if (d < best) {
                 best = d;
@@ -59,6 +70,7 @@ public final class PickupItemSkill implements CitizenSkill {
 
         double distSqr = nearest.distanceToSqr(context.citizen);
         if (distSqr > 5.0) {
+            context.citizen.clearWorkAnimation();
             context.navigator.moveTo(nearest, 1.0);
             context.navigator.tick();
             if (context.navigator.hasFailed()) {
@@ -79,6 +91,7 @@ public final class PickupItemSkill implements CitizenSkill {
             nearest.setItem(stack);
         }
         if (moved > 0) {
+            context.citizen.animateAction(WorkAnimation.REACH, nearest.blockPosition());
             Integer picked = context.get("pickedUp", 0);
             context.put("pickedUp", picked + moved);
         }

@@ -1,5 +1,6 @@
 package ai.minecivilization.navigation;
 
+import ai.minecivilization.construction.ConstructionManager;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.server.level.ServerLevel;
@@ -58,12 +59,23 @@ public final class LevelBlockView implements BlockView {
         if (!inBounds(pos)) return false;
         BlockState state = level.getBlockState(pos);
         if (state.isAir()) return false;
+        if (ConstructionManager.get(level).protectsCell(pos)) return false;
         if (!state.getFluidState().isEmpty()) return false;       // never "mine" a fluid
         if (state.getDestroySpeed(level, pos) < 0f) return false;  // bedrock & friends
         if (state.is(BlockTags.BEDS) || state.is(BlockTags.DOORS)) return false;
         if (isSettlementProperty(state)) return false;
         // Anything with contents or state worth keeping (chests, furnaces, signs).
         return !(level.getBlockEntity(pos) instanceof BlockEntity);
+    }
+
+    @Override
+    public boolean swimmable(BlockPos pos) {
+        if (!inBounds(pos)) return false;
+        FluidState fluid = level.getFluidState(pos);
+        if (fluid.isEmpty() || fluid.is(net.minecraft.tags.FluidTags.LAVA)) return false;
+        // Source or flowing, it is water and a citizen can swim in it — but
+        // not if something solid shares the cell.
+        return level.getBlockState(pos).getCollisionShape(level, pos).isEmpty();
     }
 
     @Override

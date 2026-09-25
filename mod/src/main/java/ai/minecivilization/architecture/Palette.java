@@ -63,6 +63,10 @@ public record Palette(
      */
     public java.util.Set<String> materials() {
         return new java.util.LinkedHashSet<>(java.util.List.of(
-                wall, post, trim, stairs, slab, foundation, foundationSlab, window, light));
+                wall, post, trim, stairs, slab, foundation, foundationSlab, window, light,
+                // Every generated house has a real workstation; keeping it in the
+                // palette's BOM set makes the early-colony affordability check
+                // honest instead of silently inventing a free table.
+                "minecraft:crafting_table"));
     }
 }

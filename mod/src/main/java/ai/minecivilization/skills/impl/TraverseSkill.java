@@ -3,6 +3,7 @@ package ai.minecivilization.skills.impl;
 import java.util.List;
 
 import ai.minecivilization.citizen.CitizenTaskParams;
+import ai.minecivilization.entity.WorkAnimation;
 import ai.minecivilization.navigation.BlockView;
 import ai.minecivilization.navigation.LevelBlockView;
 import ai.minecivilization.navigation.ScaffoldMaterial;
@@ -43,15 +44,23 @@ public final class TraverseSkill implements CitizenSkill {
     private static final int MAX_REPLANS = 3;
     /** Arm's reach for an operation, squared — matches MINE_BLOCK. */
     private static final double OP_REACH_SQR = 20.0;
-    /** Plain steps merged into a single navigation call. */
-    private static final int MAX_WALK_RUN = 24;
-
     /**
      * How far ahead one planned leg may reach. The terrain planner searches a
      * bounded box, so a goal beyond it cannot be planned at all — which is why
      * every walk home from a long expedition failed outright.
      */
     private static final int LEG_LENGTH = 40;
+    /** Vertical distance covered by one waypoint when a mine/home leg is far apart. */
+    private static final int VERTICAL_LEG = 8;
+    /**
+     * Block operations one leg of a route may cost.
+     *
+     * <p>Generous, because digging is paid for in time rather than material
+     * and a shaft down to ore is genuinely dozens of blocks. The planner's own
+     * node ceiling is what keeps planning cheap; this only bounds the size of
+     * the job it is allowed to come back with.</p>
+     */
+    private static final int MAX_ROUTE_OPS = 160;
 
     private TerrainPlan plan;
     private BlockPos finalGoal;
@@ -90,6 +99,10 @@ public final class TraverseSkill implements CitizenSkill {
         subContext = null;
         walkTarget = null;
         context.navigator.stop();
+        // TRAVERSE owns the worker for its whole plan, including the short
+        // pauses between sub-skills.  Keeping the crouch flag here prevents a
+        // pillar operation from losing fall protection while it places a block.
+        context.citizen.setBracedPlacement(true);
     }
 
     @Override
@@ -99,7 +112,10 @@ public final class TraverseSkill implements CitizenSkill {
             if (settled != null) return settled;
         }
         List<TerrainPlan.Step> steps = plan.steps();
-        if (stepIndex >= steps.size()) return SkillResult.COMPLETED;
+        if (stepIndex >= steps.size()) {
+            context.citizen.setBracedPlacement(false);
+            return SkillResult.COMPLETED;
+        }
 
         TerrainPlan.Step step = steps.get(stepIndex);
         if (opIndex < step.ops.size()) {
@@ -128,14 +144,14 @@ public final class TraverseSkill implements CitizenSkill {
         // question into a series of answerable ones.
         BlockPos goal = legTowards(context, finalGoal);
 
-        int carried = ScaffoldMaterial.available(inventory);
+        int carried = ScaffoldMaterial.availableAny(inventory);
         TerrainPlanner.Options options = new TerrainPlanner.Options();
         // First discover the physical route.  It may need more blocks than the
         // citizen currently holds; recover those from nearby real ground and
         // plan again rather than building half a pillar and failing.
         options.allowPlace = true;
         options.maxPlacements = 64;
-        options.maxOps = 64;
+        options.maxOps = MAX_ROUTE_OPS;
         options.arrivalRadius = arrivalRadius(context);
 
         planOrigin = context.citizen.blockPosition();
@@ -147,7 +163,11 @@ public final class TraverseSkill implements CitizenSkill {
             return SkillResult.FAILED;
         }
         if (discovered.isEmpty()) {
-            if (arrivedAtFinalGoal(context)) return SkillResult.COMPLETED;
+            if (arrivedAtFinalGoal(context)) {
+                context.citizen.setBracedPlacement(false);
+                context.citizen.setControlledDrop(false);
+                return SkillResult.COMPLETED;
+            }
             context.fail(SkillFailure.unreachable(
                     "terrain planner stopped inside the arrival radius without reaching "
                             + finalGoal));
@@ -156,16 +176,28 @@ public final class TraverseSkill implements CitizenSkill {
 
         int placements = discovered.countOps(TerrainPlan.OpKind.PLACE);
         if (placements > carried) {
+            // Try to pay for the nice route by digging up some earth. If that
+            // does not work, fall through and plan a route we can actually
+            // afford — walking round, or tunnelling. Failing here instead was
+            // the single largest source of failures in play: the citizen gave
+            // up on a journey it could have walked, because the *best* route
+            // happened to want blocks it did not have.
             SkillResult recovery = recoverScaffold(context, placements - carried);
-            if (recovery != null) return recovery;
+            if (recovery == SkillResult.RUNNING) return recovery;
         }
 
         // Now enforce the physical budget.  The discovered route is retained
         // only when its placements fit; otherwise a fresh plan may choose a
         // shorter, dig-only route.
-        carried = ScaffoldMaterial.available(inventory);
+        carried = ScaffoldMaterial.availableAny(inventory);
+        // Placing is limited by what is in the pack; digging is not. Tying the
+        // whole operation budget to carried material meant a citizen with
+        // empty hands could plan at most thirty-two blocks of work, which is
+        // not enough to reach ore fifteen blocks under its feet — and it
+        // reported that as "no route even after digging and bridging" while
+        // standing on perfectly diggable ground.
         options.maxPlacements = carried;
-        options.maxOps = Math.min(64, 32 + carried);
+        options.maxOps = MAX_ROUTE_OPS;
         plan = TerrainPlanner.plan(planOrigin, goal, view, options);
         if (plan == null) {
             context.fail(SkillFailure.unreachable(
@@ -174,7 +206,11 @@ public final class TraverseSkill implements CitizenSkill {
             return SkillResult.FAILED;
         }
         if (plan.isEmpty()) {
-            if (arrivedAtFinalGoal(context)) return SkillResult.COMPLETED;
+            if (arrivedAtFinalGoal(context)) {
+                context.citizen.setBracedPlacement(false);
+                context.citizen.setControlledDrop(false);
+                return SkillResult.COMPLETED;
+            }
             context.fail(SkillFailure.unreachable(
                     "terrain planner stopped inside the arrival radius without reaching "
                             + finalGoal));
@@ -183,7 +219,7 @@ public final class TraverseSkill implements CitizenSkill {
 
         placements = plan.countOps(TerrainPlan.OpKind.PLACE);
         if (placements > 0) {
-            scaffold = ScaffoldMaterial.choose(inventory, placements);
+            scaffold = ScaffoldMaterial.chooseAny(inventory, placements);
             if (scaffold == null) {
                 context.fail(SkillFailure.missing(
                         "the route needs " + placements + " blocks to place and none are expendable"));
@@ -197,31 +233,30 @@ public final class TraverseSkill implements CitizenSkill {
         return null;
     }
 
-    /** Mine one nearby earth block when a planned pillar/bridge is underfunded. */
+    /**
+     * Mine one nearby earth block when a planned pillar or bridge is underfunded.
+     *
+     * <p>Best-effort, never fatal. Somewhere to get a block from is a
+     * convenience, not a precondition for travelling: if there is no loose
+     * earth to hand the caller simply plans a cheaper route instead.</p>
+     *
+     * @return RUNNING while a block is being recovered, or null when this
+     *         citizen cannot top itself up here
+     */
     private SkillResult recoverScaffold(SkillContext context, int missing) {
-        if (recoveredBlocks >= 12) {
-            context.fail(SkillFailure.missing(
-                    "the route needs more building material and the nearby ground is exhausted"));
-            return SkillResult.FAILED;
-        }
-        BlockPos material = findRecoveryBlock(context);
-        if (material == null) {
-            context.fail(SkillFailure.missing(
-                    "the route needs " + missing + " more blocks, but no dirt is within reach"));
-            return SkillResult.FAILED;
-        }
+        if (recoveredBlocks >= 12) return null;
 
-        int before = ScaffoldMaterial.available(context.citizen.getInventory());
-        if (!context.level.destroyBlock(material, true, context.citizen)) {
-            context.fail(SkillFailure.unreachable("could not mine nearby scaffold material at " + material));
-            return SkillResult.FAILED;
-        }
+        BlockPos material = findRecoveryBlock(context);
+        if (material == null) return null;
+
+        int before = ScaffoldMaterial.availableAny(context.citizen.getInventory());
+        if (!context.level.destroyBlock(material, true, context.citizen)) return null;
+
+        context.citizen.animateAction(WorkAnimation.MINE, material);
         collectNearbyDrops(context);
-        int after = ScaffoldMaterial.available(context.citizen.getInventory());
-        if (after <= before) {
-            context.fail(SkillFailure.missing("the nearby block did not yield usable scaffold material"));
-            return SkillResult.FAILED;
-        }
+        int after = ScaffoldMaterial.availableAny(context.citizen.getInventory());
+        if (after <= before) return null;
+
         recoveredBlocks++;
         context.startGameTime = context.level.getGameTime();
         return SkillResult.RUNNING;
@@ -239,7 +274,8 @@ public final class TraverseSkill implements CitizenSkill {
                             pos.getY() + 0.5, pos.getZ() + 0.5) > 25.0) continue;
                     if (!context.level.isLoaded(pos)) continue;
                     BlockState state = context.level.getBlockState(pos);
-                    if (!state.is(BlockTags.DIRT) || state.is(Blocks.FARMLAND)) continue;
+                    if (!state.is(BlockTags.DIRT) || state.is(Blocks.FARMLAND)
+                            || !new LevelBlockView(context.level).diggable(pos)) continue;
                     if (context.level.getBlockEntity(pos) != null) continue;
 
                     BlockState above = context.level.getBlockState(pos.above());
@@ -259,7 +295,9 @@ public final class TraverseSkill implements CitizenSkill {
         var inventory = context.citizen.getInventory();
         var box = context.citizen.getBoundingBox().inflate(4.0);
         for (ItemEntity item : context.level.getEntitiesOfClass(ItemEntity.class, box)) {
-            if (!item.isAlive() || item.getItem().isEmpty()) continue;
+            if (!item.isAlive() || item.getItem().isEmpty()
+                    || !ScaffoldMaterial.isExpendable(
+                    ai.minecivilization.inventory.CitizenInventory.idOf(item.getItem()))) continue;
             int leftover = inventory.insert(item.getItem().copy());
             if (leftover <= 0) {
                 item.discard();
@@ -274,8 +312,15 @@ public final class TraverseSkill implements CitizenSkill {
     /** True when the citizen is at the journey's real destination. */
     private boolean arrivedAtFinalGoal(SkillContext context) {
         if (finalGoal == null) return true;
-        return TerrainPlanner.arrivedAt(context.citizen.blockPosition(), finalGoal,
-                Math.max(1, arrivalRadius(context)));
+        if (!TerrainPlanner.arrivedAt(context.citizen.blockPosition(), finalGoal,
+                Math.max(1, arrivalRadius(context)))) return false;
+        // Ask whether this is a place a body fits, not whether somebody could
+        // move into it: the citizen is already standing here, so the occupancy
+        // test it used to run could never pass and every arrival inside the
+        // radius was reported as a failure to reach the target.
+        return context.citizen.onGround()
+                && ai.minecivilization.navigation.PlacementSafety.canStandHere(
+                context.level, context.citizen, context.citizen.blockPosition());
     }
 
     /**
@@ -286,15 +331,27 @@ public final class TraverseSkill implements CitizenSkill {
     private static BlockPos legTowards(SkillContext context, BlockPos goal) {
         BlockPos here = context.citizen.blockPosition();
         if (ai.minecivilization.navigation.TravelLeg.withinOneLeg(
-                here.getX(), here.getZ(), goal.getX(), goal.getZ(), LEG_LENGTH)) {
+                here.getX(), here.getZ(), goal.getX(), goal.getZ(), LEG_LENGTH)
+                && Math.abs(goal.getY() - here.getY()) <= 40) {
             return goal;
         }
         int[] aim = ai.minecivilization.navigation.TravelLeg.aim(
                 here.getX(), here.getZ(), goal.getX(), goal.getZ(), LEG_LENGTH);
         int x = aim[0];
         int z = aim[1];
-        int y = context.level.getHeight(
-                net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z);
+        int verticalGap = goal.getY() - here.getY();
+        int y;
+        if (Math.abs(verticalGap) > 40) {
+            // Do not aim a deep mine directly at a surface waypoint: the two
+            // A* search boxes would be farther apart than their vertical range.
+            // Climb/descend in short, fully physical vertical legs instead.
+            y = here.getY() + Integer.signum(verticalGap) * VERTICAL_LEG;
+        } else {
+            y = context.level.getHeight(
+                    net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z);
+        }
+        y = Math.max(context.level.getMinBuildHeight() + 1,
+                Math.min(context.level.getMaxBuildHeight() - 2, y));
         return new BlockPos(x, y, z);
     }
 
@@ -318,6 +375,8 @@ public final class TraverseSkill implements CitizenSkill {
         }
         cancelSub(context);
         context.navigator.stop();
+        context.citizen.setBracedPlacement(true);
+        context.citizen.setControlledDrop(false);
         plan = null;
         walkTarget = null;
         context.startGameTime = context.level.getGameTime();
@@ -342,24 +401,32 @@ public final class TraverseSkill implements CitizenSkill {
             return replan(context, context.failure);
         }
 
+        // Mine/place sub-skills often stop navigation before doing their one
+        // atomic operation.  Re-assert the traversal guard around that pause.
+        context.citizen.setBracedPlacement(true);
         SkillResult result = sub.tick(subContext);
         if (result == SkillResult.RUNNING) return SkillResult.RUNNING;
 
         SkillFailure failure = subContext.failure;
+        boolean ownsScaffold = Boolean.TRUE.equals(
+                subContext.get("scaffoldOwned", true));
         cancelSub(context);
+        context.citizen.setBracedPlacement(true);
 
         if (result == SkillResult.COMPLETED || isHarmless(failure)) {
             // Remember anything laid down purely to stand on, so it can be
             // taken back afterwards rather than left as a dirt tower.
-            if (result == SkillResult.COMPLETED && op.kind == TerrainPlan.OpKind.PLACE) {
-                context.citizen.rememberScaffold(op.pos);
+            if (result == SkillResult.COMPLETED && ownsScaffold
+                    && op.kind == TerrainPlan.OpKind.PLACE) {
+                context.citizen.rememberScaffold(op.pos,
+                        context.level.getBlockState(op.pos));
             }
             finishOperation(context);
             return SkillResult.RUNNING;
         }
         // Ran out of the chosen material: try another before giving up.
         if (failure != null && "MISSING_RESOURCE".equals(failure.code)) {
-            String other = ScaffoldMaterial.choose(context.citizen.getInventory(), 1);
+            String other = ScaffoldMaterial.chooseAny(context.citizen.getInventory(), 1);
             if (other != null && !other.equals(scaffold)) {
                 scaffold = other;
                 return SkillResult.RUNNING;
@@ -369,10 +436,21 @@ public final class TraverseSkill implements CitizenSkill {
             // so a short climb does not deadlock on an empty inventory.
             SkillResult recovery = recoverScaffold(context, 1);
             if (recovery == SkillResult.RUNNING) return SkillResult.RUNNING;
+            context.fail(SkillFailure.missing(
+                    "out of material for the route and no earth within reach"));
             context.fail(failure);
             return SkillResult.FAILED;
         }
         return replan(context, failure);
+    }
+
+    private String blockStateFor(String material, String variant) {
+        if (material == null) return null;
+        if (variant != null && variant.startsWith("stair:")
+                && material.endsWith("_stairs")) {
+            return material + "[facing=" + variant.substring("stair:".length()) + "]";
+        }
+        return material;
     }
 
     private boolean beginOperation(SkillContext context, TerrainPlan.Op op) {
@@ -381,10 +459,25 @@ public final class TraverseSkill implements CitizenSkill {
         SkillType type;
         if (op.kind == TerrainPlan.OpKind.DIG) {
             type = SkillType.MINE_BLOCK;
+            params.extra.put("workAnimation", "mine");
         } else {
             type = SkillType.PLACE_BLOCK;
-            params.block = scaffold;
-            params.extra.put("item", scaffold);
+            String material = scaffold;
+            if (op.variant.startsWith("stair:")) {
+                String stair = ScaffoldMaterial.chooseStair(
+                        context.citizen.getInventory(), 1);
+                if (stair != null) material = stair;
+            } else if (material.endsWith("_stairs")) {
+                String full = ScaffoldMaterial.choose(context.citizen.getInventory(), 1);
+                if (full != null) material = full;
+            }
+            params.block = blockStateFor(material, op.variant);
+            params.extra.put("item", material);
+            params.extra.put("workAnimation", "place");
+            if (stepIndex < plan.steps().size()
+                    && plan.steps().get(stepIndex).move == TerrainPlan.MoveKind.PILLAR_UP) {
+                params.extra.put("pillar", "true");
+            }
         }
         subContext = new SkillContext(context.citizen, context.level, context.navigator, params);
         subContext.timeoutTicks = context.timeoutTicks;
@@ -407,9 +500,16 @@ public final class TraverseSkill implements CitizenSkill {
         context.startGameTime = context.level.getGameTime();
     }
 
-    private static boolean isSatisfied(SkillContext context, TerrainPlan.Op op) {
+    private boolean isSatisfied(SkillContext context, TerrainPlan.Op op) {
         if (op.kind == TerrainPlan.OpKind.DIG) {
             return context.level.getBlockState(op.pos).isAir();
+        }
+        // A pillar support must go through PlaceBlockSkill even when another
+        // worker already installed a block: the atomic raise still has to be
+        // validated and performed. Plain bridge/deck cells may be adopted.
+        if (stepIndex < plan.steps().size()
+                && plan.steps().get(stepIndex).move == TerrainPlan.MoveKind.PILLAR_UP) {
+            return false;
         }
         return !context.level.getBlockState(op.pos).canBeReplaced();
     }
@@ -427,13 +527,15 @@ public final class TraverseSkill implements CitizenSkill {
         if (walkTarget == null || !walkTarget.equals(from)) {
             walkTarget = from;
             context.navigator.stop();
-            context.navigator.moveTo(from, 1.0);
+            context.navigator.requestSafeStep();
+            context.navigator.moveToStand(from, 1.0);
         }
+        context.citizen.setBracedPlacement(true);
         context.navigator.tick();
         if (context.navigator.hasFailed()) {
             return replan(context, context.navigator.failure());
         }
-        if (context.navigator.isInRange() && !context.navigator.isMoving()) {
+        if (context.navigator.isArrived() && standingAt(context, from)) {
             walkTarget = null;
         }
         return SkillResult.RUNNING;
@@ -442,33 +544,59 @@ public final class TraverseSkill implements CitizenSkill {
     // ------------------------------------------------------------------ walking
 
     private SkillResult walk(SkillContext context, List<TerrainPlan.Step> steps) {
-        // Merge the run of steps that need no work into a single navigation leg.
-        int end = stepIndex;
-        while (end + 1 < steps.size()
-                && steps.get(end + 1).ops.isEmpty()
-                && end - stepIndex < MAX_WALK_RUN) {
-            end++;
-        }
-        BlockPos destination = steps.get(end).feet;
+        // Execute one planned transition at a time.  A geometrically nearby
+        // FALL/DIG_DOWN/PILLAR_UP is not interchangeable with a WALK: accepting
+        // it early can declare success while the worker is still airborne or
+        // can let vanilla navigation choose a different ledge.
+        TerrainPlan.Step step = steps.get(stepIndex);
+        BlockPos destination = step.feet;
+        context.citizen.setControlledDrop(step.move == TerrainPlan.MoveKind.FALL
+                || step.move == TerrainPlan.MoveKind.DIG_DOWN);
 
-        // Pillaring pushes the citizen up into the destination on its own.
-        if (context.citizen.blockPosition().equals(destination)) {
-            return arrive(context, end, steps);
+        if (standingAt(context, destination)) {
+            return arrive(context, stepIndex, steps);
         }
 
         if (walkTarget == null || !walkTarget.equals(destination)) {
             walkTarget = destination;
             context.navigator.stop();
-            context.navigator.moveTo(destination, 1.0);
+            context.navigator.requestSafeStep();
+            // A swim step has no ground to stand on by definition, so asking
+            // navigation for a standable cell there can only fail.
+            if (step.move == TerrainPlan.MoveKind.SWIM) {
+                context.navigator.moveTo(destination, 1.0);
+            } else {
+                context.navigator.moveToStand(destination, 1.0);
+            }
         }
+        context.citizen.setBracedPlacement(true);
         context.navigator.tick();
         if (context.navigator.hasFailed()) {
             return replan(context, context.navigator.failure());
         }
-        if (context.navigator.isInRange() && !context.navigator.isMoving()) {
-            return arrive(context, end, steps);
+        if (context.navigator.isArrived() && standingAt(context, destination)) {
+            return arrive(context, stepIndex, steps);
         }
         return SkillResult.RUNNING;
+    }
+
+    /**
+     * True when the citizen is standing on this exact step.
+     *
+     * <p>Asks whether a body fits here, not whether somebody could move in.
+     * The occupancy form can never say yes about a cell the asker is already
+     * standing in, so this check was permanently false and <em>every</em> step
+     * of <em>every</em> route reported as not-yet-reached. The citizen would
+     * walk onto the step, be told it had not arrived, walk again, and fail the
+     * whole traverse after six repaths — which is why a log three blocks
+     * overhead was unreachable and a felled tree always left its upper
+     * branches standing.</p>
+     */
+    private boolean standingAt(SkillContext context, BlockPos feet) {
+        return context.citizen.blockPosition().equals(feet)
+                && context.citizen.onGround()
+                && ai.minecivilization.navigation.PlacementSafety.canStandHere(
+                context.level, context.citizen, feet);
     }
 
     private SkillResult arrive(SkillContext context, int reached, List<TerrainPlan.Step> steps) {
@@ -476,12 +604,17 @@ public final class TraverseSkill implements CitizenSkill {
         opIndex = 0;
         walkTarget = null;
         context.navigator.stop();
+        context.citizen.setControlledDrop(false);
         context.startGameTime = context.level.getGameTime();
+        if (stepIndex < steps.size()) context.citizen.setBracedPlacement(true);
         if (stepIndex < steps.size()) return SkillResult.RUNNING;
 
         // End of this leg. Done if that was the destination, otherwise plan the
         // next leg from where we now stand.
-        if (arrivedAtFinalGoal(context)) return SkillResult.COMPLETED;
+        if (arrivedAtFinalGoal(context)) {
+            context.citizen.setBracedPlacement(false);
+            return SkillResult.COMPLETED;
+        }
         plan = null;
         replans = 0;   // progress was made: the budget is for stuck routes only
         return SkillResult.RUNNING;
@@ -493,6 +626,10 @@ public final class TraverseSkill implements CitizenSkill {
     public void cancel(SkillContext context) {
         cancelSub(context);
         context.navigator.stop();
+        if (!context.citizen.isOnOwnedScaffold()) {
+            context.citizen.setBracedPlacement(false);
+        }
+        context.citizen.setControlledDrop(false);
         plan = null;
         walkTarget = null;
     }

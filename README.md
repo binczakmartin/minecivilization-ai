@@ -184,6 +184,33 @@ See [`ai-service/README.md`](ai-service/README.md) for request/response schemas.
 
 ---
 
+## Watching the colony — press **K**
+
+The colony runs for hours, several hundred blocks wide, entirely on the server.
+Watching it used to mean reading a log file. **K** opens the supervision window
+instead — four tabs, live, and it does not pause the game, because a colony you
+can only watch while it is frozen is not much of a colony.
+
+| Tab | Answers |
+| --- | --- |
+| **Overview** | how many citizens are productive, what is being built and what it is waiting for, stores, growth, roads |
+| **Citizens** | every citizen sorted with the ones in trouble first; click one for the full readout |
+| **Map** | the colony from above — districts, roads, buildings, and where everyone is |
+| **Events** | the live feed: discoveries, builds, rescues, new roads, signs going up |
+
+Selecting a citizen gives you three buttons, which are the three things you
+actually want once you have found somebody:
+
+- **Track** — puts a live arrow, distance and depth on your action bar and
+  keeps it there as you both move
+- **Send home** — starts the rescue ladder, digging out if it has to
+- **Rethink** — forces a fresh AI decision
+
+The key is rebindable under Controls → MineCivilization. Everything the window
+shows is also available from `/mciv` if you prefer the terminal.
+
+---
+
 ## In-game commands
 
 Permission level 2+ (cheats / op):
@@ -204,7 +231,130 @@ Permission level 2+ (cheats / op):
 /mciv debug on|off                     toggle verbose mod logging
 ```
 
+Supervision — what the colony has actually been doing while you were away:
+
+```
+/mciv events [count]                   live newsfeed: discoveries, builds, rescues, roads
+/mciv map [width]                      the colony from above: districts, roads, people
+/mciv roads                            the road network: traffic, grade, what is next
+/mciv signs                            every sign put up or read, and where
+/mciv work                             productivity census, the work board, who needs help
+/mciv citizen report <name|id>         the full readout for one citizen (see below)
+/mciv citizen rescue <name|id>         order someone home; they dig out if they must
+/mciv track <name|id> | off            live arrow, distance and depth on the action bar
+```
+
 Citizen names are tab-completed from the live population.
+
+`/mciv citizen report` answers the questions the log never could:
+
+```
+Citizen Edda [MINER]  Lost
+  Goal:        EXPLORE — return home
+  Task:        ESCAPE @62,71,104
+  Doing:       digging out: y -27 → 4 (18 cut)
+  Priority:    return home
+  Position:    X=431 Y=-27 Z=-128  (98 below surface)
+  Destination: X=62 Y=71 Z=104
+  Colony:      X=62 Y=71 Z=104  (512m NW)
+  Condition:   health 14  hunger 61  energy 88
+  Because:     rescue: digging a staircase to the surface
+  Problem:     Not moving (43s)
+  Fallback:    DIG_TO_SURFACE (attempt 3)
+  Last done:   GATHER minecraft:iron_ore
+  Completed:   34 task(s)   failures 0   cognition idle
+```
+
+`/mciv track` puts the same citizen on your action bar and keeps it there:
+
+```
+↗ Edda  512m NW  ▼98 below  ESCAPE  [431,-27,-128]
+```
+
+---
+
+## How a citizen decides what to do
+
+Two layers, and the lower one never waits for the upper one.
+
+**The local autonomous layer** runs every tick, entirely in Java, and needs no
+service at all. It is what keeps a citizen busy: survival reflexes, then the
+colony's work board, then whatever deterministic job the citizen can find for
+itself. If the AI service is down, unplugged or has never existed, the
+settlement carries on building, hauling, mining, signposting and paving — you
+lose strategy, not life.
+
+**The AI strategic layer** is asked, asynchronously, for the things arithmetic
+cannot decide: what the colony should become, which building is worth the
+materials, where to expand, what it is about to run short of. Its answers are
+adopted at the next safe task boundary and never block a tick.
+
+### The work board
+
+Idle citizens do not invent work any more; they take it from a shared board
+(`work/GlobalTaskPool`), which ranks every source of jobs and hands out claims
+so two citizens cannot take the same one.
+
+| Priority | What it covers |
+| --- | --- |
+| `SURVIVAL` | eating, fleeing, healing |
+| `DANGER` | something hostile, here, now |
+| `RETURN_HOME` | lost, stranded or buried |
+| `FOOD` | the larder, which is what growth costs |
+| `TOOLS` | the axe, pickaxe, shovel and hoe a citizen lacks |
+| `CONSTRUCTION` | supplying and building active projects |
+| `RESOURCES` | wood, stone, ore |
+| `MAINTENANCE` | hauling to the warehouse, lighting, husbandry |
+| `EXPLORATION` | surveying unknown ground |
+| `IMPROVEMENT` | roads, signs, decoration |
+
+Adding a kind of colony work means one `GlobalTaskPool.register` call in
+`work/ColonyWork` — nothing in the brain, executor or planner changes.
+
+### Nobody is ever written off
+
+A citizen that cannot get home climbs a ladder of increasingly physical answers
+(`citizen/RescueLadder`), each failure buying the next:
+
+```
+known route → path → waypoint → look for open ground
+            → build a passage → cut a staircase to daylight → straight line
+```
+
+The last rungs cannot fail for any reason the world can produce: there is
+always sky above, and a citizen can always remove what is between. Someone
+sealed in a cave 90 blocks down will spend several minutes cutting a real
+staircase out, picking up everything it breaks, leaning the stair toward the
+colony so it surfaces closer to home than it went in. Being deep underground
+skips straight to digging, because no amount of pathfinding finds a route that
+does not exist.
+
+`citizen/StuckDetector` decides when that starts: standing in one block with a
+job, the same failure code repeating, or nothing completed for a long time are
+three different problems with three different cures.
+
+### Roads are worn in, not designed
+
+Every citizen leaves breadcrumbs (`roads/TripRecorder`). Journeys that repeat
+are merged into one remembered route in `roads/PathMemory`, and traffic earns a
+route its next grade:
+
+```
+TRACK → CLEARED → PAVED → LIT → SIGNPOSTED
+```
+
+Citizens then prefer the built road over open country, and the rescue ladder
+tries a known route before it tries anything else. A route where somebody died
+stops being improved and starts being avoided. The result is a network the
+colony built by walking, which is why it goes where the colony actually goes.
+
+### Signs are an interface, not decoration
+
+Signs go both ways. Citizens label the town hall, every district, warehouses,
+mines, roads and active builds — and they *read* signs back
+(`colony/SignRegistry`), including yours. Write `DANGER` on a post and the
+colony treats that place as dangerous. Signs survive restarts, so they are also
+the most durable memory the settlement has.
 
 ---
 
@@ -234,12 +384,16 @@ them with timeouts, stuck detection, and structured failures that are reported b
 the task escalates to **`TRAVERSE`**, which asks a different question: *"what
 would I have to build or break to walk there?"*
 
-`TerrainPlanner` runs A* over the world with three moves vanilla does not have —
-**bridge** a gap (place a deck block), **tunnel** through an obstruction (dig at
-body height), **pillar up** (place a block under one's own feet) — and returns a
-plan the citizen then executes one block at a time through the ordinary
-`MINE_BLOCK` / `PLACE_BLOCK` skills. Nothing is teleported or conjured: every
-placed block is paid for out of the citizen's inventory.
+`TerrainPlanner` runs A* over the world with four moves vanilla does not have —
+**build a stair** into an adjacent climb, **bridge** a gap (place a deck block),
+**tunnel** through an obstruction (dig at body height), and **pillar up** (place
+a block under one's own feet) — and returns a plan the citizen then executes one
+block at a time through the ordinary `MINE_BLOCK` / `PLACE_BLOCK` skills. A
+stair is a real block state with a facing; when no stair item is carried the
+worker safely falls back to a full support block. Nothing is teleported to bypass
+terrain or conjured: every vertical adjustment is a validated one-block
+support/raise transaction, and every placed block is paid for out of the
+citizen's inventory.
 
 The cost model keeps this honest — a dig is worth 4.5 walks and a placement 3.5,
 so citizens only tunnel when going around is genuinely longer, and a small
@@ -248,11 +402,21 @@ out. `ScaffoldMaterial` decides *what* to spend: cheap and plentiful first
 (dirt, cobble, planks), never sand or gravel (the deck would fall out from
 underneath), never valuables or containers. `LevelBlockView` refuses to tunnel
 through chests, furnaces, farmland or beds — a citizen mining its way out
-through the warehouse wall is efficient and a disaster.
+through the warehouse wall is efficient and a disaster. Construction footprints
+are protected in the same view, so a generic gather, mine or traversal route
+cannot dismantle a house, workshop or road while its project is still being
+built. Only the explicit blueprint/site-preparation path may clear natural
+terrain at an owned cell. Placed cells are recorded separately from progress:
+if a player later replaces a colony block, the mismatch is not silently turned
+back into mineable natural terrain, and the project waits for an explicit repair.
 
 Plans are hypotheses, not commitments: operations another citizen already
 performed are skipped, and anything unexpected triggers a bounded replan from
-wherever the citizen now stands.
+wherever the citizen now stands. A worker uses a scoped crouch/edge guard while
+walking, executes planned drops one at a time, and must be on a real standable
+cell before a step counts as arrived. Direct placements also check the worker's
+AABB and nearby living entities, so a wall or workstation cannot be written into
+an occupied body cell.
 
 ### Crafting resolves the whole tree
 
@@ -620,7 +784,13 @@ generates buildings out of the moves that actually make architecture read:
   walls, because the overhang is what casts the shadow line that makes a roof
   look like a roof;
 - **closed gables**, the single most obvious mark of a build nobody finished;
-- **a lit threshold**, with the lights standing on a plinth outside the wall.
+- **a lit threshold**, with the lights standing on a plinth outside the wall;
+- **a real crafting table and interior torch** in every generated house, both
+  emitted after their support so they are visible, paid-for work rather than
+  free conveniences;
+- **an explicit roof-support pass**: missing vertical cells are added before
+  roof stairs/slabs, so an overhang cannot remain permanently deferred as a
+  floating build.
 
 The palette follows the wood the colony actually cuts (`HouseCatalog`), so a
 spruce valley builds a spruce village, and the footprint varies from plot to
@@ -634,7 +804,28 @@ opposite ways, and that a young colony can afford every material. Writing them
 caught a lopsided even-width facade and a torch being placed *inside* the wall
 it was meant to light.
 
-### Felling a tree it cannot reach
+### Infrastructure gets built while the colony thinks
+
+When cognition is slow, unavailable or merely rate-limited, the deterministic
+fallback now takes one bounded action instead of leaving a citizen parked:
+harvest a known ripe crop, advance an active blueprint by one block, bootstrap
+and place a crafting table/furnace, light a safe work area, use an already
+known resource position, or gather ordinary useful material. A plan received
+from the AI is queued and adopted at the next task boundary rather than being
+cancelled or allowed to strand a worker. If no material exists in the loaded
+world, the worker patrols to a real standable cell and keeps its status
+explicit. None of these fallback actions can mine a container, workstation,
+project cell or tool.
+
+`RoadLayout` supplies short orthogonal two-wide segments between the town
+centre and the next active project. Only cells with air above, a sturdy natural
+floor, no entity and no protected project footprint become `PLACE` tasks, and
+cobblestone is consumed through the normal transaction; no road block is free.
+The segment cap keeps a long route resumable instead of creating one giant
+blueprint. Short-lived server-thread claims prevent several citizens from
+claiming the same blueprint cell, scaffold block or road tile; a crashed worker
+cannot leave a permanent lock because claims expire.
+
 
 Whole-tree felling only works if the citizen can get to the upper branches, and
 a lumberjack that set out empty-handed had nothing to climb with — so it
@@ -712,6 +903,12 @@ signals fix that:
   inventory.
 
 A fight outranks the job: a citizen with a sword draws it.
+
+Work is also visible: a synchronized work state and the vanilla swing packet
+make the citizen look at and gesture toward the block it is mining, placing,
+building, harvesting, tilling, crafting or smelting. The gesture is emitted
+only after a real mutation (or a real inventory/container transfer), is
+rate-limited on the server, and is broadcast to nearby clients.
 
 ### Hunting, but only as a last resort
 
@@ -994,7 +1191,10 @@ minecivilization-ai/
 │       ├── citizen/                       # identity, needs, inventory, professions
 │       ├── skills/                        # 25 skill implementations (incl. TRAVERSE/FELL_TREE/HERD_ANIMAL)
 │       ├── architecture/                  # generated houses: palettes, roofs, facades
-│       ├── colony/                        # districts, town plan, census, births
+│       ├── colony/                        # districts, town plan, census, births, signage
+│       ├── roads/                         # trip memory, route network, road building
+│       ├── work/                          # priority work board, productivity monitor
+│       ├── telemetry/                     # event log, citizen reports, snapshot, minimap
 │       ├── forestry/                      # tree shape, species, replanting, foraging
 │       ├── mining/                        # shared mine: depths, stair, landings
 │       ├── livestock/                     # which animals are kept, and on what
@@ -1006,7 +1206,7 @@ minecivilization-ai/
 │       ├── network/AiBridge.java          # HTTP client, circuit breaker, main-thread queue
 │       ├── commands/McivCommands.java     # /mciv …
 │       └── registry/                      # entities, items, blocks, sounds
-│   └── src/test/java/…                    # 319 JUnit tests (plain, no MC bootstrap)
+│   └── src/test/java/…                    # 424 JUnit tests (plain, no MC bootstrap)
 ├── ai-service/                # local AI service (Python, FastAPI)
 │   ├── src/minecivilization_ai/
 │   │   ├── main.py                         # app factory
@@ -1016,7 +1216,7 @@ minecivilization-ai/
 │   │   ├── cognition/                      # decision engine, prompts, providers
 │   │   ├── providers/                      # mock (offline) & ollama adapters
 │   │   └── db/                             # SQLAlchemy + SQLite
-│   └── tests/                              # 109 pytest tests
+│   └── tests/                              # 110 pytest tests
 └── docs/IMPLEMENTATION_PLAN.md # phased roadmap & status
 ```
 

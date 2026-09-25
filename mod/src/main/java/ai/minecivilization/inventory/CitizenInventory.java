@@ -145,14 +145,40 @@ public final class CitizenInventory {
     }
 
     /** First food item stack index, or -1. */
+    /**
+     * The best thing to eat, or -1 when there is nothing.
+     *
+     * <p>Best, not first. A citizen holding a steak and a lump of rotten flesh
+     * should eat the steak; it should eat the flesh only when the alternative
+     * is starving, because the poison is survivable and starvation is not.
+     * Picking whatever happened to be in the lowest slot got that backwards
+     * about half the time.</p>
+     */
     public int firstFoodSlot() {
+        return bestFoodSlot(false);
+    }
+
+    /**
+     * @param desperate true to include food a citizen would normally refuse —
+     *                  rotten flesh, raw chicken, spider eyes
+     */
+    public int bestFoodSlot(boolean desperate) {
+        String[] ids = new String[items.size()];
+        int[] nutrition = new int[items.size()];
         for (int i = 0; i < items.size(); i++) {
             ItemStack stack = items.get(i);
-            if (!stack.isEmpty() && stack.has(net.minecraft.core.component.DataComponents.FOOD)) {
-                return i;
-            }
+            if (stack.isEmpty()) continue;
+            var food = stack.get(net.minecraft.core.component.DataComponents.FOOD);
+            if (food == null) continue;
+            ids[i] = idOf(stack);
+            nutrition[i] = food.nutrition();
         }
-        return -1;
+        return FoodPolicy.bestIndex(ids, nutrition, desperate);
+    }
+
+    /** Food a citizen eats only rather than starve. */
+    public static boolean isLastResort(ItemStack stack) {
+        return !stack.isEmpty() && FoodPolicy.isLastResort(idOf(stack));
     }
 
     public List<ItemStack> nonToolStacks() {

@@ -54,10 +54,28 @@ public final class ModEvents {
     private static final int HEARTBEAT_INTERVAL = 1200;
 
     private static int heartbeatTick;
-    /** Hard cap on auto-planned camp houses (grows with population). */
-    private static final int MAX_HOUSES = 4;
+    /**
+     * Ceiling on auto-planned houses.
+     *
+     * <p>Four was a hard cap on the whole settlement, which meant a colony of
+     * twenty could never have more than four houses however long it ran — one
+     * of the concrete reasons the place stopped looking like it was growing.
+     * The row's own geometry still bounds it; this is only a sanity limit.</p>
+     */
+    private static final int MAX_HOUSES = CampLayout.MAX_SLOTS;
 
     private static int houseCheckTick = 0;
+    /** Blueprints are rebuilt once per world load, not once per tick. */
+    private static boolean blueprintsReconciled;
+
+    /**
+     * District markers allowed to be under construction at once.
+     *
+     * <p>Two, because a marker is a signpost and a chest, not a building. The
+     * colony has exactly one construction workforce and markers compete with
+     * the town hall for it.</p>
+     */
+    private static final int MAX_PENDING_MARKERS = 2;
 
     private ModEvents() {
     }
@@ -74,12 +92,23 @@ public final class ModEvents {
         if (server == null) return;
         ServerLevel overworld = server.getLevel(Level.OVERWORLD);
 
+        // The colony's work board has to exist before anybody asks it for a
+        // job; installing here is idempotent and covers every world load.
+        ai.minecivilization.work.ColonyWork.install();
+        reconcileBlueprints(overworld);
+
         // One pass over the town: find its containers (without this the storage
         // registry stays empty and no citizen ever delivers anything) and count
         // its beds (without which the colony cannot know whether it may grow).
         ColonyCensus.tick(overworld);
         ColonyChunkLoader.tick(overworld);
+        // Citizens carry their own ticking area, so work done away from town
+        // happens in a world that is actually running — which is what makes
+        // felled canopies decay and planted crops grow.
+        ai.minecivilization.colony.CitizenChunkLoader.tick(overworld);
         ColonyLife.tick(overworld);
+        ai.minecivilization.work.ProductivityMonitor.tick(overworld);
+        ai.minecivilization.telemetry.CitizenTracker.tick(overworld);
 
         if (++heartbeatTick % HEARTBEAT_INTERVAL == 0) {
             logHeartbeat(overworld);
@@ -90,7 +119,32 @@ public final class ModEvents {
         }
         ensureZoning(overworld);
         ensureTradesCovered(overworld);
+        // Civic buildings before houses: a colony wants a centre before it
+        // wants a fourth bedroom, and the old order never got past bedrooms.
+        ai.minecivilization.colony.CivicPlanner.ensure(overworld, CitizenIndex.population());
         ensureStarterHouses(overworld);
+        ai.minecivilization.colony.SignRegistry.get(overworld).prune(overworld);
+    }
+
+    /**
+     * Rebuild the blueprints this world's projects refer to, once per world.
+     *
+     * <p>Procedural blueprints live in a static map that starts empty, so
+     * after a reload every marker, house and town hall names a blueprint
+     * nothing has generated. The builder treats that as fatal and unrecoverable
+     * — sixteen hundred failures in one session, which was the whole of the
+     * colony's construction output.</p>
+     */
+    private static void reconcileBlueprints(ServerLevel level) {
+        if (level == null || blueprintsReconciled) return;
+        blueprintsReconciled = true;
+        int retired = ConstructionManager.get(level).reconcileBlueprints(level);
+        if (retired > 0) {
+            LOGGER.warn("[Colony] retired {} project(s) whose blueprint could not be rebuilt",
+                    retired);
+            ai.minecivilization.telemetry.ColonyEventLog.of(level).organisation(level,
+                    retired + " unbuildable project(s) were abandoned");
+        }
     }
 
     /**
@@ -137,10 +191,30 @@ public final class ModEvents {
             ColonyNotifier.zoneAllotted(level, created);
         }
 
-        // Every district gets a post saying what it is and a double chest to
-        // start its first building from. One per check, so marking the town
-        // never competes with building it.
-        for (Zone zone : ZoneManager.get(level).all()) {
+        // Every district eventually gets a post saying what it is and a double
+        // chest to start its first building from — but only a couple at a time.
+        //
+        // Without the cap, a colony of sixteen laid out twenty-nine districts
+        // and immediately planned twenty-nine markers, all at 0%. They are
+        // cheap individually and ruinous collectively: they crowd out real
+        // buildings in every queue that counts projects, and a settlement whose
+        // entire construction backlog is signposts builds nothing at all.
+        int pendingMarkers = 0;
+        for (ConstructionProject project : ConstructionManager.get(level).all()) {
+            if (project.status == ConstructionProject.Status.COMPLETED
+                    || project.status == ConstructionProject.Status.FAILED) continue;
+            if (ai.minecivilization.colony.DistrictMarker.isMarker(project.blueprintId)) {
+                pendingMarkers++;
+            }
+        }
+        if (pendingMarkers >= MAX_PENDING_MARKERS) return;
+
+        // Nearest district first, so the town marks itself outward from its
+        // centre instead of starting with an empty plot on the far rim.
+        BlockPos centre = ZoneManager.get(level).townCenter(level);
+        List<Zone> districts = ZoneManager.get(level).all();
+        districts.sort(java.util.Comparator.comparingDouble(z -> z.distanceSqrTo(centre)));
+        for (Zone zone : districts) {
             if (ai.minecivilization.colony.DistrictMarker.ensureFor(level, zone) != null) {
                 return;
             }
@@ -148,42 +222,69 @@ public final class ModEvents {
     }
 
     /**
-     * A minute-by-minute line per citizen: who is doing what, and what is
-     * holding the colony back. Failures alone never told the whole story — a
-     * settlement quietly working looked the same as one stuck in a loop.
+     * A minute-by-minute picture of the whole colony.
+     *
+     * <p>Failures alone never told the story: a settlement quietly working
+     * looked identical in the log to one stuck in a loop. This prints the
+     * numbers that distinguish them — how many citizens are productive, what
+     * is under construction and what it is waiting for, what the roads and
+     * districts add up to, and a full line per citizen including anyone lost
+     * or stuck.</p>
      */
     private static void logHeartbeat(ServerLevel level) {
         if (level == null) return;
-        var citizens = CitizenIndex.all();
-        if (citizens.isEmpty()) return;
+        if (CitizenIndex.all().isEmpty()) return;
 
-        // How many are actually doing something. This is the number that says
-        // whether the colony is working or waiting, and it was invisible: more
-        // than half of all citizen time turned out to be spent with no goal.
-        int busy = 0;
-        for (CitizenEntity citizen : citizens) {
-            if (citizen.getCitizenBrain().currentTaskOrNull() != null) busy++;
+        var snapshot = ai.minecivilization.telemetry.ColonySnapshot.take(level, 0);
+        var census = snapshot.productivity();
+
+        LOGGER.info("[Colony] {}", snapshot.headline());
+        LOGGER.info("[Colony] {}% busy — working {} building {} exploring {} "
+                        + "returning {} idle {} stuck {} lost {}",
+                census.busyPercent(),
+                census.count(ai.minecivilization.work.ProductivityMonitor.State.WORKING),
+                census.count(ai.minecivilization.work.ProductivityMonitor.State.BUILDING),
+                census.count(ai.minecivilization.work.ProductivityMonitor.State.EXPLORING),
+                census.count(ai.minecivilization.work.ProductivityMonitor.State.RETURNING),
+                census.count(ai.minecivilization.work.ProductivityMonitor.State.IDLE),
+                census.count(ai.minecivilization.work.ProductivityMonitor.State.STUCK),
+                census.count(ai.minecivilization.work.ProductivityMonitor.State.LOST));
+        // Where the time actually went. A snapshot says what everyone is doing
+        // now; this says what they have been doing, which is the question.
+        var breakdown = ai.minecivilization.telemetry.ActivityLedger.breakdown();
+        if (!breakdown.isEmpty()) {
+            StringBuilder split = new StringBuilder();
+            for (var slice : breakdown) {
+                if (slice.percent() < 1) continue;
+                if (split.length() > 0) split.append("  ");
+                split.append(slice.percent()).append("% ").append(slice.label());
+            }
+            LOGGER.info("[Colony] time spent ({}s observed, {}% wasted): {}",
+                    ai.minecivilization.telemetry.ActivityLedger.observedSeconds(),
+                    ai.minecivilization.telemetry.ActivityLedger.wastedPercent(), split);
         }
-        LOGGER.info("[Colony] {}/{} citizens working ({}% idle)",
-                busy, citizens.size(), (citizens.size() - busy) * 100 / citizens.size());
+        LOGGER.info("[Colony] {} district(s), {} container(s), {} bed(s), {} sign(s), "
+                        + "{} road(s), food {} — growth: {}",
+                snapshot.districts().size(), snapshot.containers(), snapshot.beds(),
+                snapshot.signs(), snapshot.roads().size(), snapshot.food(),
+                snapshot.growthBlocker() == null ? "ready" : snapshot.growthBlocker());
 
-        String blocker = ai.minecivilization.colony.ColonyLife.growthBlocker(level);
-        LOGGER.info("[Colony] {} citizen(s), {} district(s), {} container(s), {} bed(s) — growth: {}",
-                citizens.size(),
-                ai.minecivilization.colony.ZoneManager.get(level).all().size(),
-                ai.minecivilization.storage.StorageManager.get(level).all().size(),
-                ai.minecivilization.colony.ColonyCensus.beds(),
-                blocker == null ? "ready" : blocker);
+        // What the colony is physically building. This is the line that says
+        // whether resources are turning into a settlement or into a pile.
+        for (var project : snapshot.activeProjects()) {
+            LOGGER.info("[Colony]   build {} [{}] {}% at {},{},{}{}",
+                    project.name(), project.status(), project.percent(),
+                    project.origin().getX(), project.origin().getY(), project.origin().getZ(),
+                    project.waitingFor().isBlank() ? "" : "  waiting for " + project.waitingFor());
+        }
 
-        for (CitizenEntity citizen : citizens) {
-            var goal = citizen.getCitizenBrain().currentGoal();
-            var task = citizen.getCitizenBrain().currentTaskOrNull();
-            LOGGER.info("[Colony]   {} ({}) at {},{},{} — {} / {} / {}",
-                    citizen.getIdentity().name, citizen.getIdentity().profession,
-                    (int) citizen.getX(), (int) citizen.getY(), (int) citizen.getZ(),
-                    citizen.getStatusName(),
-                    goal == null ? "no goal" : goal.type.name(),
-                    task == null ? "idle" : task.type.name());
+        for (var citizen : snapshot.citizens()) {
+            LOGGER.info("[Colony]   {}", citizen.summaryLine());
+        }
+        // Anybody in trouble gets their full readout, because that is the case
+        // somebody will want to debug.
+        for (var citizen : snapshot.inTrouble()) {
+            for (String line : citizen.lines()) LOGGER.info("[Colony] {}", line);
         }
     }
 
@@ -240,11 +341,34 @@ public final class ModEvents {
         if (!(event.getEntity() instanceof CitizenEntity citizen)) return;
         if (!(citizen.level() instanceof ServerLevel level)) return;
 
+        // A dead citizen holds nothing. Leaving its claims to time out would
+        // reserve that job against the living for a full minute.
+        ai.minecivilization.work.GlobalTaskPool.release(citizen);
+        // The cell claims are keyed by citizen id, not entity UUID — see
+        // BuildBlueprintSkill, which is what takes them.
+        ai.minecivilization.construction.WorkClaimStore.releaseOwner(
+                String.valueOf(citizen.getIdentity().citizenId));
+
         ColonyData.get(level).recordDeath();
         String killer = event.getSource().getEntity() == null
                 ? event.getSource().getMsgId()
                 : event.getSource().getEntity().getName().getString();
         ColonyNotifier.death(level, citizen.getIdentity().name, killer);
+
+        // A death is the colony's most expensive lesson, and it used to learn
+        // nothing from it. Now the place goes on the map as dangerous, and any
+        // road passing through it stops being improved and starts being
+        // avoided — which is how a settlement routes around the ravine instead
+        // of paving a path into it.
+        BlockPos where = citizen.blockPosition();
+        ai.minecivilization.roads.PathMemory.get(level).reportDanger(level, where);
+        ai.minecivilization.telemetry.ColonyEventLog.of(level).danger(level,
+                citizen.getIdentity().name,
+                "died at " + where.getX() + "," + where.getY() + "," + where.getZ()
+                        + " (" + killer + ") — the place is now marked dangerous");
+        ai.minecivilization.colony.SignRegistry.get(level).record(level, where,
+                ai.minecivilization.colony.SignKind.DANGER, "DANGER",
+                killer.toUpperCase(java.util.Locale.ROOT), true);
     }
 
     /** A chest put down by anyone joins the settlement warehouse at once. */
@@ -254,6 +378,11 @@ public final class ModEvents {
             StorageDiscovery.onContainerPlaced(level, event.getPos());
             ai.minecivilization.colony.LandmarkRegistry.get(level)
                     .notice(level, event.getPos());
+            // A sign a player puts up is an instruction to the colony: reading
+            // it back is what makes signage a two-way interface rather than
+            // decoration the citizens produce and ignore.
+            ai.minecivilization.colony.SignRegistry.get(level)
+                    .readFromWorld(level, event.getPos());
         }
     }
 
@@ -263,6 +392,7 @@ public final class ModEvents {
         if (event.getLevel() instanceof ServerLevel level) {
             StorageDiscovery.onContainerRemoved(level, event.getPos());
             ai.minecivilization.colony.LandmarkRegistry.get(level).forget(event.getPos());
+            ai.minecivilization.colony.SignRegistry.get(level).forget(event.getPos());
         }
     }
 
@@ -284,15 +414,16 @@ public final class ModEvents {
         if (population <= 0) return;
 
         ConstructionManager manager = ConstructionManager.get(level);
-        BlockPos anchor = manager.resolveAnchor(level);
+        BlockPos anchor = housingAnchor(level, manager);
 
         List<ConstructionProject> houses = new ArrayList<>();
         List<ConstructionProject> unhomed = new ArrayList<>();  // houses owning no blocks yet
         List<CampLayout.Rect> occupied = new ArrayList<>();     // everything fixed in place
         for (ConstructionProject p : manager.all()) {
+            HouseCatalog.ensureRegistered(level, p.blueprintId);
             boolean house = HouseCatalog.isHouse(p.blueprintId);
             if (house) houses.add(p);
-            if (house && p.placed.isEmpty()) {
+            if (house && p.placed.isEmpty() && p.ownedCells.isEmpty()) {
                 unhomed.add(p);
             } else {
                 occupied.add(footprint(p));
@@ -306,15 +437,15 @@ public final class ModEvents {
 
         // The next house's design decides how much room to leave for it.
         Blueprint houseBlueprint = HouseCatalog.forColony(level, houses.size());
-        int houseW = houseBlueprint.sizeX;
-        int houseD = houseBlueprint.sizeZ;
+        int houseW = houseBlueprint.footprintWidth();
+        int houseD = houseBlueprint.footprintDepth();
 
         // 1) Leave unhomed houses alone when they already sit on a free camp
         //    slot — re-running the check must never shuffle the row.
         List<ConstructionProject> pending = new ArrayList<>();
         for (ConstructionProject p : unhomed) {
             CampLayout.Rect r = footprint(p);
-            if (CampLayout.isSlot(anchor.getX(), anchor.getZ(), p.originX, p.originZ)
+            if (CampLayout.isSlot(anchor.getX(), anchor.getZ(), r.x, r.z)
                     && CampLayout.free(r, occupied)) {
                 occupied.add(r);
             } else {
@@ -328,40 +459,89 @@ public final class ModEvents {
             if (slot < 0) continue;   // row full: better where it is than jammed in
             int x = CampLayout.slotX(anchor.getX(), slot);
             int z = CampLayout.slotZ(anchor.getZ());
-            manager.relocate(p, x, surfaceY(level, x, z, houseW, houseD), z);
-            occupied.add(new CampLayout.Rect(x, z, houseW, houseD));
+            int originX = x - blueprintMinX(p);
+            int originZ = z - blueprintMinZ(p);
+            manager.relocate(p, originX, surfaceY(level, x, z, houseW, houseD), originZ);
+            occupied.add(footprint(p));
         }
 
         // 3) Plan one more house while need outgrows the camp.
+        // One house per two citizens, as before, but now actually allowed to
+        // keep up with a growing population.
         int desired = Math.min(MAX_HOUSES, (population + 1) / 2);
         if (fulfilled >= desired || houses.size() >= MAX_HOUSES) return;
         int slot = CampLayout.freeSlot(anchor.getX(), anchor.getZ(), houseW, houseD, occupied);
         if (slot < 0) return;
         int x = CampLayout.slotX(anchor.getX(), slot);
         int z = CampLayout.slotZ(anchor.getZ());
+        int originX = x - houseBlueprint.minX;
+        int originZ = z - houseBlueprint.minZ;
         manager.createProject(houseBlueprint.name + " " + (houses.size() + 1),
-                houseBlueprint.id, x, surfaceY(level, x, z, houseW, houseD), z,
+                houseBlueprint.id, originX, surfaceY(level, x, z, houseW, houseD), originZ,
                 level.getGameTime());
     }
 
-    /** Footprint of a project: its origin plus the blueprint's ground size. */
-    private static CampLayout.Rect footprint(ConstructionProject p) {
-        Blueprint bp = ConstructionManager.blueprint(p.blueprintId);
-        return new CampLayout.Rect(p.originX, p.originZ,
-                bp == null ? 1 : bp.sizeX, bp == null ? 1 : bp.sizeZ);
+    /**
+     * Where the colony's houses go.
+     *
+     * <p>The residential district once the land registry has allotted one,
+     * and the camp beside the player's bed until then. That single indirection
+     * is most of what turns a row of huts by a bed into a town with a
+     * neighbourhood: houses cluster where housing belongs, and the civic
+     * centre, warehouses and workshops get their own ground.</p>
+     */
+    private static BlockPos housingAnchor(ServerLevel level, ConstructionManager manager) {
+        Zone housing = ZoneManager.get(level).nearest(
+                ai.minecivilization.colony.ZoneType.RESIDENTIAL,
+                ZoneManager.get(level).townCenter(level));
+        if (housing == null) return manager.resolveAnchor(level);
+        int y = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES,
+                housing.centerX(), housing.centerZ());
+        return new BlockPos(housing.centerX(), y, housing.centerZ());
     }
 
-    /** Ground level under the middle of a footprint starting at (x, z). */
+    /** Footprint in world coordinates, including an architectural overhang. */
+    private static CampLayout.Rect footprint(ConstructionProject p) {
+        Blueprint bp = ConstructionManager.blueprint(p.blueprintId);
+        if (bp == null) {
+            return new CampLayout.Rect(p.originX, p.originZ, 1, 1);
+        }
+        return new CampLayout.Rect(p.originX + bp.minX, p.originZ + bp.minZ,
+                bp.footprintWidth(), bp.footprintDepth());
+    }
+
+    private static int blueprintMinX(ConstructionProject project) {
+        Blueprint bp = ConstructionManager.blueprint(project.blueprintId);
+        return bp == null ? 0 : bp.minX;
+    }
+
+    private static int blueprintMinZ(ConstructionProject project) {
+        Blueprint bp = ConstructionManager.blueprint(project.blueprintId);
+        return bp == null ? 0 : bp.minZ;
+    }
+
+    /** First air above solid ground; blueprint origin is a build datum, not a buried block. */
     private static int surfaceY(ServerLevel level, int x, int z, int sizeX, int sizeZ) {
-        return level.getHeight(Heightmap.Types.WORLD_SURFACE,
-                x + sizeX / 2, z + sizeZ / 2) - 1;
+        return level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES,
+                x + sizeX / 2, z + sizeZ / 2);
     }
 
     @SubscribeEvent
     public static void onServerStopped(ServerStoppedEvent event) {
         CitizenIndex.clear();
+        blueprintsReconciled = false;
         ColonyCensus.reset();
         ColonyChunkLoader.reset();
+        ai.minecivilization.colony.CitizenChunkLoader.reset();
         ColonyLife.reset();
+        ai.minecivilization.construction.WorkClaimStore.clear();
+        ai.minecivilization.work.GlobalTaskPool.clear();
+        ai.minecivilization.work.ColonyWork.reset();
+        ai.minecivilization.work.ProductivityMonitor.reset();
+        ai.minecivilization.telemetry.ColonyEventLog.clear();
+        ai.minecivilization.telemetry.CitizenTracker.reset();
+        ai.minecivilization.colony.CitizenMarkers.reset();
+        ai.minecivilization.network.ModNetwork.reset();
+        ai.minecivilization.telemetry.ActivityLedger.reset();
     }
 }

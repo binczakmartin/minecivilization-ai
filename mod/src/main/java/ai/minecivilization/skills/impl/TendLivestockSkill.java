@@ -1,6 +1,7 @@
 package ai.minecivilization.skills.impl;
 
 import ai.minecivilization.config.ModConfig;
+import ai.minecivilization.entity.WorkAnimation;
 import ai.minecivilization.livestock.*;
 import ai.minecivilization.skills.*;
 import net.minecraft.world.entity.animal.*;
@@ -32,10 +33,12 @@ public final class TendLivestockSkill implements CitizenSkill {
             if (drops.isEmpty()) return finish(c);
             var egg = drops.get(0);
             if (c.citizen.distanceToSqr(egg) > 9) {
+                c.citizen.clearWorkAnimation();
                 c.navigator.moveTo(egg, 1); c.navigator.tick();
                 if (c.navigator.hasFailed()) { c.fail(c.navigator.failure()); return SkillResult.FAILED; }
                 return SkillResult.RUNNING;
             }
+            c.citizen.animateAction(WorkAnimation.REACH, egg.blockPosition());
             collect(c); return finish(c);
         }
         if (animal == null) for (Animal a : Pens.animals(c.level, pen)) {
@@ -48,6 +51,7 @@ public final class TendLivestockSkill implements CitizenSkill {
         if (animal == null) { c.fail(SkillFailure.notFound("no livestock needs " + mode)); return SkillResult.FAILED; }
         if (!Pens.inside(pen, animal) || !HerdRegistry.owned(animal)) return finish(c);
         if (c.citizen.distanceToSqr(animal) > 9) {
+            c.citizen.clearWorkAnimation();
             c.navigator.moveTo(animal, 1); c.navigator.tick();
             if (c.navigator.hasFailed()) { c.fail(c.navigator.failure()); return SkillResult.FAILED; }
             return SkillResult.RUNNING;
@@ -57,7 +61,9 @@ public final class TendLivestockSkill implements CitizenSkill {
         if ((mode.equals("SURPLUS") || mode.equals("FOOD"))) {
             // Recheck before EVERY blow: another worker may just have culled the excess.
             if (!surplus(c, animal)) return finish(c);
+            if (c.level.getGameTime() < nextAttack) c.citizen.clearWorkAnimation();
             if (c.level.getGameTime() >= nextAttack) {
+                c.citizen.animateAction(WorkAnimation.COMBAT, animal.blockPosition());
                 c.citizen.doHurtTarget(animal); nextAttack = c.level.getGameTime() + 16;
             }
             if (!animal.isAlive()) { collect(c); return finish(c); }
@@ -65,6 +71,7 @@ public final class TendLivestockSkill implements CitizenSkill {
         }
         if (mode.equals("SHEAR") && animal instanceof Sheep sheep && sheep.readyForShearing()) {
             for (int i = 0; i < inv.getContainerSize(); i++) if (inv.getItem(i).is(Items.SHEARS)) {
+                c.citizen.animateAction(WorkAnimation.REACH, sheep.blockPosition());
                 sheep.shear(SoundSource.NEUTRAL);
                 ItemStack tool = inv.getItem(i); tool.setDamageValue(tool.getDamageValue() + 1);
                 if (tool.getDamageValue() >= tool.getMaxDamage()) inv.setItem(i, ItemStack.EMPTY);
@@ -73,6 +80,7 @@ public final class TendLivestockSkill implements CitizenSkill {
             c.fail(SkillFailure.missing("shearing needs real shears")); return SkillResult.FAILED;
         }
         if (mode.equals("MILK") && inv.containsAtLeast("minecraft:bucket", 1)) {
+            c.citizen.animateAction(WorkAnimation.REACH, animal.blockPosition());
             inv.extract("minecraft:bucket", 1);
             int left = inv.insert(new ItemStack(Items.MILK_BUCKET));
             if (left > 0) c.citizen.spawnAtLocation(new ItemStack(Items.MILK_BUCKET, left));

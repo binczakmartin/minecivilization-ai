@@ -1,5 +1,6 @@
 package ai.minecivilization.skills.impl;
 
+import ai.minecivilization.entity.WorkAnimation;
 import ai.minecivilization.livestock.*;
 import ai.minecivilization.config.ModConfig;
 import ai.minecivilization.skills.*;
@@ -49,6 +50,7 @@ public final class BreedAnimalsSkill implements CitizenSkill {
         for (String food : AnimalHusbandry.feedFor(species)) {
             if (c.citizen.getInventory().count(food) < 2) continue;
             if (!registry.reserveBirth(first, species, ModConfig.LIVESTOCK_LIMIT.get(), c.level.getGameTime())) { finished = true; return visit.leave(c); }
+            c.citizen.animateAction(WorkAnimation.REACH, first.blockPosition());
             c.citizen.getInventory().extract(food, 2);
             first.setInLove(null); second.setInLove(null);
             c.navigator.stop(); c.citizen.getSkills().addXp("farming", 0.1f);
