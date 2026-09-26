@@ -125,28 +125,32 @@ public final class CombatPolicy {
             return within(distanceSqr, BLAST_DANGER_RADIUS) ? Response.FLEE : Response.IGNORE;
         }
 
+        // 3. Endermen and their kind are a problem only if you make one. This
+        //    comes before the hurt/unarmed retreat rules on purpose: a peaceful
+        //    enderman is not a threat to run from either, and citizens used to
+        //    spend whole evenings backing away from ones minding their business.
+        if (kind == ThreatKind.NEUTRAL && !isRecentAttacker) {
+            return Response.IGNORE;
+        }
+
         double alarmRadius = Math.max(engageRadius, isRecentAttacker ? attackerLeash : 0.0);
 
-        // 3. Already being hit, at arm's length: fight, whatever we are holding
+        // 4. Already being hit, at arm's length: fight, whatever we are holding
         //    and however hurt we are. Turning your back on something that has
         //    closed to melee is strictly worse than swinging at it — and
         //    against a teleporting enderman, retreat is not an option at all.
         if (isRecentAttacker && within(distanceSqr, CORNERED_RANGE)) {
             return Response.ENGAGE;
         }
-        // 4. Badly hurt, with room to break off: disengage from anything.
+        // 5. Badly hurt, with room to break off: disengage from anything.
         //    A dead citizen wins no fights later.
         if (healthFraction <= LOW_HEALTH_FRACTION) {
             return within(distanceSqr, alarmRadius) ? Response.FLEE : Response.IGNORE;
         }
-        // 5. Bare hands lose a fight you chose. Retreat rather than trade a
+        // 6. Bare hands lose a fight you chose. Retreat rather than trade a
         //    citizen for nothing — but only while there is still distance to use.
         if (!armed) {
             return within(distanceSqr, alarmRadius) ? Response.FLEE : Response.IGNORE;
-        }
-        // 6. Endermen and their kind are a problem only if you make one.
-        if (kind == ThreatKind.NEUTRAL && !isRecentAttacker) {
-            return Response.IGNORE;
         }
         // 7. Self-defence overrides hunger: being hit is not negotiable.
         if (isRecentAttacker && within(distanceSqr, attackerLeash)) {

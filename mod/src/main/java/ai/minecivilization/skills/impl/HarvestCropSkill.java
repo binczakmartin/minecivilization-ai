@@ -43,12 +43,7 @@ public final class HarvestCropSkill implements CitizenSkill {
                     "crop belongs to a colony construction footprint", true));
             return SkillResult.FAILED;
         }
-        if (!context.level.getEntities(context.citizen,
-                new net.minecraft.world.phys.AABB(pos)).isEmpty()) {
-            context.fail(new SkillFailure("POSITION_OCCUPIED",
-                    "a living entity is inside the crop cell", true));
-            return SkillResult.FAILED;
-        }
+        // Someone standing in the wheat does not stop it being cut.
         if (state.isAir()) {
             context.fail(new SkillFailure("CROP_GONE", "crop already harvested", true));
             return SkillResult.FAILED;
@@ -58,6 +53,10 @@ public final class HarvestCropSkill implements CitizenSkill {
             return SkillResult.FAILED;
         }
         if (context.citizen.distanceToSqr(pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5) > 20.0) {
+            // Walk the last few blocks: the move before this aimed at the crop
+            // cell itself, which is not a place to stand, and stopped short.
+            SkillResult arrival = SkillNavigation.approach(context, pos, 16.0, "harvest.walk");
+            if (arrival != SkillResult.FAILED) return SkillResult.RUNNING;
             context.fail(SkillFailure.unreachable("crop out of reach"));
             return SkillResult.FAILED;
         }

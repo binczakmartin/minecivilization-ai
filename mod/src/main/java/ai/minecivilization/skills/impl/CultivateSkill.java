@@ -36,7 +36,9 @@ public final class CultivateSkill implements CitizenSkill {
     private boolean viable(SkillContext c, BlockPos ground) {
         if (!c.level.isLoaded(ground) || rejected.contains(ground)
                 || ai.minecivilization.construction.ConstructionManager.get(c.level)
-                .protectsCell(ground)) return false;
+                .protectsCell(ground)
+                || ai.minecivilization.construction.ConstructionManager.get(c.level)
+                .inBuildingPlot(ground)) return false;
         BlockPos support = ground.below();
         if (!c.level.getBlockState(support).isFaceSturdy(c.level, support, Direction.UP)) {
             return false;
@@ -83,7 +85,10 @@ public final class CultivateSkill implements CitizenSkill {
         }
         if (arrival == SkillResult.RUNNING) return arrival;
         c.navigator.stop();
-        if (!PlacementSafety.canOccupy(c.level, c.citizen, target, false)) {
+        // The crop grows in the cell above the soil — that is the one that has
+        // to be free. Asking it of the soil block itself (always solid) rejected
+        // every plot there was, and not one seed was ever sown.
+        if (!filling && !PlacementSafety.canOccupy(c.level, c.citizen, target.above(), false)) {
             rejected.add(target); target = null; filling = false; c.failure = null;
             return SkillResult.RUNNING;
         }

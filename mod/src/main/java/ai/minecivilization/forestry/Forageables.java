@@ -43,6 +43,16 @@ public final class Forageables {
             "minecraft:melon", "minecraft:pumpkin", "minecraft:moss_block",
             "minecraft:sea_pickle", "minecraft:kelp", "minecraft:dead_bush");
 
+    /** Pseudo-resource: "anything edible", for a forage that replaces a failed hunt. */
+    public static final String FOOD = "food";
+
+    /** Plants that are, or drop, something a citizen can eat. */
+    public static final List<String> FOOD_SOURCES = List.of(
+            "minecraft:sweet_berry_bush",
+            "minecraft:melon",
+            "minecraft:cave_vines",
+            "minecraft:cave_vines_plant");
+
     private Forageables() {
     }
 
@@ -54,7 +64,8 @@ public final class Forageables {
     }
 
     public static boolean isForageable(String blockId) {
-        return blockId != null && (SEED_SOURCES.contains(blockId) || OTHER_FORAGE.contains(blockId));
+        return blockId != null && (SEED_SOURCES.contains(blockId) || OTHER_FORAGE.contains(blockId)
+                || FOOD_SOURCES.contains(blockId));
     }
 
     /** True for the plants that can drop wheat seeds. */
@@ -71,6 +82,7 @@ public final class Forageables {
      */
     public static List<String> sourcesFor(String itemId) {
         if (itemId == null) return List.copyOf(all());
+        if (FOOD.equals(itemId)) return FOOD_SOURCES;
         if (itemId.endsWith("_seeds") || "minecraft:wheat".equals(itemId)) {
             return SEED_SOURCES;
         }

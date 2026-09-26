@@ -82,7 +82,40 @@ public final class BuildBlueprintSkill implements CitizenSkill {
             return SkillResult.COMPLETED;
         }
 
-        Optional<ConstructionManager.NextStep> step = manager.nextStep(context.level, project);
+        // Place whatever this builder can supply now, not strictly the next
+        // block in blueprint order: one missing chest used to stop a house.
+        java.util.Map<String, Integer> stock = storeTotals(context);
+        java.util.function.Predicate<String> available = blockId -> {
+            String item = itemFor(context, blockId);
+            for (String variant : ai.minecivilization.construction.WoodSwap.variants(item)) {
+                if (context.citizen.getInventory().count(variant) > 0
+                        || stock.getOrDefault(variant, 0) > 0) return true;
+            }
+            return false;
+        };
+        Optional<ConstructionManager.NextStep> step = manager.nextStep(context.level, project, available);
+        if (step.isPresent() && step.get().missingMaterial) {
+            project.status = ConstructionProject.Status.WAITING_FOR_RESOURCES;
+            manager.setDirty();
+            // Ask for what the building needs most; a courier brings it while
+            // this builder gets on with something else.
+            String most = null;
+            int mostCount = 0;
+            for (var entry : ai.minecivilization.work.ConstructionSupply
+                    .remainingMaterials(context.level, project).entrySet()) {
+                if (entry.getValue() > mostCount) {
+                    mostCount = entry.getValue();
+                    most = itemFor(context, entry.getKey());
+                }
+            }
+            if (most != null) {
+                ai.minecivilization.work.MaterialRequests.post(context.citizen.getUUID(), most,
+                        Math.min(32, mostCount), "for " + project.name, context.level.getGameTime());
+            }
+            context.fail(SkillFailure.missing("nothing left on " + project.name
+                    + " that the stores or this builder can supply"));
+            return SkillResult.FAILED;
+        }
         if (step.isEmpty()) {
             context.fail(new SkillFailure("PROJECT_BLOCKED",
                     "all remaining blocks lack support", true));
@@ -93,6 +126,13 @@ public final class BuildBlueprintSkill implements CitizenSkill {
             return prepareNaturalSite(context, manager, project, next.pos);
         }
         if (next.unsupported) {
+            // A floor over a dip in the ground: lay the foundation the
+            // blueprint assumed. Without this, every block over a hole was
+            // "deferred" forever and the building could never be finished.
+            if (next.pos != null && next.detail != null && next.detail.startsWith("missing support")) {
+                SkillResult shored = shoreUp(context, next.pos);
+                if (shored != null) return shored;
+            }
             context.fail(new SkillFailure("UNSUPPORTED_BLOCK", next.detail, true));
             return SkillResult.FAILED;
         }
@@ -103,7 +143,7 @@ public final class BuildBlueprintSkill implements CitizenSkill {
             return SkillResult.FAILED;
         }
         BlockState existing = context.level.getBlockState(next.pos);
-        if (existing.equals(state)) {
+        if (ConstructionManager.matches(state, existing)) {
             // A world save or another worker may already have completed this
             // exact step. Adopt it instead of trying to overwrite it.
             String existingKey = project.key(next.pos.getX(), next.pos.getY(), next.pos.getZ());
@@ -149,6 +189,24 @@ public final class BuildBlueprintSkill implements CitizenSkill {
             return SkillResult.FAILED;
         }
         String itemId = CitizenInventory.idOf(new ItemStack(blockItem));
+        // Build in the wood the colony has. The blueprint's species is a
+        // preference: an oak house in a savanna goes up in acacia.
+        if (ai.minecivilization.construction.WoodSwap.isWooden(itemId)
+                && !context.citizen.getInventory().containsAtLeast(itemId, 1)) {
+            for (String variant : ai.minecivilization.construction.WoodSwap.variants(itemId)) {
+                if (context.citizen.getInventory().count(variant) > 0
+                        || stock.getOrDefault(variant, 0) > 0) {
+                    String species = ai.minecivilization.construction.WoodSwap.speciesOf(variant);
+                    BlockState swapped = ConstructionManager.inSpecies(state, species);
+                    Item swappedItem = net.minecraft.world.item.BlockItem.byBlock(swapped.getBlock());
+                    if (swappedItem == net.minecraft.world.item.Items.AIR) continue;
+                    state = swapped;
+                    blockItem = swappedItem;
+                    itemId = CitizenInventory.idOf(new ItemStack(blockItem));
+                    break;
+                }
+            }
+        }
 
         // Missing materials: walk to storage and withdraw. "Still walking" is
         // not the same answer as "the material is absent"; the old boolean
@@ -192,7 +250,7 @@ public final class BuildBlueprintSkill implements CitizenSkill {
             return SkillResult.FAILED;
         }
         boolean wrote = context.level.setBlock(next.pos, state, 3);
-        if (!wrote || !context.level.getBlockState(next.pos).equals(state)) {
+        if (!wrote || !ConstructionManager.matches(state, context.level.getBlockState(next.pos))) {
             if (wrote) {
                 context.level.setBlock(next.pos, existing, 3);
             }
@@ -268,13 +326,11 @@ public final class BuildBlueprintSkill implements CitizenSkill {
                 target.getY() + 0.5, target.getZ() + 0.5);
         if (distance > 20.0) {
             BlockPos stand = findSiteStand(context, target);
-            if (stand == null) {
-                context.fail(new SkillFailure("POSITION_OCCUPIED",
-                        "no safe stand cell beside the construction site", true));
-                return SkillResult.FAILED;
-            }
             context.citizen.clearWorkAnimation();
-            return SkillNavigation.approach(context, stand, 20.0,
+            // A block buried in a hillside has nowhere to stand beside it yet:
+            // walk (or dig) up to the block itself instead of giving up on the
+            // whole building — fourteen failures a session came from this.
+            return SkillNavigation.approach(context, stand != null ? stand : target, 20.0,
                     "build.prepare-site");
         }
 
@@ -298,11 +354,11 @@ public final class BuildBlueprintSkill implements CitizenSkill {
     }
 
     private BlockPos findSiteStand(SkillContext context, BlockPos target) {
-        for (int radius = 1; radius <= 3; radius++) {
+        for (int radius = 1; radius <= 4; radius++) {
             for (int dx = -radius; dx <= radius; dx++) {
                 for (int dz = -radius; dz <= radius; dz++) {
                     if (Math.max(Math.abs(dx), Math.abs(dz)) != radius) continue;
-                    for (int dy = -1; dy <= 1; dy++) {
+                    for (int dy : new int[]{0, 1, -1, 2, -2, 3}) {
                         BlockPos stand = target.offset(dx, dy, dz);
                         if (levelLoaded(context, stand)
                                 && PlacementSafety.canStand(context.level, context.citizen, stand)) {
@@ -354,15 +410,19 @@ public final class BuildBlueprintSkill implements CitizenSkill {
         for (Direction direction : Direction.Plane.HORIZONTAL) {
             BlockPos stand = current.relative(direction);
             if (!PlacementSafety.canStand(context.level, context.citizen, stand)) continue;
-            BlockPos requested = context.get("build.reposition", (BlockPos) null);
+            // The chosen cell lives under its own key: the navigation key below
+            // holds the traversal in progress, and sharing one key between a
+            // BlockPos and a skill crashed the server with a ClassCastException.
+            BlockPos requested = context.get("build.reposition.target", (BlockPos) null);
             if (!stand.equals(requested)) {
-                context.put("build.reposition", stand);
+                context.put("build.reposition.target", stand);
                 SkillResult navigation = SkillNavigation.approach(context, stand, 1.5,
                         "build.reposition");
                 if (navigation == SkillResult.FAILED) {
                     context.failure = null;
                     context.data.remove("build.reposition");
                     context.data.remove("build.reposition.ctx");
+                    context.data.remove("build.reposition.target");
                     continue;
                 }
                 return SkillResult.RUNNING;
@@ -370,6 +430,74 @@ public final class BuildBlueprintSkill implements CitizenSkill {
             if (current.equals(stand)) return SkillResult.RUNNING;
         }
         return SkillResult.FAILED;
+    }
+
+    /**
+     * Fill the gap under an unsupported blueprint block, from the bottom up,
+     * with plain earth or stone from the pack.
+     *
+     * @return RUNNING while working on it, or null when this cannot help
+     */
+    private SkillResult shoreUp(SkillContext context, BlockPos unsupported) {
+        BlockPos cell = unsupported.below();
+        // Find the lowest open cell of the gap (at most six deep).
+        BlockPos lowest = null;
+        for (int depth = 0; depth < 6; depth++) {
+            BlockState state = context.level.getBlockState(cell);
+            if (!state.canBeReplaced()) break;
+            lowest = cell;
+            cell = cell.below();
+        }
+        if (lowest == null) return null;
+        if (!context.level.getBlockState(lowest.below())
+                .isFaceSturdy(context.level, lowest.below(), Direction.UP)) return null;
+        var manager = ConstructionManager.get(context.level);
+        if (manager.protectsCell(lowest)) return null;
+        String material = ai.minecivilization.navigation.ScaffoldMaterial.choose(
+                context.citizen.getInventory(), 1);
+        if (material == null || material.endsWith("_log") || material.endsWith("_planks")) return null;
+
+        if (context.citizen.distanceToSqr(lowest.getX() + 0.5, lowest.getY() + 0.5,
+                lowest.getZ() + 0.5) > 25.0) {
+            SkillResult arrival = SkillNavigation.approach(context, lowest, 25.0, "build.foundation");
+            return arrival == SkillResult.FAILED ? null : SkillResult.RUNNING;
+        }
+        if (!PlacementSafety.canOccupy(context.level, context.citizen, lowest, false)) return null;
+        var item = CitizenInventory.itemById(material);
+        if (!(item instanceof net.minecraft.world.item.BlockItem blockItem)) return null;
+        if (context.citizen.getInventory().extract(material, 1) != 1) return null;
+        if (!context.level.setBlock(lowest, blockItem.getBlock().defaultBlockState(), 3)) {
+            context.citizen.getInventory().insert(new ItemStack(item));
+            return null;
+        }
+        context.citizen.animateAction(WorkAnimation.BUILD, lowest);
+        context.startGameTime = context.level.getGameTime();
+        return SkillResult.RUNNING;
+    }
+
+    /** What the stores near the builder hold, refreshed every few seconds. */
+    private static java.util.Map<String, Integer> storeTotals(SkillContext context) {
+        long now = context.level.getGameTime();
+        Long at = context.get("stock.at", (Long) null);
+        java.util.Map<String, Integer> cached = context.get("stock", (java.util.Map<String, Integer>) null);
+        if (cached == null || at == null || now - at > 100) {
+            cached = ai.minecivilization.storage.SettlementStock.totals(context.level,
+                    context.citizen.blockPosition());
+            context.put("stock", cached);
+            context.put("stock.at", now);
+        }
+        return cached;
+    }
+
+    /** The item that places a blueprint block id (a wall torch is placed with a torch). */
+    private static String itemFor(SkillContext context, String blockId) {
+        var block = net.minecraftforge.registries.ForgeRegistries.BLOCKS.getValue(
+                net.minecraft.resources.ResourceLocation.parse(blockId));
+        if (block == null) return blockId;
+        Item item = net.minecraft.world.item.BlockItem.byBlock(block);
+        if (item == net.minecraft.world.item.Items.AIR) item = block.asItem();
+        return item == net.minecraft.world.item.Items.AIR ? blockId
+                : CitizenInventory.idOf(new ItemStack(item));
     }
 
     private SkillResult tryWithdrawFromStorage(SkillContext context, String itemId) {

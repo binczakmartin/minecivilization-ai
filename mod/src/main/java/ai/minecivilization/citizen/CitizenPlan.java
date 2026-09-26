@@ -23,7 +23,11 @@ public final class CitizenPlan {
     public enum TaskType {
         IDLE, REST, GATHER, HARVEST, PLANT, DELIVER, WITHDRAW,
         BUILD, PLACE, CRAFT, SMELT, MOVE, INSPECT, HERD, BREED, DECORATE, HUNT, MINE_SHAFT,
-        TEND_LIVESTOCK, TAME_WOLF, COLLECT, PREPARE_PEN, ESCAPE, SIGN, ROADWORK, EXPLORE
+        TEND_LIVESTOCK, TAME_WOLF, COLLECT, PREPARE_PEN, ESCAPE, SIGN, ROADWORK, EXPLORE,
+        /** Wall in for the night (or, with target "dismantle", take last night's walls down). */
+        SHELTER,
+        /** Take what a co-worker asked for to it (target = its UUID). */
+        HANDOVER
     }
 
     public static final class Goal {

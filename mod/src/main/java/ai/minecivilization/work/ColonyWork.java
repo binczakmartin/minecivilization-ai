@@ -58,6 +58,9 @@ public final class ColonyWork {
         // eat anything. In one session that was 78 of the colony's 86 completed
         // tasks: the single most common activity in the settlement was standing
         // still on purpose.
+        // Planting a carried sapling is a minute's work and it is the colony's
+        // future wood: ranked with the tools so it is ever reached at all.
+        GlobalTaskPool.register("forest", WorkPriority.TOOLS, ColonyWork::forest);
         GlobalTaskPool.register("workstations", WorkPriority.TOOLS,
                 ColonyWork::workstations);
         // The kit comes before the job. A shepherd with no wheat cannot lead a
@@ -66,10 +69,21 @@ public final class ColonyWork {
         // spectator — each of which used to show up as a citizen being handed
         // work it had no means to do, failing, and being handed it again.
         GlobalTaskPool.register("loadout", WorkPriority.TOOLS, ColonyWork::loadout);
+        // Runners: whoever asked for something gets it brought, so builders
+        // build instead of walking to the warehouse and back.
+        GlobalTaskPool.register("courier", WorkPriority.TOOLS, ColonyWork::courier);
         GlobalTaskPool.register("tools", WorkPriority.TOOLS, ColonyWork::tools);
+        // Build before supply: a house is always short of something, so asking
+        // "what is missing?" first sent every citizen carrying planks off to
+        // fetch more instead of putting the ones it had on the wall.
+        // Beds before walls: every bed is a citizen the colony may raise.
+        GlobalTaskPool.register("furnish", WorkPriority.CONSTRUCTION, ColonyWork::furnish);
+        GlobalTaskPool.register("build", WorkPriority.CONSTRUCTION, ColonyWork::build);
         GlobalTaskPool.register("supply-construction", WorkPriority.CONSTRUCTION,
                 ColonyWork::supplyConstruction);
-        GlobalTaskPool.register("build", WorkPriority.CONSTRUCTION, ColonyWork::build);
+        // Roads make every later trip faster: ranked with construction (after
+        // it, and two workers at most) so paths actually get made.
+        GlobalTaskPool.register("roads", WorkPriority.CONSTRUCTION, ColonyWork::roads);
         // Food, light, crops and livestock are what make the place a colony
         // rather than a work camp. They used to live in LocalWorkPlanner, which
         // is only consulted when the board has nothing at all to offer — and
@@ -81,7 +95,9 @@ public final class ColonyWork {
         GlobalTaskPool.register("collect", WorkPriority.MAINTENANCE, ColonyWork::collect);
         GlobalTaskPool.register("storage", WorkPriority.MAINTENANCE, ColonyWork::storage);
         GlobalTaskPool.register("lighting", WorkPriority.MAINTENANCE, ColonyWork::lighting);
-        GlobalTaskPool.register("livestock", WorkPriority.MAINTENANCE, ColonyWork::livestock);
+        // The herd is food, wool, beds and growth: the shepherd's main work,
+        // not something left for when nothing else is going on.
+        GlobalTaskPool.register("livestock", WorkPriority.FOOD, ColonyWork::livestock);
         GlobalTaskPool.register("deliver", WorkPriority.MAINTENANCE, ColonyWork::deliver);
         // Signposting sits with maintenance, not with decoration. A sign costs
         // two planks and is the only way the settlement explains itself — to a
@@ -91,7 +107,8 @@ public final class ColonyWork {
         GlobalTaskPool.register("sign-supply", WorkPriority.MAINTENANCE,
                 ColonyWork::signSupply);
         GlobalTaskPool.register("signage", WorkPriority.MAINTENANCE, ColonyWork::signage);
-        GlobalTaskPool.register("roads", WorkPriority.IMPROVEMENT, ColonyWork::roads);
+        GlobalTaskPool.register("mine", WorkPriority.RESOURCES, ColonyWork::mine);
+
         GlobalTaskPool.register("explore", WorkPriority.EXPLORATION, ColonyWork::explore);
     }
 
@@ -219,11 +236,30 @@ public final class ColonyWork {
         // Essentials always; spares only once the colony has stores to spare
         // them from, so a starting camp does not shop for luxuries.
         boolean stocked = StorageManager.nearest(level, citizen.blockPosition()) != null;
-        Loadout.Need need = Loadout.nextMissing(trade, carried, stocked);
+        // Iron kit only once there is iron: shears sent shepherds searching
+        // for deepslate ore ninety times in an afternoon, with no mine dug.
+        int iron = citizen.getInventory().count("minecraft:iron_ingot")
+                + ai.minecivilization.storage.SettlementStock.count(level, citizen.blockPosition(),
+                        "minecraft:iron_ingot");
+        // Torches only from coal or charcoal already to hand: making them
+        // by smelting logs into charcoal took a quarter of the colony's time.
+        int fuel = citizen.getInventory().count("minecraft:coal") + citizen.getInventory().count("minecraft:charcoal")
+                + ai.minecivilization.storage.SettlementStock.count(level, citizen.blockPosition(), "minecraft:coal")
+                + ai.minecivilization.storage.SettlementStock.count(level, citizen.blockPosition(), "minecraft:charcoal")
+                + ai.minecivilization.storage.SettlementStock.count(level, citizen.blockPosition(), "minecraft:torch");
+        Loadout.Need need = Loadout.nextMissing(trade, carried, stocked,
+                n -> (!Loadout.needsIron(n.itemId()) || iron >= 2)
+                        && (!n.itemId().equals("minecraft:torch") || fuel >= 1));
         if (need == null) return null;
 
         CitizenPlan.Task task = taskFor(level, citizen, need);
         if (task == null) return null;
+        // In the stores and somebody to run it over: ask, and keep working.
+        if (task.type == CitizenPlan.TaskType.WITHDRAW && courierAvailable(citizen)) {
+            MaterialRequests.post(citizen.getUUID(), need.itemId(), task.quantity,
+                    "to work as a " + trade.toLowerCase(java.util.Locale.ROOT), level.getGameTime());
+            return null;
+        }
 
         return new WorkOffer(WorkPriority.TOOLS, "",
                 "equip " + need.label() + " for work as a "
@@ -290,7 +326,10 @@ public final class ColonyWork {
         // the handle as well as the head.
         if (planks + logs * 4 < 5 && !(material && planks >= 3)) return false;
 
+        // A carried workbench goes down wherever it is needed; with enough wood
+        // for one more (four planks, i.e. one log) the craft makes its own.
         return inventory.count("minecraft:crafting_table") > 0
+                || planks + logs * 4 >= 9
                 || ai.minecivilization.colony.LandmarkRegistry.get(level).nearest(
                         ai.minecivilization.colony.LandmarkKind.CRAFTING_TABLE,
                         citizen.blockPosition()) != null;
@@ -311,6 +350,15 @@ public final class ColonyWork {
             ConstructionSupply.Shortfall shortfall =
                     ConstructionSupply.nextShortfall(level, project, citizen);
             if (shortfall == null) continue;
+            // A full load in the pack belongs in the stores, where the builders
+            // (and the "materials on hand" check) can see it — not another trip.
+            if (shortfall.carried() >= 32 && !shortfall.isInStore()
+                    && StorageManager.nearest(level, citizen.blockPosition()) != null) {
+                return new WorkOffer(WorkPriority.CONSTRUCTION, "",
+                        "take " + shortName(shortfall.itemId()) + " to the stores for " + project.name,
+                        List.of(new CitizenPlan.Task(CitizenPlan.TaskType.DELIVER, null, -1,
+                                null, null, null, null)), Integer.MAX_VALUE);
+            }
             return WorkOffer.single(WorkPriority.CONSTRUCTION,
                     "supply:" + project.id + ":" + shortfall.itemId(),
                     "fetch " + shortName(shortfall.itemId()) + " for " + project.name,
@@ -329,10 +377,10 @@ public final class ColonyWork {
     @Nullable
     private static WorkOffer build(ServerLevel level, CitizenEntity citizen) {
         for (ConstructionProject project : sortedActiveProjects(level, citizen)) {
-            ConstructionSupply.Shortfall shortfall =
-                    ConstructionSupply.nextShortfall(level, project, citizen);
-            // Only build what this citizen can actually place right now.
-            if (shortfall != null && !shortfall.isInStore()) continue;
+            // Build as soon as anything can be placed: blocks go up one
+            // material at a time, as they arrive. Waiting for the whole bill of
+            // materials first meant no house ever got past 0%.
+            if (!ConstructionSupply.anyMaterialOnHand(level, project, citizen)) continue;
             return WorkOffer.shared(WorkPriority.CONSTRUCTION, "build:" + project.id,
                     "build " + project.name,
                     List.of(new CitizenPlan.Task(CitizenPlan.TaskType.BUILD, null, -1,
@@ -379,14 +427,20 @@ public final class ColonyWork {
      * <p>Claimed per item so two citizens do not sprint at the same log.</p>
      */
     @Nullable
-    private static WorkOffer collect(ServerLevel level, CitizenEntity citizen) {
+    private static synchronized WorkOffer collect(ServerLevel level, CitizenEntity citizen) {
         var box = citizen.getBoundingBox().inflate(COLLECT_RADIUS);
         net.minecraft.world.entity.item.ItemEntity best = null;
         double bestDist = Double.MAX_VALUE;
 
+        long now = level.getGameTime();
+        UNREACHABLE_DROPS.values().removeIf(until -> until <= now);
         for (var item : level.getEntitiesOfClass(
                 net.minecraft.world.entity.item.ItemEntity.class, box)) {
             if (!item.isAlive() || item.getItem().isEmpty()) continue;
+            // Somewhere nobody could get to a minute ago; still nobody can.
+            if (UNREACHABLE_DROPS.containsKey(item.blockPosition())) continue;
+            // Floating off down a river is not worth chasing.
+            if (item.isInWater() || Math.abs(item.getY() - citizen.getY()) > 4) continue;
             // Leave a stack that is about to be picked up by its own owner.
             if (item.hasPickUpDelay()) continue;
             double d = citizen.distanceToSqr(item);
@@ -403,6 +457,20 @@ public final class ColonyWork {
                 "pick up " + shortName(CitizenInventory.idOf(best.getItem())),
                 new CitizenPlan.Task(CitizenPlan.TaskType.COLLECT, null, 1, null, null, null,
                         new int[]{at.getX(), at.getY(), at.getZ()}));
+    }
+
+    /**
+     * Spots where a dropped item could not be reached, until when to leave them.
+     *
+     * <p>Items on a ledge, in a hole or across water were offered again the
+     * moment the last attempt failed — 260 failed pick-ups in one session,
+     * each after six rounds of path-finding.</p>
+     */
+    private static final java.util.Map<BlockPos, Long> UNREACHABLE_DROPS = new java.util.HashMap<>();
+
+    /** A pick-up at {@code pos} failed for want of a route. */
+    public static synchronized void noteUnreachableDrop(BlockPos pos, long now) {
+        if (pos != null) UNREACHABLE_DROPS.put(pos.immutable(), now + 2400);
     }
 
     /** Empty a full pack into the warehouse rather than carrying it around. */
@@ -449,8 +517,21 @@ public final class ColonyWork {
      */
     @Nullable
     private static WorkOffer cook(ServerLevel level, CitizenEntity citizen) {
-        if (ai.minecivilization.colony.LandmarkRegistry.get(level).count(
-                ai.minecivilization.colony.LandmarkKind.FURNACE) == 0) {
+        // Wheat is not food until it is bread: three sheaves, one loaf, at a
+        // workbench (a carried one will do). The colony grew wheat and starved.
+        int wheat = citizen.getInventory().count("minecraft:wheat");
+        if (wheat >= 3) {
+            return new WorkOffer(WorkPriority.FOOD, "", "bake bread",
+                    List.of(new CitizenPlan.Task(CitizenPlan.TaskType.CRAFT, "minecraft:bread",
+                            citizen.getInventory().count("minecraft:bread") + wheat / 3,
+                            null, null, null, null)), Integer.MAX_VALUE);
+        }
+        // A furnace somewhere in the world is not a furnace this citizen can
+        // cook at: one walked to from a hundred blocks out stood "not moving"
+        // with a raw porkchop until the deadlock breaker took the job away.
+        BlockPos furnace = ai.minecivilization.colony.LandmarkRegistry.get(level).nearest(
+                ai.minecivilization.colony.LandmarkKind.FURNACE, citizen.blockPosition());
+        if (furnace == null || furnace.distSqr(citizen.blockPosition()) > 48 * 48) {
             return null;
         }
         var inventory = citizen.getInventory();
@@ -481,7 +562,7 @@ public final class ColonyWork {
                 level, citizen.blockPosition());
         if (dark == null) return null;
         BlockPos spot = ai.minecivilization.farming.FarmLighting.torchSpot(level, dark);
-        if (spot == null) return null;
+        if (spot == null || ConstructionManager.get(level).inBuildingPlot(spot)) return null;
 
         return WorkOffer.single(WorkPriority.MAINTENANCE,
                 "light:" + spot.getX() + "," + spot.getY() + "," + spot.getZ(),
@@ -505,7 +586,7 @@ public final class ColonyWork {
         for (CitizenPlan.Task task : ai.minecivilization.livestock.LivestockWork
                 .candidates(level, citizen)) {
             String key = "livestock:" + task.type + ":" + task.resource + ":" + task.target;
-            return WorkOffer.single(WorkPriority.MAINTENANCE, key,
+            return WorkOffer.single(WorkPriority.FOOD, key,
                     "tend the colony's animals (" + task.type + ")", task);
         }
         return null;
@@ -520,6 +601,26 @@ public final class ColonyWork {
      */
     @Nullable
     private static WorkOffer harvest(ServerLevel level, CitizenEntity citizen) {
+        // The colony's fields first: every crop sown is on record, and a small
+        // look around adds any field this citizen is standing near.
+        if (level.getGameTime() % 20 == citizen.getId() % 20) {
+            ai.minecivilization.farming.FieldRegistry.scan(level, citizen.blockPosition(), 8, 3);
+        }
+        BlockPos ripe = ai.minecivilization.farming.FieldRegistry.nearestRipe(level,
+                citizen.blockPosition(), 128);
+        if (ripe != null) {
+            var key = net.minecraftforge.registries.ForgeRegistries.BLOCKS
+                    .getKey(level.getBlockState(ripe).getBlock());
+            String produce = key == null ? null : ai.minecivilization.farming.Crops.produceFor(key.toString());
+            if (produce != null) {
+                return WorkOffer.single(WorkPriority.FOOD,
+                        "crop:" + ripe.getX() + "," + ripe.getY() + "," + ripe.getZ(),
+                        "bring in a ripe " + shortName(produce),
+                        new CitizenPlan.Task(CitizenPlan.TaskType.HARVEST, produce, 1, null,
+                                key.toString(), null,
+                                new int[]{ripe.getX(), ripe.getY(), ripe.getZ()}));
+            }
+        }
         for (var entry : citizen.knownResources().entrySet()) {
             String produce = ai.minecivilization.farming.Crops.produceFor(entry.getKey());
             if (produce == null) continue;
@@ -540,8 +641,15 @@ public final class ColonyWork {
                             new int[]{pos.getX(), pos.getY(), pos.getZ()}));
         }
 
-        // Nothing ripe: sow what the citizen is carrying.
+        // Nothing ripe: sow what the citizen is carrying — with a hoe. Grass
+        // does not take seed; without one to till it every sowing ended in
+        // "no suitable soil".
         var inventory = citizen.getInventory();
+        boolean hoe = false;
+        for (int slot = 0; slot < inventory.getContainerSize(); slot++) {
+            if (inventory.getItem(slot).getItem() instanceof HoeItem) hoe = true;
+        }
+        if (!hoe) return null;
         for (String seed : ai.minecivilization.farming.Crops.SEEDS.keySet()) {
             if (inventory.count(seed) <= 0) continue;
             return new WorkOffer(WorkPriority.FOOD, "", "plant " + shortName(seed),
@@ -564,6 +672,12 @@ public final class ColonyWork {
      */
     @Nullable
     private static WorkOffer signSupply(ServerLevel level, CitizenEntity citizen) {
+        // Signs are a settled colony's business. On day one the planks are a
+        // sword, a pickaxe and a workbench, and a citizen still missing those
+        // spent them on acacia signs instead — thirty-three times in a session.
+        if (!kitted(citizen) || StorageManager.nearest(level, citizen.blockPosition()) == null) {
+            return null;
+        }
         var inventory = citizen.getInventory();
         int signs = 0;
         String wood = null;
@@ -585,7 +699,10 @@ public final class ColonyWork {
 
         String item = "minecraft:" + wood + "_sign";
         return new WorkOffer(WorkPriority.MAINTENANCE, "", "make signs to label the colony",
-                List.of(new CitizenPlan.Task(CitizenPlan.TaskType.CRAFT, item, 3,
+                // "End up holding" the stock level: asking for three while
+                // holding three finished instantly, 96 times in five minutes.
+                List.of(new CitizenPlan.Task(CitizenPlan.TaskType.CRAFT, item,
+                        ai.minecivilization.colony.Signage.SIGN_STOCK,
                         null, null, null, null)), Integer.MAX_VALUE);
     }
 
@@ -605,10 +722,329 @@ public final class ColonyWork {
     private static WorkOffer roads(ServerLevel level, CitizenEntity citizen) {
         RoadWorks.Job job = RoadWorks.next(level, citizen);
         if (job == null) return null;
-        return WorkOffer.shared(WorkPriority.IMPROVEMENT,
-                "road:" + job.route().id + ":" + job.grade().name(),
+        // Shovel paths are upkeep, done between real jobs; a road's grade
+        // (clearing, paving, lighting) is construction.
+        boolean shovel = "minecraft:dirt_path".equals(job.tasks().get(0).resource);
+        return WorkOffer.shared(shovel ? WorkPriority.MAINTENANCE : WorkPriority.CONSTRUCTION,
+                "road:" + job.route().id + ":" + (shovel ? "PATH" : job.grade().name()),
                 job.grade().label() + " on the " + job.route().displayName() + " road",
                 job.tasks(), 2);
+    }
+
+    // ------------------------------------------------------------------ beds
+
+    /**
+     * Make beds and put them in homes.
+     *
+     * <p>Growth needs a bed for every citizen and one to spare, and nothing in
+     * the colony ever made or placed a single bed: sixteen citizens, zero beds,
+     * growth permanently "held back". A bed needs three wool (the herd) and
+     * three planks; it goes into a finished home, in the spot its plan keeps
+     * for it, or failing that by the town centre.</p>
+     */
+    @Nullable
+    private static WorkOffer furnish(ServerLevel level, CitizenEntity citizen) {
+        int population = CitizenIndex.population();
+        int beds = ai.minecivilization.colony.ColonyCensus.beds();
+        if (beds >= ai.minecivilization.colony.Population.bedsNeededFor(population)) return null;
+        var inventory = citizen.getInventory();
+
+        String bed = null;
+        for (int slot = 0; slot < inventory.getContainerSize(); slot++) {
+            var stack = inventory.getItem(slot);
+            if (!stack.isEmpty() && stack.is(net.minecraft.tags.ItemTags.BEDS)) {
+                bed = CitizenInventory.idOf(stack);
+                break;
+            }
+        }
+        if (bed != null) {
+            BlockPos foot = bedSpot(level);
+            if (foot == null) return null;
+            return WorkOffer.single(WorkPriority.CONSTRUCTION,
+                    "bed:" + foot.getX() + "," + foot.getY() + "," + foot.getZ(),
+                    "put a bed in a home",
+                    new CitizenPlan.Task(CitizenPlan.TaskType.PLACE, bed, 1, null,
+                            bed + "[facing=north,part=foot]", null,
+                            new int[]{foot.getX(), foot.getY(), foot.getZ()}));
+        }
+        var stock = ai.minecivilization.storage.SettlementStock.totals(level, citizen.blockPosition());
+        int wool = inventory.count("minecraft:white_wool") + stock.getOrDefault("minecraft:white_wool", 0);
+        if (wool < 3) {
+            // No herd yet: spiders give string, and four string are a wool.
+            // The night's fights furnish the first beds.
+            int string = inventory.count("minecraft:string") + stock.getOrDefault("minecraft:string", 0);
+            if (string < 4) return null;
+            return WorkOffer.shared(WorkPriority.CONSTRUCTION, "bed:wool", "spin spider string into wool for a bed",
+                    List.of(new CitizenPlan.Task(CitizenPlan.TaskType.CRAFT, "minecraft:white_wool",
+                            inventory.count("minecraft:white_wool") + 1, null, null, null, null)), 1);
+        }
+        return WorkOffer.shared(WorkPriority.CONSTRUCTION, "bed:craft", "make a bed from the herd's wool",
+                List.of(new CitizenPlan.Task(CitizenPlan.TaskType.CRAFT, "minecraft:white_bed", 1,
+                        null, null, null, null)), 1);
+    }
+
+    /** A free bed spot (the foot; the head is the cell to its north). */
+    @Nullable
+    private static BlockPos bedSpot(ServerLevel level) {
+        for (ConstructionProject project : ConstructionManager.get(level).all()) {
+            if (!ai.minecivilization.architecture.ModularHouse.isHome(project.blueprintId)
+                    || project.status != ConstructionProject.Status.COMPLETED) continue;
+            int[] spot = ai.minecivilization.architecture.ModularHouse.bedSpot(
+                    ai.minecivilization.architecture.ModularHouse.stageOf(project.blueprintId));
+            if (spot == null) continue;
+            BlockPos foot = new BlockPos(project.originX + spot[0], project.originY + spot[1],
+                    project.originZ + spot[2]);
+            if (bedFits(level, foot)) return foot;
+        }
+        // No home ready: by the town centre, where the colony gathers.
+        BlockPos centre = ai.minecivilization.colony.ZoneManager.get(level).townCenter(level);
+        var manager = ConstructionManager.get(level);
+        for (int r = 2; r <= 10; r++) {
+            for (int dx = -r; dx <= r; dx++) {
+                for (int dz = -r; dz <= r; dz++) {
+                    if (Math.max(Math.abs(dx), Math.abs(dz)) != r) continue;
+                    int x = centre.getX() + dx;
+                    int z = centre.getZ() + dz;
+                    int y = level.getHeight(net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z);
+                    BlockPos foot = new BlockPos(x, y, z);
+                    if (manager.inBuildingPlot(foot) || manager.inBuildingPlot(foot.north())) continue;
+                    if (bedFits(level, foot)) return foot;
+                }
+            }
+        }
+        return null;
+    }
+
+    private static boolean bedFits(ServerLevel level, BlockPos foot) {
+        BlockPos head = foot.north();
+        return level.isLoaded(foot) && level.isLoaded(head)
+                && level.getBlockState(foot).canBeReplaced() && level.getBlockState(head).canBeReplaced()
+                && level.getFluidState(foot).isEmpty() && level.getFluidState(head).isEmpty()
+                && level.getBlockState(foot.below()).isFaceSturdy(level, foot.below(), net.minecraft.core.Direction.UP)
+                && level.getBlockState(head.below()).isFaceSturdy(level, head.below(), net.minecraft.core.Direction.UP);
+    }
+
+    // ------------------------------------------------------------------ couriers
+
+    /** Trades that run materials and tools to the others. */
+    public static boolean isCourier(CitizenEntity citizen) {
+        String trade = citizen.getIdentity().profession;
+        return "CRAFTER".equals(trade) || "LOGISTICS".equals(trade) || "TRADER".equals(trade);
+    }
+
+    private static boolean courierAvailable(CitizenEntity asking) {
+        for (CitizenEntity other : CitizenIndex.all()) {
+            if (other != asking && other.isAlive() && isCourier(other)) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Take the oldest request a co-worker posted, get the thing — out of the
+     * stores, or made from what the stores hold (planks from logs) — and put
+     * it in the co-worker's hands.
+     */
+    @Nullable
+    private static WorkOffer courier(ServerLevel level, CitizenEntity citizen) {
+        if (!isCourier(citizen)) return null;
+        var stock = ai.minecivilization.storage.SettlementStock.totals(level, citizen.blockPosition());
+        var inventory = citizen.getInventory();
+        MaterialRequests.Request request = MaterialRequests.claim(citizen.getUUID(),
+                level.getGameTime(), r -> {
+                    if (!(level.getEntity(r.requester) instanceof CitizenEntity who)
+                            || !who.isAlive() || who.distanceToSqr(citizen) > 160 * 160) return false;
+                    return obtainable(r.item, stock, inventory) > 0;
+                });
+        if (request == null) return null;
+
+        List<CitizenPlan.Task> tasks = new ArrayList<>();
+        int carried = 0;
+        for (String variant : ai.minecivilization.construction.WoodSwap.variants(request.item)) {
+            carried += inventory.count(variant);
+        }
+        int quantity = request.quantity;
+        if (carried < quantity) {
+            String stored = null;
+            int storedCount = 0;
+            for (String variant : ai.minecivilization.construction.WoodSwap.variants(request.item)) {
+                int here = stock.getOrDefault(variant, 0);
+                if (here > storedCount) {
+                    storedCount = here;
+                    stored = variant;
+                }
+            }
+            if (stored != null) {
+                tasks.add(new CitizenPlan.Task(CitizenPlan.TaskType.WITHDRAW, stored,
+                        Math.min(quantity - carried, storedCount), null, null, null, null));
+            } else {
+                // Make it from what the stores hold: the craft plan fetches the logs.
+                tasks.add(new CitizenPlan.Task(CitizenPlan.TaskType.CRAFT, request.item,
+                        inventory.count(request.item) + (quantity - carried), null, null, null, null));
+            }
+        }
+        tasks.add(new CitizenPlan.Task(CitizenPlan.TaskType.HANDOVER, request.item, quantity,
+                request.requester.toString(), null, null, null));
+        String name = level.getEntity(request.requester) instanceof CitizenEntity who
+                ? who.getIdentity().name : "a co-worker";
+        return new WorkOffer(WorkPriority.TOOLS, "",
+                "bring " + quantity + " " + shortName(request.item) + " to " + name + " " + request.reason,
+                tasks, Integer.MAX_VALUE);
+    }
+
+    /** How much of an item (any wood) the courier could lay hands on. */
+    private static int obtainable(String item, java.util.Map<String, Integer> stock,
+                                  CitizenInventory inventory) {
+        int total = 0;
+        for (String variant : ai.minecivilization.construction.WoodSwap.variants(item)) {
+            total += stock.getOrDefault(variant, 0) + inventory.count(variant);
+        }
+        if (total == 0 && item.endsWith("_planks")) {
+            // Planks are logs a moment later: the courier's own or the stores'.
+            for (String species : ai.minecivilization.architecture.Palette.SPECIES) {
+                String log = "minecraft:" + species + "_log";
+                total += 4 * (stock.getOrDefault(log, 0) + inventory.count(log));
+            }
+        }
+        return total;
+    }
+
+    // ------------------------------------------------------------------ mining
+
+    /**
+     * A shift on the colony's shared mine.
+     *
+     * <p>The mine only ever started when the AI service asked a miner already
+     * carrying eight torches and two chests to dig it — a combination that
+     * never happened, so four hours of play produced no mine at all. Any miner
+     * with a pickaxe now takes a shift; torches and chests are put in when it
+     * has them, and the stone and ore it cuts go to the stores like any other
+     * load.</p>
+     */
+    @Nullable
+    private static WorkOffer mine(ServerLevel level, CitizenEntity citizen) {
+        if (!"MINER".equals(citizen.getIdentity().profession)) return null;
+        boolean pickaxe = false;
+        var inventory = citizen.getInventory();
+        for (int slot = 0; slot < inventory.getContainerSize(); slot++) {
+            if (inventory.getItem(slot).getItem() instanceof PickaxeItem) pickaxe = true;
+        }
+        if (!pickaxe) return null;
+        var works = ai.minecivilization.mining.MineWorks.get(level);
+        if (works.found(level) == null || works.nextLevel(level) == null) return null;
+        return WorkOffer.shared(WorkPriority.RESOURCES, "mine:shaft",
+                "take a shift on the colony mine",
+                List.of(new CitizenPlan.Task(CitizenPlan.TaskType.MINE_SHAFT, null, 1,
+                        null, null, null, null)), 2);
+    }
+
+    // ------------------------------------------------------------------ forestry
+
+    /**
+     * Plant the saplings a citizen is carrying in the colony's forest.
+     *
+     * <p>The colony cut every tree within forty-eight blocks and planted
+     * nothing back except a sapling on the odd stump: wood ran out and every
+     * house stopped. A lumberjack now plants whatever saplings it carries in a
+     * managed forest district, spaced so each grows into a tree; anybody else
+     * who picked up a handful does the same.</p>
+     */
+    @Nullable
+    private static WorkOffer forest(ServerLevel level, CitizenEntity citizen) {
+        var inventory = citizen.getInventory();
+        String sapling = null;
+        int carried = 0;
+        for (int slot = 0; slot < inventory.getContainerSize(); slot++) {
+            var stack = inventory.getItem(slot);
+            if (stack.isEmpty() || !stack.is(net.minecraft.tags.ItemTags.SAPLINGS)) continue;
+            carried += stack.getCount();
+            if (sapling == null) sapling = CitizenInventory.idOf(stack);
+        }
+        if (sapling == null) return null;
+        String trade = citizen.getIdentity().profession;
+        boolean forester = "LUMBERJACK".equals(trade) || "FORESTER".equals(trade);
+        if (!forester && carried < 4) return null;
+
+        List<BlockPos> spots = plantingSpots(level, citizen, Math.min(4, carried));
+        if (spots.isEmpty()) return null;
+        // One trip, several saplings: the walk to the forest is the expensive
+        // part, and planting one per trip left most of them in the pack.
+        List<CitizenPlan.Task> tasks = new ArrayList<>();
+        for (BlockPos spot : spots) {
+            tasks.add(new CitizenPlan.Task(CitizenPlan.TaskType.PLACE, sapling, 1, null, sapling, null,
+                    new int[]{spot.getX(), spot.getY(), spot.getZ()}));
+        }
+        BlockPos first = spots.get(0);
+        return new WorkOffer(WorkPriority.TOOLS, "plant:" + first.getX() + "," + first.getZ(),
+                "plant " + tasks.size() + " " + shortName(sapling) + "(s) in the colony forest",
+                tasks, 1);
+    }
+
+    /**
+     * Open soil in the nearest forest district, on a three-block grid and with
+     * nothing woody within two blocks — room for a trunk and a canopy.
+     */
+    private static List<BlockPos> plantingSpots(ServerLevel level, CitizenEntity citizen, int count) {
+        BlockPos from = citizen.blockPosition();
+        ai.minecivilization.colony.Zone forest = null;
+        double best = Double.MAX_VALUE;
+        for (var zone : ai.minecivilization.colony.ZoneManager.get(level).all()) {
+            if (zone.type != ai.minecivilization.colony.ZoneType.FOREST) continue;
+            double d = zone.distanceSqrTo(from);
+            if (d < best) {
+                best = d;
+                forest = zone;
+            }
+        }
+        // A forest district a long walk away is not worth the trip: the one
+        // this was aimed at sat 114 blocks off and the walk stalled. Plant
+        // where the citizen is instead — around the stumps of what it cut,
+        // which is how a forest is kept, as long as it is out of the town.
+        int minX, maxX, minZ, maxZ;
+        if (forest != null && best <= 64.0 * 64.0) {
+            minX = forest.minX + 1;
+            maxX = forest.maxX - 1;
+            minZ = forest.minZ + 1;
+            maxZ = forest.maxZ - 1;
+        } else {
+            BlockPos centre = ai.minecivilization.colony.ZoneManager.get(level).townCenter(level);
+            if (centre.distSqr(from) < 32.0 * 32.0) return List.of();
+            minX = from.getX() - 12;
+            maxX = from.getX() + 12;
+            minZ = from.getZ() - 12;
+            maxZ = from.getZ() + 12;
+        }
+        var manager = ConstructionManager.get(level);
+        List<BlockPos> found = new ArrayList<>();
+        for (int x = minX - Math.floorMod(minX, 3); x <= maxX; x += 3) {
+            for (int z = minZ - Math.floorMod(minZ, 3); z <= maxZ; z += 3) {
+                BlockPos column = new BlockPos(x, from.getY(), z);
+                if (!level.isLoaded(column)) continue;
+                int y = level.getHeight(net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z);
+                BlockPos spot = new BlockPos(x, y, z);
+                if (!level.getBlockState(spot).canBeReplaced()
+                        || !level.getFluidState(spot).isEmpty()
+                        || !level.getBlockState(spot.below()).is(net.minecraft.tags.BlockTags.DIRT)) continue;
+                if (manager.protectsCell(spot) || manager.inBuildingPlot(spot)) continue;
+                if (woodyNearby(level, spot)) continue;
+                found.add(spot);
+            }
+        }
+        // The nearest spot, then its nearest neighbours: one short walk.
+        if (found.isEmpty()) return found;
+        found.sort(java.util.Comparator.comparingDouble(p -> p.distSqr(from)));
+        BlockPos anchor = found.get(0);
+        found.sort(java.util.Comparator.comparingDouble(p -> p.distSqr(anchor)));
+        return new ArrayList<>(found.subList(0, Math.min(count, found.size())));
+    }
+
+    private static boolean woodyNearby(ServerLevel level, BlockPos spot) {
+        for (BlockPos pos : BlockPos.betweenClosed(spot.offset(-2, 0, -2), spot.offset(2, 3, 2))) {
+            var state = level.getBlockState(pos);
+            if (state.is(net.minecraft.tags.BlockTags.SAPLINGS) || state.is(net.minecraft.tags.BlockTags.LOGS)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     // ------------------------------------------------------------------ exploration
@@ -622,6 +1058,11 @@ public final class ColonyWork {
      */
     @Nullable
     private static WorkOffer explore(ServerLevel level, CitizenEntity citizen) {
+        // Nobody goes over the horizon without a weapon and a workbench —
+        // and nobody goes at all after dark.
+        if (!kitted(citizen)) return null;
+        if (ai.minecivilization.citizen.NightPolicy.shelterTime(level.getDayTime(),
+                level.isThundering())) return null;
         int population = CitizenIndex.population();
         if (population < 3) return null;
         int explorers = Math.max(1, population / 6);
@@ -633,20 +1074,16 @@ public final class ColonyWork {
 
     // ------------------------------------------------------------------ helpers
 
-    /** Unfinished projects, nearest first — a builder should not cross the town. */
+    /** True once the citizen carries every essential of its trade's kit. */
+    private static boolean kitted(CitizenEntity citizen) {
+        return Loadout.nextMissing(citizen.getIdentity().profession,
+                citizen.getInventory().summary(), false) == null;
+    }
+
+    /** Unfinished projects in the colony's order (see ConstructionManager#prioritized). */
     private static List<ConstructionProject> sortedActiveProjects(ServerLevel level,
                                                                   CitizenEntity citizen) {
-        List<ConstructionProject> active = new ArrayList<>();
-        for (ConstructionProject project : ConstructionManager.get(level).all()) {
-            if (project.status == ConstructionProject.Status.COMPLETED
-                    || project.status == ConstructionProject.Status.FAILED) continue;
-            active.add(project);
-        }
-        var from = citizen.blockPosition();
-        active.sort(java.util.Comparator.comparingDouble(project ->
-                new net.minecraft.core.BlockPos(project.originX, project.originY,
-                        project.originZ).distSqr(from)));
-        return active;
+        return ConstructionManager.get(level).prioritized(level, citizen.blockPosition());
     }
 
     /** {@code minecraft:oak_planks} → {@code oak planks}, for readable reasons. */

@@ -50,7 +50,11 @@ final class SkillNavigation {
         }
         context.citizen.clearWorkAnimation();
 
-        CitizenSkill traverse = context.get(key, (CitizenSkill) null);
+        // Defensive: a caller storing something else under this key must never
+        // be able to crash the server tick.
+        Object held = context.data.get(key);
+        CitizenSkill traverse = held instanceof CitizenSkill skill ? skill : null;
+        if (held != null && traverse == null) clear(context, key);
         if (traverse != null) {
             return tickTraverse(context, traverse, key);
         }

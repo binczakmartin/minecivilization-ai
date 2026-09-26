@@ -51,6 +51,10 @@ public final class LevelBlockView implements BlockView {
         // a leaf canopy, so a route must never assume it.
         if (state.getBlock() instanceof LeavesBlock) return false;
         if (state.is(Blocks.MAGMA_BLOCK)) return false;
+        // Farmland and paths are a sixteenth short of a full block but walked
+        // on like one. Counting them as no floor at all left nowhere to stand
+        // inside a field, so every harvest ended "crop out of reach".
+        if (state.is(Blocks.FARMLAND) || state.is(Blocks.DIRT_PATH)) return true;
         return state.isFaceSturdy(level, pos, Direction.UP);
     }
 
@@ -73,6 +77,13 @@ public final class LevelBlockView implements BlockView {
         if (!inBounds(pos)) return false;
         FluidState fluid = level.getFluidState(pos);
         if (fluid.isEmpty() || fluid.is(net.minecraft.tags.FluidTags.LAVA)) return false;
+        // A waterfall is not a route. Falling water pushes a swimmer down
+        // faster than it can climb, and routes planned up or through one left
+        // half a colony treading water at the foot of a cave fall. Go round.
+        if (!fluid.isSource() && fluid.hasProperty(net.minecraft.world.level.material.FlowingFluid.FALLING)
+                && fluid.getValue(net.minecraft.world.level.material.FlowingFluid.FALLING)) {
+            return false;
+        }
         // Source or flowing, it is water and a citizen can swim in it — but
         // not if something solid shares the cell.
         return level.getBlockState(pos).getCollisionShape(level, pos).isEmpty();

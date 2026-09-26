@@ -128,6 +128,9 @@ public final class FindBlockSkill implements CitizenSkill {
         Block named = resolveBlock(context);
         if (named != null) blocks.add(named);
 
+        // A builder needs the exact block its blueprint names: an acacia log
+        // does not stand in for an oak post.
+        if ("true".equals(context.params.extra.get("exact"))) return blocks;
         String wanted = context.params.resource != null
                 ? context.params.resource : context.params.block;
         for (String id : ai.minecivilization.forestry.ResourceFamily.sourceBlocks(wanted)) {
@@ -199,6 +202,19 @@ public final class FindBlockSkill implements CitizenSkill {
             if (!context.level.isLoaded(pos)) continue;
             BlockState state = context.level.getBlockState(pos);
             if (!accepted.contains(state.getBlock())) continue;
+            if (ai.minecivilization.navigation.UnreachableMemory.isUnreachable(pos,
+                    context.level.getGameTime())) continue;
+            // A log with neither ground nor more trunk under it is a branch up
+            // in the canopy — acacias are mostly branch. Aiming at one sent
+            // citizens pillaring into the treetops on three blocks of dirt;
+            // the trunk it grows from is a walk away and fells the lot.
+            if (state.is(net.minecraft.tags.BlockTags.LOGS)) {
+                BlockState under = context.level.getBlockState(pos.below());
+                if (!under.is(net.minecraft.tags.BlockTags.LOGS)
+                        && !under.is(net.minecraft.tags.BlockTags.DIRT)
+                        && (under.is(net.minecraft.tags.BlockTags.LEAVES)
+                            || !under.isFaceSturdy(context.level, pos.below(), Direction.UP))) continue;
+            }
             if (!new ai.minecivilization.navigation.LevelBlockView(context.level).diggable(pos)) continue;
             if (state.is(net.minecraft.world.level.block.Blocks.FARMLAND)
                     && !context.level.getBlockState(pos.above()).isAir()) continue;

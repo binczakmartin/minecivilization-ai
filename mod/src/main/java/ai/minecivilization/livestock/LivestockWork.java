@@ -34,7 +34,14 @@ public final class LivestockWork {
         }
         var pen = Pens.nearest(level, citizen.blockPosition());
         if (pen == null) {
-            if (Pens.all(level).isEmpty() && nearby.stream().noneMatch(a -> AnimalHusbandry.isLivestock(HerdRegistry.species(a)))) return work;
+            // A herd seen anywhere is reason enough to build the pen: the
+            // animals are fetched once it stands.
+            if (Pens.all(level).isEmpty() && nearby.stream().noneMatch(a -> AnimalHusbandry.isLivestock(HerdRegistry.species(a)))
+                    && !AnimalSightings.any(level)) {
+                if (!ai.minecivilization.citizen.NightPolicy.shelterTime(level.getDayTime(), level.isThundering()))
+                    work.add(new Task(TaskType.EXPLORE, null, 1, null, null, null, null));
+                return work;
+            }
             var project = Pens.ensureProject(level, citizen.blockPosition(), penWood(level, citizen));
             if (project == null) return work;
             if (!Pens.prepared(level, project)) {
@@ -67,6 +74,39 @@ public final class LivestockWork {
             work.add(new Task(TaskType.BUILD, null, -1, null, null, project.id, null)); return work;
         }
         var penned = Pens.animals(level, pen);
+        // Too few animals in the pen and none about: go and fetch the herd the
+        // colony has seen, with something to lure it with.
+        long pennedLivestock = penned.stream().filter(a -> AnimalHusbandry.isLivestock(HerdRegistry.species(a))).count();
+        boolean wildNearby = nearby.stream().anyMatch(a -> AnimalHusbandry.isLivestock(HerdRegistry.species(a))
+                && !HerdRegistry.owned(a) && !Pens.inside(pen, a));
+        if (pennedLivestock < 4 && !wildNearby) {
+            var sighting = AnimalSightings.nearest(level, citizen.blockPosition());
+            if (sighting != null && sighting.distSqr(citizen.blockPosition()) < 20 * 20) {
+                // Arrived and they have wandered off.
+                AnimalSightings.forgetNear(level, sighting);
+                sighting = AnimalSightings.nearest(level, citizen.blockPosition());
+            }
+            boolean night = ai.minecivilization.citizen.NightPolicy.shelterTime(level.getDayTime(), level.isThundering());
+            if (sighting != null && !night) {
+                int lure = inventory.count("minecraft:wheat") + inventory.count("minecraft:wheat_seeds")
+                        + inventory.count("minecraft:carrot");
+                if (lure >= 2) {
+                    work.add(new Task(TaskType.MOVE, null, -1, null, null, null,
+                            new int[]{sighting.getX(), sighting.getY(), sighting.getZ()}));
+                } else if (stored.getOrDefault("minecraft:wheat", 0) >= 2) {
+                    work.add(task(TaskType.WITHDRAW, "minecraft:wheat", Math.min(8, stored.get("minecraft:wheat")), null));
+                } else {
+                    // Seeds lure chickens, wheat lures sheep and cows: grass gives seeds.
+                    work.add(new Task(TaskType.GATHER, "minecraft:wheat_seeds", inventory.count("minecraft:wheat_seeds") + 6,
+                            null, "minecraft:short_grass", null, null));
+                }
+                return work;
+            }
+            if (sighting == null && !night && pennedLivestock == 0) {
+                work.add(new Task(TaskType.EXPLORE, null, 1, null, null, null, null));
+                return work;
+            }
+        }
         boolean foodNeeded = stored.entrySet().stream().filter(e -> e.getKey().contains("cooked_") || e.getKey().equals("minecraft:bread"))
             .mapToInt(Map.Entry::getValue).sum() < 32;
         for (String species : AnimalHusbandry.species()) {
@@ -76,8 +116,10 @@ public final class LivestockWork {
                 work.add(task(TaskType.TEND_LIVESTOCK, species, 1, total > ModConfig.LIVESTOCK_LIMIT.get() ? "SURPLUS" : "FOOD"));
         }
         if (penned.stream().anyMatch(a -> a instanceof Sheep sheep && sheep.readyForShearing())) {
+            int iron = inventory.count("minecraft:iron_ingot") + stored.getOrDefault("minecraft:iron_ingot", 0);
             if (inventory.count("minecraft:shears") > 0) work.add(task(TaskType.TEND_LIVESTOCK, "minecraft:sheep", 1, "SHEAR"));
-            else work.add(task(TaskType.CRAFT, "minecraft:shears", 1, null));
+            // Shears are iron: only once the mine has produced some.
+            else if (iron >= 2) work.add(task(TaskType.CRAFT, "minecraft:shears", 1, null));
         }
         if (inventory.count("minecraft:milk_bucket") == 0 && stored.getOrDefault("minecraft:milk_bucket", 0) < 4
                 && inventory.count("minecraft:bucket") > 0 && penned.stream().anyMatch(a -> !a.isBaby() && (a instanceof Cow || a instanceof Goat)))

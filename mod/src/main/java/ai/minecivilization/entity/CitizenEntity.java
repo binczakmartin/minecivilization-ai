@@ -114,6 +114,7 @@ public class CitizenEntity extends PathfinderMob {
 
     /** Hunger 0..100; below the starvation line citizens refuse to work. */
     public static final float HUNGER_FULL = 100.0f;
+    private static final String TAG_SHELTER = "ShelterBlocks";
     public static final float HUNGER_STARVING = 15.0f;
 
     private final CitizenInventory inventory = new CitizenInventory(CitizenInventory.SIZE);
@@ -130,6 +131,10 @@ public class CitizenEntity extends PathfinderMob {
      * restart is better forgotten than chased across a save.</p>
      */
     private final List<BlockPos> scaffoldPlaced = new ArrayList<>();
+    /** Blocks put up as tonight's shelter, to be taken down again at dawn. */
+    private final List<BlockPos> shelterBlocks = new ArrayList<>();
+    /** True while sitting the night out inside a finished shelter. */
+    private boolean sheltered;
     /** Exact state owned by each temporary support, so cleanup cannot remove a replacement. */
     private final Map<BlockPos, BlockState> scaffoldStates = new HashMap<>();
 
@@ -192,6 +197,11 @@ public class CitizenEntity extends PathfinderMob {
         // the edge of the world, and — having fallen into either — could not
         // path its way out of the cell it was standing in.
         this.navigation.setCanFloat(true);
+        // Never plan a walk across a tree canopy. Vanilla lets mobs stroll over
+        // leaves; a citizen that did so ended its path ten blocks up, fell off
+        // the edge of the canopy and died — and the ones that did not were left
+        // stranded in treetops, pillaring down on dirt.
+        this.setPathfindingMalus(net.minecraft.world.level.pathfinder.PathType.LEAVES, -1.0F);
         this.navigator = new CitizenNavigator(this, this.navigation);
         this.brain = new CitizenBrain(this);
     }
@@ -558,13 +568,18 @@ public class CitizenEntity extends PathfinderMob {
     }
 
     /** Called when the citizen eats; restores hunger and enforces nutrition rules. */
-    public void eatNow() {
-        if (this.level().random.nextFloat() < 0.05f) {
-            this.level().playSound(null, this.blockPosition(), SoundEvents.GENERIC_EAT, SoundSource.NEUTRAL, 0.6f, 1.0f);
-        }
-        this.setHunger(HUNGER_FULL);
-        this.setEnergy(100.0f);
+    /**
+     * Eat one real item from the pack, now.
+     *
+     * <p>This used to set hunger straight to full without taking anything out
+     * of the inventory — a free meal whenever a citizen merely owned food,
+     * which hid every food shortage the colony actually had.</p>
+     */
+    public boolean eatNow() {
+        float before = this.hunger;
+        eatFromInventoryIfPossible();
         this.changed = true;
+        return this.hunger > before;
     }
 
     /** Cheap heuristic used by skills: where might food be? */
@@ -627,6 +642,10 @@ public class CitizenEntity extends PathfinderMob {
         if (tag.contains(TAG_INVENTORY, Tag.TAG_COMPOUND)) {
             this.inventory.load(tag.getCompound(TAG_INVENTORY), this.registryAccess());
         }
+        this.shelterBlocks.clear();
+        for (long packed : tag.getLongArray(TAG_SHELTER)) {
+            this.shelterBlocks.add(BlockPos.of(packed));
+        }
         this.navigator.setBlockedPaths(this.executor.hasActiveTask());
         this.markDirty();
     }
@@ -658,6 +677,7 @@ public class CitizenEntity extends PathfinderMob {
         CompoundTag inventoryTag = new CompoundTag();
         this.inventory.save(inventoryTag, this.registryAccess());
         tag.put(TAG_INVENTORY, inventoryTag);
+        tag.putLongArray(TAG_SHELTER, this.shelterBlocks.stream().mapToLong(BlockPos::asLong).toArray());
     }
 
     // ------------------------------------------------------------------ lifecycle
@@ -753,6 +773,29 @@ public class CitizenEntity extends PathfinderMob {
         this.scaffoldStates.remove(immutable);
     }
 
+    public void rememberShelterBlock(BlockPos pos) {
+        BlockPos immutable = pos.immutable();
+        if (!this.shelterBlocks.contains(immutable)) this.shelterBlocks.add(immutable);
+        this.markDirty();
+    }
+
+    public List<BlockPos> shelterBlocks() {
+        return List.copyOf(this.shelterBlocks);
+    }
+
+    public void forgetShelterBlock(BlockPos pos) {
+        this.shelterBlocks.remove(pos);
+        this.markDirty();
+    }
+
+    public boolean isSheltered() {
+        return this.sheltered;
+    }
+
+    public void setSheltered(boolean sheltered) {
+        this.sheltered = sheltered;
+    }
+
     public void forgetAllScaffold() {
         this.scaffoldPlaced.clear();
         this.scaffoldStates.clear();
@@ -814,8 +857,11 @@ public class CitizenEntity extends PathfinderMob {
         ServerLevel server = (ServerLevel) this.level();
         if (this.escapeCooldown > 0) this.escapeCooldown--;
         // A combat cancel or timeout must not leave a worker standing on a
-        // temporary tower without the same edge guard used by normal TRAVERSE.
-        if (!this.bracedPlacement && this.isOnOwnedScaffold()) {
+        // temporary tower without the same edge guard used by normal TRAVERSE —
+        // but only a tower worth guarding. Bracing on every scaffold block pinned
+        // citizens to one-block dirt pillars for whole sessions: a hop down is
+        // harmless, and the guard stopped them taking it.
+        if (!this.bracedPlacement && this.isOnOwnedScaffold() && dangerousDropAround()) {
             this.setBracedPlacement(true);
         }
         long time = server.getGameTime();
@@ -834,14 +880,45 @@ public class CitizenEntity extends PathfinderMob {
                             + " (" + learned.lengthBlocks + " blocks)");
         }
 
-        // Passive hunger: work costs energy, doing nothing costs less.
+        // Passive hunger: work costs energy, doing nothing costs less — and a
+        // night spent sitting in a shelter costs least of all.
         if (time % 40 == 0) {
-            float drain = this.executor.hasActiveTask() ? 0.35f : 0.12f;
+            SkillType resting = this.executor.activeSkillType();
+            // Every 40 ticks. 0.35 here emptied a full belly in under ten
+            // minutes of work — half a day — and with food still scarce that
+            // sent the whole colony hunting for game that was not there.
+            // Now a meal lasts about a working day, like a player's.
+            float drain = resting == SkillType.SHELTER || resting == SkillType.SLEEP ? 0.03f
+                    : this.executor.hasActiveTask() ? 0.17f : 0.06f;
             this.setHunger(this.hunger - drain);
         }
 
+        // Natural healing. Citizens never regained a single point of health,
+        // so every arrow and every zombie scratch added up until one more
+        // finished them — which is why working after dark was a death sentence.
+        // Like a player: quickly when fed, slowly on an empty stomach, and not
+        // at all in the middle of a fight.
+        if (this.isAlive() && this.getHealth() < this.getMaxHealth()
+                && this.combatTarget == null
+                && this.tickCount - this.getLastHurtByMobTimestamp() > 100
+                && time % (this.hunger >= 30.0f ? 40 : 200) == 0) {
+            this.heal(1.0f);
+        }
+
+        // Roads are faster, which is what they are for.
+        if (time % 10 == 0) updateRoadSpeed();
+
+        // Keep an eye out for wild livestock: the colony's herd starts from a
+        // sighting, wherever it was.
+        if ((time + this.getId()) % 200 == 0) {
+            ai.minecivilization.livestock.AnimalSightings.glance(server, this);
+        }
+
         // Eating is a local deterministic action: only from a real food stack.
-        if (this.hunger < 60.0f && !this.executor.hasActiveTask()) {
+        // Between jobs at 60; mid-job only once properly hungry, the way a
+        // player eats without putting the pickaxe down.
+        if (time % 20 == 0 && (this.hunger < 60.0f && !this.executor.hasActiveTask()
+                || this.hunger < 30.0f)) {
             eatFromInventoryIfPossible();
         }
 
@@ -852,8 +929,9 @@ public class CitizenEntity extends PathfinderMob {
             this.syncEquipmentDisplay();
         }
         boolean fighting = this.tickCombat(server, time);
-        if (this.bracedPlacement && !this.isOnOwnedScaffold()
-                && !this.executor.hasActiveTask() && !fighting) {
+        if (this.bracedPlacement && !fighting && (!this.executor.hasActiveTask()
+                || this.executor.activeSkillType() != SkillType.TRAVERSE)
+                && (!this.isOnOwnedScaffold() || !dangerousDropAround())) {
             this.setBracedPlacement(false);
         }
         SkillType activeSkill = this.executor.activeSkillType();
@@ -1183,6 +1261,13 @@ public class CitizenEntity extends PathfinderMob {
             if (distSqr > scanRadius * scanRadius) continue; // inflate() box reaches corners
 
             boolean recentAttacker = attackerRecent && attacker == candidate;
+            // Walled in for the night: whatever is prowling outside cannot get
+            // in, and stepping out to fight it is the one way to lose. Only
+            // something already landing blows gets an answer.
+            if (this.sheltered && !(recentAttacker
+                    && distSqr <= CombatPolicy.CORNERED_RANGE * CombatPolicy.CORNERED_RANGE)) {
+                continue;
+            }
             CombatPolicy.Response response = CombatPolicy.assess(true,
                     CombatPolicy.classify(entityId(candidate)), distSqr, radius, ATTACKER_LEASH,
                     recentAttacker, healthFraction, starving, armed);
@@ -1206,6 +1291,34 @@ public class CitizenEntity extends PathfinderMob {
             return null;   // running takes precedence over any available fight
         }
         return bestFight;
+    }
+
+    private static final net.minecraft.resources.ResourceLocation ROAD_SPEED =
+            net.minecraft.resources.ResourceLocation.fromNamespaceAndPath("minecivilization", "road_speed");
+
+    /** +30% walking speed on a path, gravel, cobble or stone road. */
+    private void updateRoadSpeed() {
+        var attribute = this.getAttribute(Attributes.MOVEMENT_SPEED);
+        if (attribute == null) return;
+        BlockState under = this.level().getBlockState(this.blockPosition().below());
+        BlockState at = this.level().getBlockState(this.blockPosition());
+        boolean road = at.is(net.minecraft.world.level.block.Blocks.DIRT_PATH)
+                || under.is(net.minecraft.world.level.block.Blocks.DIRT_PATH)
+                || under.is(net.minecraft.world.level.block.Blocks.GRAVEL)
+                || under.is(net.minecraft.world.level.block.Blocks.COBBLESTONE)
+                || under.is(net.minecraft.world.level.block.Blocks.STONE_BRICKS);
+        boolean has = attribute.hasModifier(ROAD_SPEED);
+        if (road && !has) {
+            attribute.addTransientModifier(new net.minecraft.world.entity.ai.attributes.AttributeModifier(
+                    ROAD_SPEED, 0.3, net.minecraft.world.entity.ai.attributes.AttributeModifier.Operation.ADD_MULTIPLIED_BASE));
+        } else if (!road && has) {
+            attribute.removeModifier(ROAD_SPEED);
+        }
+    }
+
+    /** Carrying a sword or an axe. */
+    public boolean isArmed() {
+        return hasWeapon();
     }
 
     /** Something worth swinging: a sword or an axe beats bare hands. */
@@ -1242,9 +1355,30 @@ public class CitizenEntity extends PathfinderMob {
             this.fleeFrom = null;
             return false;   // far enough; get back to work
         }
+        boolean explosive = this.fleeKind == CombatPolicy.ThreatKind.EXPLOSIVE;
+        // A creeper hissing at arm's length cannot be outrun any more. Hit it:
+        // the knock-back carries it out of range and its fuse winds down —
+        // the move every player learns on their first night.
+        if (explosive && distSqr <= 3.2 * 3.2 && hasWeapon()
+                && threat instanceof net.minecraft.world.entity.monster.Creeper creeper
+                && creeper.getSwellDir() > 0
+                && CombatPolicy.canAttack(time, this.combatNextAttackAt)) {
+            this.syncEquipmentDisplay();
+            ItemStack weapon = bestMatching("_sword");
+            if (weapon.isEmpty()) weapon = bestMatching("_axe");
+            this.setDisplayItem(EquipmentSlot.MAINHAND, weapon);
+            this.lookControl.setLookAt(creeper);
+            this.swing(InteractionHand.MAIN_HAND);
+            this.doHurtTarget(creeper);
+            creeper.knockback(1.2D, this.getX() - creeper.getX(), this.getZ() - creeper.getZ());
+            this.combatNextAttackAt = time + ModConfig.COMBAT_ATTACK_INTERVAL_TICKS.get();
+        }
         // A threat that cannot be escaped — behind a wall, or following us round
-        // a pen — must not cost a citizen the rest of its life.
-        if (time - this.fleeStartedAt > CombatPolicy.MAX_FLEE_TICKS) {
+        // a pen — must not cost a citizen the rest of its life. A creeper still
+        // close enough to hurt is the exception: stopping then is the death.
+        boolean stillInBlast = explosive
+                && distSqr <= (CombatPolicy.BLAST_DANGER_RADIUS + 2) * (CombatPolicy.BLAST_DANGER_RADIUS + 2);
+        if (!stillInBlast && time - this.fleeStartedAt > CombatPolicy.MAX_FLEE_TICKS) {
             this.fleeFrom = null;
             this.brain.addEvent("stopped running from " + entityId(threat));
             return false;
@@ -1266,10 +1400,28 @@ public class CitizenEntity extends PathfinderMob {
                 away = away.add(homeward.normalize().scale(6.0));
             }
 
-            BlockPos destination = BlockPos.containing(this.getX() + away.x, this.getY(),
-                    this.getZ() + away.z);
-            this.navigator.stop();
-            this.navigator.moveTo(destination, 1.3D);
+            // Try straight away first, then either side: running into a
+            // hillside or a river because that was "directly away" is how
+            // backing-off citizens were caught.
+            boolean moving = false;
+            for (int turn : new int[]{0, 60, -60, 110, -110}) {
+                double rad = Math.toRadians(turn);
+                double ax = away.x * Math.cos(rad) - away.z * Math.sin(rad);
+                double az = away.x * Math.sin(rad) + away.z * Math.cos(rad);
+                int x = net.minecraft.util.Mth.floor(this.getX() + ax);
+                int z = net.minecraft.util.Mth.floor(this.getZ() + az);
+                // Aim at the ground there, not at our own height inside a hill.
+                int y = server.isLoaded(new BlockPos(x, this.getBlockY(), z))
+                        ? server.getHeight(net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z)
+                        : this.getBlockY();
+                this.navigator.stop();
+                if (this.navigator.moveTo(new BlockPos(x, y, z), 1.3D)
+                        && this.navigation.getPath() != null) {
+                    moving = true;
+                    break;
+                }
+            }
+            if (!moving) this.navigator.stop();
             this.combatLastRepathAt = time;
         }
         this.navigator.tick();
@@ -1289,6 +1441,9 @@ public class CitizenEntity extends PathfinderMob {
         this.setTraversalSneak(false);
         this.setControlledDrop(false);
         this.combatTarget = target;
+        // Weapon in hand before the first swing, not at the next display sync
+        // a second later: attack damage comes from the main-hand item.
+        this.syncEquipmentDisplay();
         this.combatLeash = Math.max(
                 CombatPolicy.effectiveRadius(ModConfig.COMBAT_TRIGGER_RADIUS.get(),
                         this.personality.riskTolerance),
@@ -1476,7 +1631,13 @@ public class CitizenEntity extends PathfinderMob {
         }
 
         BlockPos escape = findEscapeCell(this.blockPosition());
-        if (escape == null) return false;
+        if (escape == null) escape = findWiderEscapeCell(this.blockPosition());
+        if (escape == null) {
+            // Sealed in (a neighbour's wall went up around it): dig out, as a
+            // player would, rather than suffocate politely. Builders put a
+            // missing block back; nobody brings a citizen back.
+            return digOutOfWall();
+        }
 
         Vec3 oldPosition = this.position();
         Vec3 oldVelocity = this.getDeltaMovement();
@@ -1534,6 +1695,44 @@ public class CitizenEntity extends PathfinderMob {
         return null;
     }
 
+    /** Standable free cells up to two blocks away, nearest first. */
+    private BlockPos findWiderEscapeCell(BlockPos feet) {
+        var dimensions = this.getDimensions(getPose());
+        BlockPos best = null;
+        double bestDist = Double.MAX_VALUE;
+        for (BlockPos candidate : BlockPos.betweenClosed(feet.offset(-2, -2, -2), feet.offset(2, 2, 2))) {
+            double d = candidate.distSqr(feet);
+            if (d >= bestDist || !this.level().isLoaded(candidate)) continue;
+            AABB body = dimensions.makeBoundingBox(
+                    candidate.getX() + 0.5, candidate.getY(), candidate.getZ() + 0.5);
+            if (!this.level().noCollision(this, body)) continue;
+            BlockState floor = this.level().getBlockState(candidate.below());
+            if (floor.getBlock() instanceof net.minecraft.world.level.block.LeavesBlock
+                    || !floor.isFaceSturdy(this.level(), candidate.below(), Direction.UP)
+                    || !isCellFreeOfOtherLivingEntities(body)) continue;
+            best = candidate.immutable();
+            bestDist = d;
+        }
+        return best;
+    }
+
+    /** Break whatever fills the body's cells (never bedrock-like blocks). */
+    private boolean digOutOfWall() {
+        BlockPos feet = this.blockPosition();
+        boolean dug = false;
+        for (BlockPos cell : new BlockPos[]{feet, feet.above()}) {
+            BlockState state = this.level().getBlockState(cell);
+            if (state.isAir() || state.getCollisionShape(this.level(), cell).isEmpty()) continue;
+            if (state.getDestroySpeed(this.level(), cell) < 0) return false;
+            this.level().destroyBlock(cell, true, this);
+            dug = true;
+        }
+        if (!dug || !this.level().noCollision(this, this.getBoundingBox())) return false;
+        this.escapeCooldown = 20;
+        LOGGER.warn("[Citizen {}] dug itself out of a wall at {}", this.getName().getString(), feet);
+        return true;
+    }
+
     private boolean isCellFreeOfOtherLivingEntities(AABB body) {
         for (net.minecraft.world.entity.LivingEntity other :
                 this.level().getEntitiesOfClass(net.minecraft.world.entity.LivingEntity.class,
@@ -1545,7 +1744,11 @@ public class CitizenEntity extends PathfinderMob {
 
     @Override
     public void travel(Vec3 input) {
-        if (this.isSafeMovement() && blocksSneakEdge(input)) {
+        // The cliff rule applies to every step, not only to a task's careful
+        // "safe step" mode: a citizen following an ordinary path walked off a
+        // fourteen-block hillside between two re-paths, the same one, in every
+        // run. The stricter scaffold rules still only apply while braced.
+        if (blocksSneakEdge(input)) {
             Vec3 motion = this.getDeltaMovement();
             this.setDeltaMovement(0.0, motion.y, 0.0);
             input = new Vec3(0.0, input.y, 0.0);
@@ -1553,29 +1756,93 @@ public class CitizenEntity extends PathfinderMob {
         super.travel(input);
     }
 
-    private boolean blocksSneakEdge(Vec3 input) {
-        int dx = (int) Math.signum(input.x);
-        int dz = (int) Math.signum(input.z);
-        if (dx == 0 && dz == 0) return false;
-        BlockPos feet = this.blockPosition();
-        if (!this.onGround() && !this.bracedPlacement) return false;
-        if (!hasFloorAt(feet) || (this.bracedPlacement && !hasFloorUnderSelf())) {
-            // Once a worker is genuinely airborne, vanilla gravity owns the
-            // descent.  Only a braced worker is stopped from drifting farther
-            // out over a hole while it is still on a scaffold transaction.
-            return this.bracedPlacement;
-        }
-        if (dx != 0 && !hasFloorAt(feet.offset(dx, 0, 0))
-                && !hasFloorAt(feet.offset(dx, -1, 0))) {
-            if (!controlledDrop || !(hasFloorAt(feet.offset(dx, -2, 0))
-                    || hasFloorAt(feet.offset(dx, -3, 0)))) return true;
-        }
-        if (dz != 0 && !hasFloorAt(feet.offset(0, 0, dz))
-                && !hasFloorAt(feet.offset(0, -1, dz))) {
-            if (!controlledDrop || !(hasFloorAt(feet.offset(0, -2, dz))
-                    || hasFloorAt(feet.offset(0, -3, dz)))) return true;
+    /** Local movement input (strafe, up, forward) as a world-space direction. */
+    private Vec3 worldDirection(Vec3 local) {
+        float yaw = this.getYRot() * ((float) Math.PI / 180F);
+        double sin = Mth.sin(yaw);
+        double cos = Mth.cos(yaw);
+        return new Vec3(local.x * cos - local.z * sin, local.y, local.z * cos + local.x * sin);
+    }
+
+    /** Standing on, or at the edge of, a block this citizen placed to stand on. */
+    private boolean nearOwnedScaffold() {
+        if (this.scaffoldPlaced.isEmpty()) return false;
+        BlockPos below = this.blockPosition().below();
+        for (int dx = -1; dx <= 1; dx++) {
+            for (int dz = -1; dz <= 1; dz++) {
+                if (this.scaffoldPlaced.contains(below.offset(dx, 0, dz))) return true;
+            }
         }
         return false;
+    }
+
+    /** Stepping off this spot in some direction would fall more than three blocks. */
+    private boolean dangerousDropAround() {
+        BlockPos feet = this.blockPosition();
+        for (Direction side : Direction.Plane.HORIZONTAL) {
+            BlockPos next = feet.relative(side);
+            int drop = 0;
+            while (drop <= 3 && !hasFloorAt(next.below(drop))) drop++;
+            if (drop > 3) return true;
+        }
+        return false;
+    }
+
+    private boolean blocksSneakEdge(Vec3 localInput) {
+        // travel() receives the mob's *local* input — strafe, up, forward —
+        // not a world direction. Reading it as world x/z meant "forward" was
+        // always checked as "south", and every riverbank and pillar edge froze
+        // someone in place. Rotate it the way vanilla's own movement does.
+        // Nobody falls off a ledge while swimming.
+        if (this.isInWater()) return false;
+        Vec3 input = worldDirection(localInput);
+        Vec3 flat = new Vec3(input.x, 0.0, input.z);
+        if (flat.lengthSqr() < 1.0e-6) return false;
+        BlockPos feet = this.blockPosition();
+
+        // The strict rules are for a worker up on its own pillar or bridge.
+        // TRAVERSE braces for its whole route, natural ground included, and
+        // applying them there refused ordinary steps down and held citizens
+        // hanging over the lip of every slope.
+        boolean strict = this.bracedPlacement && nearOwnedScaffold();
+        // No steering in mid-fall. A citizen stepping down a staircase of
+        // two-block ledges kept walking forward through the air, drifted over
+        // ledge after ledge without ever landing, and hit the bottom fourteen
+        // blocks down. Falling straight lands it on the first step, where the
+        // edge check gets to look again.
+        if (!this.onGround() && this.fallDistance > 0.5f && !this.isInWater()) return true;
+        if (!this.onGround() && !strict) return false;
+
+        // Where the body is actually heading: half a block ahead along the
+        // real direction of travel. Looking a whole cell ahead along the main
+        // axis only, and ignoring small sideways components, let a slow
+        // diagonal drift walk a citizen off a fourteen-block ledge.
+        Vec3 probe = this.position().add(flat.normalize().scale(0.5));
+        BlockPos ahead = BlockPos.containing(probe.x, this.getY() + 0.01, probe.z);
+        if (ahead.getX() == feet.getX() && ahead.getZ() == feet.getZ()) return false;
+
+        if (strict && (!hasFloorAt(feet) || !hasFloorUnderSelf())) {
+            // A braced worker already hanging over the edge of its scaffold may
+            // move back towards the middle of the block, never farther out.
+            if (hasFloorAt(ahead)) return false;
+            double cx = feet.getX() + 0.5 - this.getX();
+            double cz = feet.getZ() + 0.5 - this.getZ();
+            return flat.x * cx < 0 || flat.z * cz < 0;
+        }
+        // How far down the next floor may be. Ordinary walking follows vanilla
+        // path-finding, which plans drops of up to three blocks (the fall a mob
+        // takes without damage). Up on its own scaffold only a level step
+        // counts, one down at most: a longer step from a pillar top can be
+        // blocks above the ground.
+        int maxDrop = strict ? (this.controlledDrop ? 3 : 1) : 3;
+        for (int k = 0; k <= maxDrop; k++) {
+            BlockPos cell = ahead.below(k);
+            if (hasFloorAt(cell)) return false;
+            // Dropping into water is a landing, not a fall.
+            if (!this.level().getFluidState(cell).isEmpty()) return false;
+        }
+        // Nothing to land on within reach: a real cliff or a ravine.
+        return true;
     }
 
     private boolean hasFloorUnderSelf() {
@@ -1593,6 +1860,8 @@ public class CitizenEntity extends PathfinderMob {
     private boolean hasFloorAt(BlockPos feet) {
         BlockPos floor = feet.below();
         BlockState state = this.level().getBlockState(floor);
+        if (state.is(net.minecraft.world.level.block.Blocks.FARMLAND)
+                || state.is(net.minecraft.world.level.block.Blocks.DIRT_PATH)) return true;
         return !(state.getBlock() instanceof net.minecraft.world.level.block.LeavesBlock)
                 && state.isFaceSturdy(this.level(), floor, Direction.UP);
     }

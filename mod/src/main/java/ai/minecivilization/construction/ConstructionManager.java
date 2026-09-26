@@ -90,6 +90,16 @@ public final class ConstructionManager extends SavedData {
         if (id.startsWith(ai.minecivilization.architecture.HouseCatalog.ID_PREFIX)) {
             return ai.minecivilization.architecture.HouseCatalog.ensureRegistered(level, id);
         }
+        if (ai.minecivilization.architecture.TownSquare.isSquare(id)) {
+            Blueprint square = ai.minecivilization.architecture.TownSquare.create(id);
+            registerBlueprint(square);
+            return square;
+        }
+        if (ai.minecivilization.architecture.ModularHouse.isHome(id)) {
+            Blueprint home = ai.minecivilization.architecture.ModularHouse.create(id);
+            if (home != null) registerBlueprint(home);
+            return home;
+        }
         if (AnimalPen.isPen(id)) {
             // Pens are registered statically for the woods the mod knows, so a
             // miss here means a wood it does not — rebuild it from the id.
@@ -146,6 +156,13 @@ public final class ConstructionManager extends SavedData {
         projects.put(project.id, project);
         setDirty();
         return project;
+    }
+
+    /** Drop a project that never started, so its plot can be planned again. */
+    public void remove(ConstructionProject project) {
+        if (project == null) return;
+        projects.remove(project.id);
+        setDirty();
     }
 
     public ConstructionProject byId(String id) {
@@ -285,6 +302,31 @@ public final class ConstructionManager extends SavedData {
         return false;
     }
 
+    /**
+     * True when {@code pos} lies on the plot of a building not yet finished:
+     * inside its horizontal footprint, give or take a block.
+     *
+     * <p>Torches, fields and signs went wherever there was room, and the room
+     * was often a house plot. Each one then stood in a blueprint cell, and the
+     * house could not go up round it. Nothing but the building goes on a plot.</p>
+     */
+    public boolean inBuildingPlot(BlockPos pos) {
+        if (pos == null) return false;
+        for (ConstructionProject project : projects.values()) {
+            if (project.status == ConstructionProject.Status.COMPLETED
+                    || project.status == ConstructionProject.Status.FAILED) continue;
+            Blueprint blueprint = BLUEPRINTS.get(project.blueprintId);
+            if (blueprint == null) continue;
+            int x = pos.getX() - project.originX;
+            int z = pos.getZ() - project.originZ;
+            if (x >= -1 && x <= blueprint.sizeX && z >= -1 && z <= blueprint.sizeZ
+                    && Math.abs(pos.getY() - project.originY) <= blueprint.sizeY + 2) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /** True when a named project owns this world cell. */
     public boolean ownsCell(String projectId, BlockPos pos) {
         if (projectId == null || pos == null) return false;
@@ -314,6 +356,31 @@ public final class ConstructionManager extends SavedData {
             return false;
         }
         if (!state.getFluidState().isEmpty() || state.getDestroySpeed(level, pos) < 0f) return false;
+        // Anything growing or lying about where a building goes: trees, leaves,
+        // flowers, crops, torches, the odd cobblestone or plank left by a
+        // traversal. Only dirt and stone used to count, so an acacia standing
+        // in a savanna house plot blocked the house forever — 585 failures of
+        // "cell is occupied by a different block" in one afternoon. What is
+        // never cleared: block entities (checked above), beds and doors, and
+        // cells belonging to another project (checked by the caller).
+        if (state.is(net.minecraft.tags.BlockTags.BEDS) || state.is(net.minecraft.tags.BlockTags.DOORS)) {
+            return false;
+        }
+        if (state.is(net.minecraft.tags.BlockTags.LOGS) || state.is(net.minecraft.tags.BlockTags.LEAVES)
+                || state.is(net.minecraft.tags.BlockTags.FLOWERS) || state.is(net.minecraft.tags.BlockTags.SAPLINGS)
+                || state.is(net.minecraft.tags.BlockTags.CROPS) || state.is(Blocks.FARMLAND)
+                || state.is(Blocks.TORCH) || state.is(Blocks.WALL_TORCH)
+                || state.is(Blocks.COBBLESTONE) || state.is(net.minecraft.tags.BlockTags.PLANKS)
+                || state.is(Blocks.SNOW) || state.is(Blocks.SNOW_BLOCK) || state.is(Blocks.ICE)
+                || state.is(Blocks.MOSS_BLOCK) || state.is(Blocks.MUD) || state.is(Blocks.DIRT_PATH)
+                || state.is(Blocks.SANDSTONE) || state.is(Blocks.TERRACOTTA)
+                || state.is(net.minecraft.tags.BlockTags.TERRACOTTA)
+                || state.is(Blocks.SUGAR_CANE) || state.is(Blocks.CACTUS) || state.is(Blocks.PUMPKIN)
+                || state.is(Blocks.MELON) || state.is(Blocks.SWEET_BERRY_BUSH)
+                || state.is(Blocks.MOSSY_COBBLESTONE)
+                || state.is(net.minecraft.tags.BlockTags.BASE_STONE_OVERWORLD)) {
+            return true;
+        }
         return state.is(Blocks.GRASS_BLOCK) || state.is(Blocks.DIRT)
                 || state.is(Blocks.PODZOL) || state.is(Blocks.COARSE_DIRT)
                 || state.is(Blocks.ROOTED_DIRT) || state.is(Blocks.SAND)
@@ -370,7 +437,7 @@ public final class ConstructionManager extends SavedData {
             Blueprint.BlockEntry expected = expectedByPosition.get(relative);
             BlockState expectedState = expected == null ? null : parseState(level, expected.blockState);
             boolean matches = expected != null && expectedState != null
-                    && level.getBlockState(pos).equals(expectedState);
+                    && matches(expectedState, level.getBlockState(pos));
             if (matches) {
                 if (project.placed.add(key)) changed = true;
             } else {
@@ -392,7 +459,40 @@ public final class ConstructionManager extends SavedData {
             ConstructionProject p = manager.byId(projectId);
             if (p != null) return p;
         }
-        return manager.nearestActive(near);
+        // No project named: the one the colony most wants finished, not the
+        // nearest. A generic "go and build" sent every such builder to the
+        // biggest building beside them while the homes stayed at 0%.
+        List<ConstructionProject> ranked = manager.prioritized(level, near);
+        return ranked.isEmpty() ? null : ranked.get(0);
+    }
+
+    /**
+     * Unfinished projects in the order the colony wants them done: least work
+     * left first, then the nearest.
+     */
+    public List<ConstructionProject> prioritized(ServerLevel level, BlockPos from) {
+        List<ConstructionProject> active = new ArrayList<>();
+        for (ConstructionProject project : projects.values()) {
+            if (project.status == ConstructionProject.Status.COMPLETED
+                    || project.status == ConstructionProject.Status.FAILED) continue;
+            active.add(project);
+        }
+        Map<String, Double> progress = new HashMap<>();
+        Map<String, Integer> size = new HashMap<>();
+        for (ConstructionProject project : active) {
+            Blueprint blueprint = ensureBlueprint(level, project.blueprintId);
+            progress.put(project.id, blueprint == null ? 0.0 : project.progress(blueprint));
+            size.put(project.id, blueprint == null ? Integer.MAX_VALUE : blueprint.entries().size());
+        }
+        // Least work left first: that is what gets buildings finished. A cabin
+        // with ninety blocks to go beats a town hall with three hundred, even
+        // one that is further along.
+        active.sort(java.util.Comparator
+                .comparingDouble((ConstructionProject project) ->
+                        size.get(project.id) * (1.0 - progress.get(project.id)))
+                .thenComparingDouble(project -> from == null ? 0.0
+                        : new BlockPos(project.originX, project.originY, project.originZ).distSqr(from)));
+        return active;
     }
 
     /**
@@ -400,11 +500,60 @@ public final class ConstructionManager extends SavedData {
      * placed, and currently survivable (or deferred when support is missing).
      * Returns empty when the project is complete or everything left is blocked.
      */
+    /**
+     * Whether {@code actual} fulfils a blueprint cell that asks for {@code expected}:
+     * the exact state, or the same wooden block in another species with the
+     * same shape (facing, half, axis...). See {@link WoodSwap}.
+     */
+    public static boolean matches(BlockState expected, BlockState actual) {
+        if (expected == null || actual == null) return false;
+        if (expected.equals(actual)) return true;
+        var expectedKey = net.minecraftforge.registries.ForgeRegistries.BLOCKS.getKey(expected.getBlock());
+        var actualKey = net.minecraftforge.registries.ForgeRegistries.BLOCKS.getKey(actual.getBlock());
+        if (expectedKey == null || actualKey == null
+                || !WoodSwap.sameKind(expectedKey.toString(), actualKey.toString())) return false;
+        for (var property : expected.getProperties()) {
+            if (!actual.hasProperty(property)
+                    || !actual.getValue(property).equals(expected.getValue(property))) return false;
+        }
+        return true;
+    }
+
+    /** The blueprint state rebuilt in another wood species, keeping its shape. */
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    public static BlockState inSpecies(BlockState state, String species) {
+        var key = net.minecraftforge.registries.ForgeRegistries.BLOCKS.getKey(state.getBlock());
+        if (key == null || !WoodSwap.isWooden(key.toString())) return state;
+        var other = net.minecraftforge.registries.ForgeRegistries.BLOCKS.getValue(
+                net.minecraft.resources.ResourceLocation.parse(WoodSwap.withSpecies(key.toString(), species)));
+        if (other == null || other == net.minecraft.world.level.block.Blocks.AIR) return state;
+        BlockState out = other.defaultBlockState();
+        for (var property : state.getProperties()) {
+            if (out.hasProperty(property)) {
+                out = out.setValue((net.minecraft.world.level.block.state.properties.Property) property,
+                        (Comparable) state.getValue(property));
+            }
+        }
+        return out;
+    }
+
     public Optional<NextStep> nextStep(ServerLevel level, ConstructionProject project) {
+        return nextStep(level, project, item -> true);
+    }
+
+    /**
+     * The next block to place, skipping those whose material {@code available}
+     * says the builder cannot get right now. Building strictly in blueprint
+     * order meant one missing chest stopped a whole house; now a builder puts
+     * up every wall it has planks for and leaves the chest for later.
+     */
+    public Optional<NextStep> nextStep(ServerLevel level, ConstructionProject project,
+                                       java.util.function.Predicate<String> available) {
         Blueprint blueprint = BLUEPRINTS.get(project.blueprintId);
         if (blueprint == null) return Optional.empty();
 
         List<Blueprint.BlockEntry> deferred = new ArrayList<>();
+        boolean skippedForMaterial = false;
         for (Blueprint.BlockEntry entry : blueprint.entries()) {
             int ax = project.originX + entry.x;
             int ay = project.originY + entry.y;
@@ -419,7 +568,7 @@ public final class ConstructionManager extends SavedData {
                         "unparseable block state: " + entry.blockState));
             }
             BlockState existing = level.getBlockState(pos);
-            if (existing.equals(state)) {
+            if (matches(state, existing)) {
                 // Reconcile the ledger with the real world instead of asking a
                 // builder to overwrite a block that is already correct.
                 project.placed.add(key);
@@ -443,15 +592,24 @@ public final class ConstructionManager extends SavedData {
                 deferred.add(entry);
                 continue;
             }
+            if (!available.test(entry.itemId())) {
+                skippedForMaterial = true;
+                continue;
+            }
             return Optional.of(new NextStep(pos, entry.blockState, false, null));
         }
 
-        if (!deferred.isEmpty()) {
-            Blueprint.BlockEntry entry = deferred.get(0);
+        // Unsupported blocks the builder has material for come first: the
+        // builder can lay the foundation under them (see BuildBlueprintSkill).
+        for (Blueprint.BlockEntry entry : deferred) {
+            if (!available.test(entry.itemId())) continue;
             BlockPos pos = new BlockPos(project.originX + entry.x,
                     project.originY + entry.y, project.originZ + entry.z);
             return Optional.of(new NextStep(pos, entry.blockState, true,
                     "missing support at " + pos.getX() + "," + pos.getY() + "," + pos.getZ()));
+        }
+        if (skippedForMaterial || !deferred.isEmpty()) {
+            return Optional.of(NextStep.noMaterial());
         }
         return Optional.empty();
     }
@@ -509,8 +667,17 @@ public final class ConstructionManager extends SavedData {
         /** The worker must remove natural terrain before placing this entry. */
         public final boolean clearExisting;
 
+        /** Set when every placeable block left needs a material the builder cannot get. */
+        public boolean missingMaterial;
+
         public NextStep(BlockPos pos, String blockState, boolean unsupported, String detail) {
             this(pos, blockState, unsupported, detail, false);
+        }
+
+        static NextStep noMaterial() {
+            NextStep step = new NextStep(null, null, true, "no material on hand for any remaining block");
+            step.missingMaterial = true;
+            return step;
         }
 
         public NextStep(BlockPos pos, String blockState, boolean unsupported, String detail,

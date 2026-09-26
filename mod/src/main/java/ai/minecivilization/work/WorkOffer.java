@@ -60,9 +60,9 @@ public record WorkOffer(WorkPriority priority, String claimKey, String reason,
             case BUILD, PLACE, ROADWORK, SIGN -> CitizenPlan.GoalType.BUILD_PROJECT;
             case HARVEST -> CitizenPlan.GoalType.HARVEST_FOOD;
             case CRAFT, SMELT -> CitizenPlan.GoalType.CRAFT_ITEM;
-            case DELIVER, WITHDRAW -> CitizenPlan.GoalType.DELIVER_RESOURCE;
+            case DELIVER, WITHDRAW, HANDOVER -> CitizenPlan.GoalType.DELIVER_RESOURCE;
             case EXPLORE, MOVE, ESCAPE -> CitizenPlan.GoalType.EXPLORE;
-            case IDLE, REST -> CitizenPlan.GoalType.REST;
+            case IDLE, REST, SHELTER -> CitizenPlan.GoalType.REST;
             default -> CitizenPlan.GoalType.INCREASE_RESOURCE;
         };
         return new CitizenPlan(reason,

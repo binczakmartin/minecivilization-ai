@@ -75,6 +75,10 @@ public final class FellTreeSkill implements CitizenSkill {
     private static final int MAX_CLIMB = 24;
 
     private int leavesTaken;
+    /** When this tree was started, for its time budget. */
+    private long treeStartedAt;
+    /** Longest one tree may take (90 s) before the job settles for what is down. */
+    private static final int TREE_BUDGET_TICKS = 1800;
     private int climbed;
     /** True while the running sub-skill is a pillar rather than a mine. */
     private boolean climbing;
@@ -131,6 +135,7 @@ public final class FellTreeSkill implements CitizenSkill {
         teardownWalks = 0;
         replantAttempted = false;
         cleanupAbandoned = false;
+        treeStartedAt = context.level.getGameTime();
         // Keep the ledger of earlier temporary bridges/pillars.  It is not
         // route-scoped yet, and forgetting it here would make cleanup silently
         // lose ownership of blocks that are still standing.
@@ -145,6 +150,17 @@ public final class FellTreeSkill implements CitizenSkill {
         if (trunk == null) {
             SkillResult settled = survey(context);
             if (settled != null) return settled;
+        }
+
+        // One tree, one budget. A savanna acacia cluster is ninety-odd blocks of
+        // diagonal branch, and pillaring up to every one of them kept a
+        // lumberjack on a single tree for many minutes. A player cuts what it
+        // can reach and moves on: take what is down, let the rest decay, plant.
+        if (sub == null && context.level.getGameTime() - treeStartedAt > TREE_BUDGET_TICKS
+                && index < trunk.size()) {
+            index = trunk.size();
+            deferred.clear();
+            sweeps = MAX_SWEEPS;
         }
 
         // Skip anything already gone — another citizen may be felling with us.
@@ -735,6 +751,8 @@ public final class FellTreeSkill implements CitizenSkill {
         if (!replantAttempted) {
             replantAttempted = true;
             dropCanopy(context);
+            decayOrphanedLeaves(context);
+            collectDrops(context);
             replant(context);
             rememberSpecies(context);
         }
@@ -773,6 +791,85 @@ public final class FellTreeSkill implements CitizenSkill {
             // Stagger them so a big canopy does not vanish in a single frame.
             level.scheduleTick(pos, state.getBlock(), 1 + (scheduled % 20));
             scheduled++;
+        }
+    }
+
+    /**
+     * Bring the orphaned canopy down now, the way vanilla decay eventually
+     * would: every leaf with no log within six blocks through the foliage
+     * falls, dropping its saplings, sticks and apples.
+     *
+     * <p>Asking vanilla to re-check the leaves only updates their distance;
+     * the actual decay then waits for random ticks, which are rare — felled
+     * forests kept floating canopies for a long time. Leaves still held by a
+     * log (a branch the lumberjack could not reach, a neighbouring tree) are
+     * left exactly as vanilla would leave them.</p>
+     */
+    private void decayOrphanedLeaves(SkillContext context) {
+        if (trunk == null || trunk.isEmpty()) return;
+        var level = context.level;
+        java.util.Set<BlockPos> leaves = new java.util.HashSet<>();
+        int minX = Integer.MAX_VALUE, minY = Integer.MAX_VALUE, minZ = Integer.MAX_VALUE;
+        int maxX = Integer.MIN_VALUE, maxY = Integer.MIN_VALUE, maxZ = Integer.MIN_VALUE;
+        for (BlockPos pos : trunk) {
+            minX = Math.min(minX, pos.getX()); maxX = Math.max(maxX, pos.getX());
+            minY = Math.min(minY, pos.getY()); maxY = Math.max(maxY, pos.getY());
+            minZ = Math.min(minZ, pos.getZ()); maxZ = Math.max(maxZ, pos.getZ());
+        }
+        // Every natural leaf in and around the tree's extent, and every log
+        // that could still be holding some of them up.
+        java.util.ArrayDeque<BlockPos> frontier = new java.util.ArrayDeque<>();
+        java.util.Map<BlockPos, Integer> held = new java.util.HashMap<>();
+        for (BlockPos pos : BlockPos.betweenClosed(minX - 6, minY - 2, minZ - 6,
+                maxX + 6, maxY + 2, maxZ + 6)) {
+            if (!level.isLoaded(pos)) continue;
+            BlockState state = level.getBlockState(pos);
+            if (state.is(BlockTags.LOGS)) {
+                BlockPos log = pos.immutable();
+                held.put(log, 0);
+                frontier.add(log);
+            } else if (state.is(BlockTags.LEAVES)
+                    && !(state.hasProperty(net.minecraft.world.level.block.LeavesBlock.PERSISTENT)
+                         && state.getValue(net.minecraft.world.level.block.LeavesBlock.PERSISTENT))) {
+                leaves.add(pos.immutable());
+            }
+        }
+        // Distance through foliage from the nearest remaining log, as vanilla counts it.
+        while (!frontier.isEmpty()) {
+            BlockPos at = frontier.poll();
+            int d = held.get(at);
+            if (d >= 6) continue;
+            for (Direction dir : Direction.values()) {
+                BlockPos next = at.relative(dir);
+                if (!leaves.contains(next) || held.containsKey(next)) continue;
+                held.put(next, d + 1);
+                frontier.add(next);
+            }
+        }
+        int fallen = 0;
+        for (BlockPos leaf : leaves) {
+            if (held.containsKey(leaf)) continue;
+            if (fallen >= MAX_DECAY_SCHEDULED) break;
+            level.destroyBlock(leaf, true);
+            fallen++;
+        }
+    }
+
+    /** Pick up what the tree dropped: saplings, sticks, apples, stray logs. */
+    private void collectDrops(SkillContext context) {
+        var box = context.citizen.getBoundingBox().inflate(10.0, 12.0, 10.0);
+        var inventory = context.citizen.getInventory();
+        for (var item : context.level.getEntitiesOfClass(
+                net.minecraft.world.entity.item.ItemEntity.class, box)) {
+            if (!item.isAlive() || item.getItem().isEmpty()) continue;
+            int leftover = inventory.insert(item.getItem().copy());
+            if (leftover <= 0) {
+                item.discard();
+            } else {
+                var stack = item.getItem();
+                stack.setCount(leftover);
+                item.setItem(stack);
+            }
         }
     }
 

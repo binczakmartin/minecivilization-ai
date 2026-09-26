@@ -52,6 +52,14 @@ public final class CitizenNavigator {
     /** Idempotent owner flag for the short MOVE_TO/work-site edge guard. */
     private boolean safeStepRequested;
 
+    /** Ticks spent walking the final step by hand, bounded so it cannot hang. */
+    private int finalApproachTicks;
+    private static final int FINAL_APPROACH_TICKS = 40;
+
+    /** A stand target that was refused, and how many times in a row. */
+    private BlockPos refusedTarget;
+    private int refusals;
+
     public CitizenNavigator(CitizenEntity citizen, PathNavigation navigation) {
         this.citizen = citizen;
         this.navigation = navigation;
@@ -87,13 +95,23 @@ public final class CitizenNavigator {
         if (failed) return false;
         this.requireGround = standTarget;
         if (standTarget && (!bodyFree(pos) || !sturdyFloor(pos.below()))) {
+            // Not a place to stand. Count it like any other failed path: a
+            // refusal that is never counted is a caller retrying it forever
+            // while the citizen stands still and nothing reports a problem.
+            if (!pos.equals(refusedTarget)) {
+                refusedTarget = pos.immutable();
+                refusals = 0;
+            }
+            if (++refusals >= ModConfig.MAX_REPATHS.get()) failed = true;
             return false;
         }
+        refusedTarget = null;
         if (pos.equals(requestedTarget) && navigation.isInProgress()) return true;
         boolean changed = requestedTarget == null || !requestedTarget.equals(pos);
         requestedTarget = pos.immutable();
         target = pos.immutable();
         if (changed) {
+            finalApproachTicks = 0;
             targetDist = 0.9;
             repaths = 0;
             stalledTicks = 0;
@@ -241,6 +259,24 @@ public final class CitizenNavigator {
             navigation.stop();
             collisionTicks = 0;
             return;
+        }
+
+        // The last step. Vanilla declares a path finished once the body is
+        // within about half a block of its final node — measured from an
+        // offset point — so a target one block away is "done" before the
+        // citizen has entered it. Repathing then returns the same one-node
+        // path, and six of those made up nine tenths of every "could not reach
+        // target" in the colony. Close enough to see: just walk there.
+        if (navigation.isDone() && finalApproachTicks < FINAL_APPROACH_TICKS) {
+            Vec3 goal = new Vec3(target.getX() + 0.5, target.getY(), target.getZ() + 0.5);
+            double dy = Math.abs(goal.y - pos.y);
+            if (goal.distanceToSqr(pos.x, goal.y, pos.z) <= 4.0 && dy <= 1.5) {
+                finalApproachTicks++;
+                citizen.getMoveControl().setWantedPosition(goal.x, goal.y, goal.z,
+                        citizen.navigationSpeed());
+                if (goal.y > pos.y + 0.5 && citizen.onGround()) citizen.getJumpControl().jump();
+                return;
+            }
         }
 
         boolean madeProgress = lastProgressPos == null

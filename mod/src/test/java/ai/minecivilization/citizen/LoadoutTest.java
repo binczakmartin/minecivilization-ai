@@ -164,4 +164,23 @@ class LoadoutTest {
         assertFalse(Loadout.satisfied(torches, carrying("minecraft:torch", 3)));
         assertTrue(Loadout.satisfied(torches, carrying("minecraft:torch", 8)));
     }
+
+    @Test
+    void everyTradeStartsWithAWorkbenchThenAWeapon() {
+        for (String trade : new String[]{"SHEPHERD", "FARMER", "MINER", "CRAFTER", "BUILDER"}) {
+            var first = Loadout.nextMissing(trade, java.util.Map.of());
+            assertEquals("minecraft:crafting_table", first.itemId(), trade);
+            var second = Loadout.nextMissing(trade,
+                    java.util.Map.of("minecraft:crafting_table", 1));
+            assertEquals("minecraft:wooden_sword", second.itemId(), trade);
+        }
+    }
+
+    @Test
+    void aShepherdIsNotSentForIronOnItsFirstDay() {
+        var need = Loadout.nextMissing("SHEPHERD", java.util.Map.of(
+                "minecraft:crafting_table", 1, "minecraft:wooden_sword", 1,
+                "minecraft:wooden_axe", 1, "minecraft:wooden_pickaxe", 1));
+        assertNull(need, "shears and wheat are spares until the colony can supply them");
+    }
 }

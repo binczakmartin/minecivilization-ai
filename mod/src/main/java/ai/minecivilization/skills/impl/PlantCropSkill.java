@@ -96,6 +96,8 @@ public final class PlantCropSkill implements CitizenSkill {
             return SkillResult.FAILED;
         }
         context.citizen.getInventory().extract(seedId, 1);
+        // Remember the field, or nobody will know to come back for the harvest.
+        ai.minecivilization.farming.FieldRegistry.add(context.level, above);
         context.citizen.animateAction(WorkAnimation.PLANT, above);
         context.citizen.getSkills().addXp("farming", 0.03f);
         return SkillResult.COMPLETED;

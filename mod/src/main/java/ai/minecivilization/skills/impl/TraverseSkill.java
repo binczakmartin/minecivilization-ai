@@ -74,6 +74,10 @@ public final class TraverseSkill implements CitizenSkill {
     private CitizenSkill sub;
     private SkillContext subContext;
     private BlockPos walkTarget;
+    /** When the current walk step was begun, for the stall watchdog. */
+    private long stepStartedAt;
+    /** Longest a single planned step may take before the route is replanned. */
+    private static final int STEP_STALL_TICKS = 200;
 
     @Override
     public SkillType type() {
@@ -346,6 +350,9 @@ public final class TraverseSkill implements CitizenSkill {
             // A* search boxes would be farther apart than their vertical range.
             // Climb/descend in short, fully physical vertical legs instead.
             y = here.getY() + Integer.signum(verticalGap) * VERTICAL_LEG;
+        } else if (!context.level.isLoaded(new BlockPos(x, here.getY(), z))) {
+            // An unloaded column's heightmap reads as the bottom of the world.
+            y = here.getY();
         } else {
             y = context.level.getHeight(
                     net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z);
@@ -557,17 +564,31 @@ public final class TraverseSkill implements CitizenSkill {
             return arrive(context, stepIndex, steps);
         }
 
+        long now = context.level.getGameTime();
         if (walkTarget == null || !walkTarget.equals(destination)) {
             walkTarget = destination;
+            stepStartedAt = now;
             context.navigator.stop();
             context.navigator.requestSafeStep();
             // A swim step has no ground to stand on by definition, so asking
             // navigation for a standable cell there can only fail.
-            if (step.move == TerrainPlan.MoveKind.SWIM) {
-                context.navigator.moveTo(destination, 1.0);
-            } else {
-                context.navigator.moveToStand(destination, 1.0);
+            boolean accepted = step.move == TerrainPlan.MoveKind.SWIM
+                    ? context.navigator.moveTo(destination, 1.0)
+                    : context.navigator.moveToStand(destination, 1.0);
+            if (!accepted && !context.navigator.hasFailed() && context.navigator.currentTarget() == null) {
+                // Navigation refused the cell outright (a leaf where the head
+                // goes, say) without counting it as a failure. Nothing would
+                // ever move or fail after that: citizens stood on "step 1/41"
+                // for whole sessions. The world disagrees with the plan — replan.
+                return replan(context, SkillFailure.unreachable(
+                        "planned step " + destination + " is not a place to stand"));
             }
+        }
+        // Watchdog: one step of a route is a few blocks of walking. Far longer
+        // than that on the same step means something the plan did not foresee.
+        if (now - stepStartedAt > STEP_STALL_TICKS) {
+            return replan(context, SkillFailure.unreachable(
+                    "stalled on the way to " + destination));
         }
         context.citizen.setBracedPlacement(true);
         context.navigator.tick();

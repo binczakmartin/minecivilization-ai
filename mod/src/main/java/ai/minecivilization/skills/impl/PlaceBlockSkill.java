@@ -88,7 +88,11 @@ public final class PlaceBlockSkill implements CitizenSkill {
                     "target position is occupied", true));
             return SkillResult.FAILED;
         }
-        if (!PlacementSafety.canOccupy(context.level, context.citizen, pos, false)) {
+        // Only a solid block needs the cell empty. A sapling, torch or flower
+        // goes down at someone's feet as happily as anywhere — refusing that
+        // failed every sapling a planter was standing over.
+        boolean solid = !state.getCollisionShape(context.level, pos).isEmpty();
+        if (solid && !PlacementSafety.canOccupy(context.level, context.citizen, pos, false)) {
             context.fail(new SkillFailure("POSITION_OCCUPIED",
                     "placement cell intersects a living entity", true));
             return SkillResult.FAILED;
@@ -127,8 +131,27 @@ public final class PlaceBlockSkill implements CitizenSkill {
             context.fail(SkillFailure.missing("no " + itemId + " in inventory to place"));
             return SkillResult.FAILED;
         }
+        // A bed is two blocks: its head goes in the cell it faces, which must
+        // be free before the foot goes down.
+        BlockPos bedHead = null;
+        if (state.getBlock() instanceof net.minecraft.world.level.block.BedBlock
+                && state.getValue(net.minecraft.world.level.block.BedBlock.PART)
+                        == net.minecraft.world.level.block.state.properties.BedPart.FOOT) {
+            bedHead = pos.relative(state.getValue(net.minecraft.world.level.block.BedBlock.FACING));
+            if (!context.level.getBlockState(bedHead).canBeReplaced()) {
+                context.citizen.getInventory().insert(new net.minecraft.world.item.ItemStack(
+                        ai.minecivilization.inventory.CitizenInventory.itemById(itemId)));
+                releaseClaim(context);
+                context.fail(new SkillFailure("POSITION_OCCUPIED", "no room for the head of the bed", true));
+                return SkillResult.FAILED;
+            }
+        }
         BlockState oldState = context.level.getBlockState(pos);
         boolean wrote = context.level.setBlock(pos, state, 3);
+        if (wrote && bedHead != null) {
+            context.level.setBlock(bedHead, state.setValue(net.minecraft.world.level.block.BedBlock.PART,
+                    net.minecraft.world.level.block.state.properties.BedPart.HEAD), 3);
+        }
         if (!wrote || !context.level.getBlockState(pos).equals(state)) {
             if (wrote) context.level.setBlock(pos, oldState, 3);
             // The transaction is all-or-nothing: a failed setBlock must not

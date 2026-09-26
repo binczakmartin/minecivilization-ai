@@ -35,6 +35,9 @@ public enum SkillType {
     WITHDRAW_ITEM,
     EAT,
     SLEEP,
+    SHELTER,
+    HAND_OVER,
+    MAKE_PATH,
     BUILD_BLUEPRINT,
     DELIVER_ITEMS;
 

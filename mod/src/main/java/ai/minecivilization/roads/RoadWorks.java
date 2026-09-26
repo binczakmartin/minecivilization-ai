@@ -65,6 +65,18 @@ public final class RoadWorks {
     @Nullable
     public static Job next(ServerLevel level, CitizenEntity citizen) {
         long now = level.getGameTime();
+        // A shovel makes a road of any route, whatever its grade: grass turned
+        // into a trodden path costs nothing but wear and makes every later
+        // walk faster. Waiting for a route to "earn" paving first meant no
+        // path was ever made in a whole session.
+        if (hasShovel(citizen)) {
+            PathMemory memory = PathMemory.get(level);
+            for (Route route : memory.all()) {
+                if (route.waypoints.isEmpty()) continue;
+                List<CitizenPlan.Task> paths = shovelPathTasks(level, citizen, centreLine(level, route));
+                if (!paths.isEmpty()) return new Job(route, RoadGrade.PAVED, paths);
+            }
+        }
         if (now < nextSurveyAt) return null;
         nextSurveyAt = now + SURVEY_INTERVAL;
 
@@ -167,6 +179,12 @@ public final class RoadWorks {
     /** PAVED: a proper surface underfoot, and a filled hole where there was none. */
     private static List<CitizenPlan.Task> pavingTasks(ServerLevel level, CitizenEntity citizen,
                                                       List<BlockPos> line) {
+        // With a shovel, the road is a trodden path: grass turned over, no
+        // material spent — the way a player marks a road on day one.
+        if (hasShovel(citizen)) {
+            List<CitizenPlan.Task> paths = shovelPathTasks(level, citizen, line);
+            if (!paths.isEmpty()) return paths;
+        }
         String material = pavingMaterial(citizen);
         if (material == null) return List.of();
 
@@ -186,6 +204,27 @@ public final class RoadWorks {
             }
         }
         return tasks;
+    }
+
+    /** Grass along the line that a shovel can turn into a path, up to one job's worth. */
+    private static List<CitizenPlan.Task> shovelPathTasks(ServerLevel level, CitizenEntity citizen,
+                                                          List<BlockPos> line) {
+        List<CitizenPlan.Task> paths = new ArrayList<>();
+        for (BlockPos ground : line) {
+            if (paths.size() >= JOB_SIZE) break;
+            if (!inWorkingRange(citizen, ground)) continue;
+            for (BlockPos cell : surfaceCells(level, ground)) {
+                if (paths.size() >= JOB_SIZE) break;
+                BlockPos surface = cell.below();
+                if (!ai.minecivilization.skills.impl.MakePathSkill.turnable(level.getBlockState(surface))
+                        || !level.getBlockState(cell).isAir()
+                        || ConstructionManager.get(level).protectsCell(surface)
+                        || ConstructionManager.get(level).inBuildingPlot(surface)) continue;
+                paths.add(new CitizenPlan.Task(CitizenPlan.TaskType.ROADWORK, "minecraft:dirt_path", 1,
+                        null, null, null, new int[]{surface.getX(), surface.getY(), surface.getZ()}));
+            }
+        }
+        return paths;
     }
 
     /** LIT: torches at intervals, so nothing spawns on the colony's own roads. */
@@ -250,6 +289,14 @@ public final class RoadWorks {
                 || state.is(Blocks.STONE) || state.is(Blocks.COARSE_DIRT)
                 || state.is(Blocks.STONE_BRICKS) || state.is(Blocks.OAK_PLANKS)
                 || state.is(Blocks.DIRT_PATH);
+    }
+
+    private static boolean hasShovel(CitizenEntity citizen) {
+        var inventory = citizen.getInventory();
+        for (int slot = 0; slot < inventory.getContainerSize(); slot++) {
+            if (inventory.getItem(slot).getItem() instanceof net.minecraft.world.item.ShovelItem) return true;
+        }
+        return false;
     }
 
     private static boolean inWorkingRange(CitizenEntity citizen, BlockPos pos) {

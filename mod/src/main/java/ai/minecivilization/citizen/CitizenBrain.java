@@ -2,6 +2,7 @@ package ai.minecivilization.citizen;
 
 import java.util.ArrayDeque;
 import java.util.Iterator;
+import java.util.List;
 
 import com.mojang.logging.LogUtils;
 import ai.minecivilization.colony.HomeDestination;
@@ -228,6 +229,42 @@ public final class CitizenBrain {
         // same as doing something about it. This is the guarantee: a citizen
         // that has stopped making progress drops what it is doing and takes
         // different work, every time, without exception.
+        // Caught in water the navigator cannot get out of (a cave waterfall
+        // held half a colony): swim for dry ground, or cut a step and climb.
+        boolean wasEscaping = waterEscape.active();
+        boolean diggingOut = currentTask != null && currentTask.type == CitizenPlan.TaskType.ESCAPE;
+        if (!diggingOut && waterEscape.tick(level, self, now)) {
+            if (!wasEscaping) {
+                if (destination != null) {
+                    ai.minecivilization.navigation.UnreachableMemory.note(destination, now);
+                }
+                addEvent("swimming out of the water");
+                LOGGER.info("[Citizen {}] stuck in water — making for dry ground",
+                        self.getName().getString());
+                // Out of the water and straight back in, again and again: the
+                // only walkable way out of this cave is through the current.
+                // Stop walking and cut a staircase to daylight instead.
+                if (now - waterEscapeWindowStart > 2400) {
+                    waterEscapeWindowStart = now;
+                    waterEscapes = 0;
+                }
+                if (++waterEscapes >= 2 && depthBelowSurface(level, self.blockPosition()) >= 4) {
+                    waterEscapes = 0;
+                    waterEscape.reset();
+                    digOut(level, self, now, "keeps ending up in the water underground");
+                    return;
+                }
+            }
+            return;
+        }
+
+        // Stranded on top of a pillar: come down before anything else.
+        if (climbDownPillar(level, self, now)) return;
+
+        // Nightfall outranks everything the brain might otherwise do: a job
+        // finished in the dark is usually a citizen lost in the dark.
+        if (nightWatch(level, self, now)) return;
+
         if (breakDeadlock(level, self, now)) return;
 
         // expire a cognition request only after the HTTP timeout has had time
@@ -242,15 +279,13 @@ public final class CitizenBrain {
 
         // emergency eating between tasks
         if (currentTask == null && self.getHunger() < 6f
-                && self.getInventory().firstFoodSlot() >= 0) {
-            self.eatNow();
+                && self.getInventory().firstFoodSlot() >= 0 && self.eatNow()) {
             return;
         }
         // A local maintenance lease is deliberately interruptible: food is a
         // survival checkpoint, not another long task hidden behind a queue.
         if (currentTask != null && localPlanActive && self.getHunger() < 6f
-                && self.getInventory().firstFoodSlot() >= 0) {
-            self.eatNow();
+                && self.getInventory().firstFoodSlot() >= 0 && self.eatNow()) {
             return;
         }
 
@@ -282,9 +317,17 @@ public final class CitizenBrain {
             case COMPLETED -> {
                 // Logged at INFO, not DEBUG: with only failures visible, a
                 // colony that is working looks identical to one that is stuck.
-                LOGGER.info("[Citizen {}] completed {}{}", self.getName().getString(),
-                        currentTask.type,
-                        currentTask.resource == null ? "" : " " + currentTask.resource);
+                // Resting is logged quietly: a hurt citizen resting through the
+                // night finishes a short rest every second or two.
+                boolean restful = currentTask.type == CitizenPlan.TaskType.REST
+                        || currentTask.type == CitizenPlan.TaskType.IDLE;
+                if (restful) {
+                    LOGGER.debug("[Citizen {}] completed {}", self.getName().getString(), currentTask.type);
+                } else {
+                    LOGGER.info("[Citizen {}] completed {}{}", self.getName().getString(),
+                            currentTask.type,
+                            currentTask.resource == null ? "" : " " + currentTask.resource);
+                }
                 self.onTaskSucceeded(currentTask.type.name());
                 AiBridge.postTaskResult(self, currentTask, "COMPLETED", null, null);
                 addEvent("completed " + currentTask.type);
@@ -292,6 +335,19 @@ public final class CitizenBrain {
                 stuck.noteProgress(now);
                 if (localPlanActive) {
                     ai.minecivilization.work.GlobalTaskPool.noteSuccess(self);
+                }
+                // Finishing the instant it started, again and again, is a loop
+                // wearing the costume of progress: a job whose target is already
+                // met, re-offered forever. Five in a row and it is set aside.
+                if (now - lastTaskStartedAt <= 2) {
+                    if (++instantCompletions >= 5) {
+                        impossible.put(taskKey(currentTask), now + IMPOSSIBLE_TICKS);
+                        instantCompletions = 0;
+                        LOGGER.info("[Citizen {}] {} keeps finishing before it starts — setting it aside",
+                                self.getName().getString(), taskKey(currentTask));
+                    }
+                } else {
+                    instantCompletions = 0;
                 }
                 lastCompleted = currentTask.type
                         + (currentTask.resource == null ? "" : " " + currentTask.resource);
@@ -302,6 +358,13 @@ public final class CitizenBrain {
                 if (currentTask.type == CitizenPlan.TaskType.ESCAPE) {
                     rescue.succeeded();
                     lost = false;
+                }
+                // A walk home that "arrives" the moment it starts went nowhere:
+                // treat it as a failed rung so the ladder climbs instead of
+                // reissuing the same non-move every tick.
+                if (walkingHome && currentTask.type == CitizenPlan.TaskType.MOVE
+                        && now - lastTaskStartedAt <= 2) {
+                    rescue.failed(now);
                 }
                 currentTask = null;
                 destination = null;
@@ -378,6 +441,57 @@ public final class CitizenBrain {
                 }
 
                 localWork.failed(currentTask, now);
+                // A courier that could not deliver lets someone else try.
+                ai.minecivilization.work.MaterialRequests.release(self.getUUID());
+                // Underground and unable to get anywhere: the cave is the
+                // problem. Two such failures in two minutes and the citizen
+                // digs out instead of walking the same dead ends for ten.
+                if (failure != null && "TARGET_UNREACHABLE".equals(failure.code)
+                        && currentTask.type != CitizenPlan.TaskType.ESCAPE
+                        && currentTask.type != CitizenPlan.TaskType.MINE_SHAFT
+                        && depthBelowSurface(level, self.blockPosition()) >= 4) {
+                    if (now - caveFailuresSince > 2400) {
+                        caveFailuresSince = now;
+                        caveFailures = 0;
+                    }
+                    if (++caveFailures >= 2) {
+                        caveFailures = 0;
+                        digOut(level, self, now, "cannot find a way out of the cave");
+                        return;
+                    }
+                }
+                // An empty hunting ground stays empty for a while. Cognition
+                // re-issued the same hunt 1149 times in one afternoon to
+                // citizens standing in a valley with no animals; each attempt
+                // spent a minute foraging bare grass before timing out.
+                if ((currentTask.type == CitizenPlan.TaskType.HUNT
+                        || currentTask.type == CitizenPlan.TaskType.HARVEST) && failure != null
+                        && ("TARGET_NOT_FOUND".equals(failure.code) || "TIMEOUT".equals(failure.code))) {
+                    impossible.put(taskKey(currentTask), now + 6000);
+                    clearPlan("nothing to hunt, harvest or forage here", true);
+                    status = Status.IDLE;
+                    return;
+                }
+                // A remembered resource that turned out to be unreachable is
+                // not a resource: forget it, or the planner hands it straight
+                // back (48 identical failures on one spot in a session).
+                if (currentTask.position != null && failure != null
+                        && "TARGET_UNREACHABLE".equals(failure.code)
+                        && currentTask.type != CitizenPlan.TaskType.MOVE) {
+                    var spot = new net.minecraft.core.BlockPos(currentTask.position[0],
+                            currentTask.position[1], currentTask.position[2]);
+                    self.knownResources().values().removeIf(pos -> pos.distSqr(spot) <= 4);
+                }
+                if (currentTask.type == CitizenPlan.TaskType.COLLECT && currentTask.position != null
+                        && failure != null && "TARGET_UNREACHABLE".equals(failure.code)) {
+                    ai.minecivilization.work.ColonyWork.noteUnreachableDrop(
+                            new net.minecraft.core.BlockPos(currentTask.position[0],
+                                    currentTask.position[1], currentTask.position[2]), now);
+                    // Nothing to retry: the next offer will be a different item.
+                    clearPlan("drop out of reach", true);
+                    status = Status.IDLE;
+                    return;
+                }
                 // Tell the board its job did not work out, so it offers this
                 // citizen something else rather than the same impossible thing
                 // on the very next tick.
@@ -391,6 +505,9 @@ public final class CitizenBrain {
                 // Repeating them immediately cannot grow a crop or invent a missing tool.
                 if (failure != null && ("MISSING_RESOURCE".equals(failure.code)
                         || "TARGET_NOT_FOUND".equals(failure.code))) {
+                    // Remember it, so the same plan is not adopted again the
+                    // moment it comes back from cognition.
+                    impossible.put(taskKey(currentTask), now + IMPOSSIBLE_TICKS);
                     clearPlan("prerequisite unavailable; choose different work", true);
                     status = Status.IDLE;
                     return;
@@ -405,6 +522,9 @@ public final class CitizenBrain {
                     // deterministic layer already tried simple recovery; ask for a new decision
                     LOGGER.info("[Citizen {}] goal disengaged after {} failures",
                             self.getName().getString(), consecutiveTaskFailures);
+                    // Three strikes: keep the same job off this citizen for a
+                    // while, or the queued copy of it is adopted on the next tick.
+                    impossible.put(taskKey(currentTask), now + IMPOSSIBLE_TICKS);
                     clearPlan("repeated task failures", true);
                     status = Status.IDLE;
                     requestDecision(level, self, "task_failed", "HIGH", now);
@@ -421,6 +541,246 @@ public final class CitizenBrain {
 
     private boolean walkingHome;
     private final HomewardPolicy homeward = new HomewardPolicy();
+
+    /** True while the current plan is the evening routine (walk home, wall in). */
+    private boolean nightPlan;
+    /** The night whose dusk walk home has already been tried — it is tried once. */
+    private long homewardNight = Long.MIN_VALUE;
+    /** The night last announced in the log: one line per citizen per night. */
+    private long announcedNight = Long.MIN_VALUE;
+
+    /** True while the citizen is following its evening routine. */
+    public boolean isNightRoutine() {
+        return nightPlan;
+    }
+
+    /**
+     * Stop work at dusk, get home if it is close, and wall in for the night.
+     *
+     * <p>A citizen used to work straight through sunset and be a hundred blocks
+     * out felling trees when the zombies rose; seven of twelve died in one
+     * colony's first three minutes of darkness. This is the player's first-night
+     * routine, and it outranks every job: at dusk the citizen drops what it is
+     * doing, walks home if home is near enough to reach before dark, and then
+     * puts four walls and a roof around itself until morning. At dawn it takes
+     * the walls back down and goes back to work.</p>
+     *
+     * @return true when the routine took over this tick
+     */
+    private boolean nightWatch(ServerLevel level, CitizenEntity self, long now) {
+        long dayTime = level.getDayTime();
+        NightPolicy.Phase phase = NightPolicy.phase(dayTime, level.isThundering());
+        boolean sheltering = currentTask != null
+                && currentTask.type == CitizenPlan.TaskType.SHELTER;
+
+        // Walls left from the nights citizens used to spend shut in: take them
+        // back first. They are building material, and a field of abandoned
+        // cells is litter.
+        if (currentTask == null && !sheltering && !self.shelterBlocks().isEmpty()) {
+            beginNightRoutine(level, self, List.of(new CitizenPlan.Task(
+                    CitizenPlan.TaskType.SHELTER, null, 1, "dismantle", null, null, null)),
+                    "taking an old night shelter down");
+            return true;
+        }
+        if (phase == NightPolicy.Phase.DAY) {
+            nightPlan = false;
+            return false;
+        }
+        // The night is for working carefully, not for hiding: citizens keep at
+        // their jobs after dark. What changes is where and who. The walk home
+        // (below) keeps them near the colony, the work board stops sending
+        // anyone over the horizon, and combat handles what comes.
+        if (nightPlan && currentTask != null) return false;
+
+        long night = NightPolicy.nightIndex(dayTime);
+        net.minecraft.core.BlockPos home = HomeDestination.forCitizen(level, self);
+        if (home == null) home = ZoneManager.get(level).townCenter(level);
+        double distance = Math.sqrt(home.distSqr(self.blockPosition()));
+        boolean vulnerable = !self.isArmed()
+                || self.getHealth() < self.getMaxHealth() * NightPolicy.RETREAT_HEALTH;
+
+        // Far out at dusk: come back towards the colony, once, and carry on
+        // working there.
+        if (NightPolicy.walkHome(phase, distance) && homewardNight != night) {
+            homewardNight = night;
+            String why = "dusk: heading back to the colony (" + (int) distance + " blocks)";
+            announce(self, night, why);
+            beginNightRoutine(level, self, List.of(move(home, false)), why);
+            return true;
+        }
+        // Unarmed or hurt in the dark: no work is worth it. Go home and rest
+        // near the others until healed or morning.
+        if (phase == NightPolicy.Phase.NIGHT && vulnerable && currentTask == null) {
+            String why;
+            CitizenPlan.Task task;
+            if (distance > NightPolicy.HOME_RADIUS) {
+                why = "night: too hurt or unarmed to work in the dark — going home";
+                task = move(home, false);
+            } else {
+                why = "night: resting at home until healed or morning";
+                task = new CitizenPlan.Task(CitizenPlan.TaskType.REST, null, 1, null, null, null, null);
+            }
+            announce(self, night, why);
+            beginNightRoutine(level, self, List.of(task), why);
+            return true;
+        }
+        return false;
+    }
+
+    private void announce(CitizenEntity self, long night, String why) {
+        if (announcedNight == night) return;
+        announcedNight = night;
+        LOGGER.info("[Citizen {}] {}", self.getName().getString(), why);
+    }
+
+    private void beginNightRoutine(ServerLevel level, CitizenEntity self,
+                                   List<CitizenPlan.Task> routine, String why) {
+        // Keep whatever cognition had lined up: it is still the plan for tomorrow.
+        clearPlan(why, true);
+        walkingHome = false;
+        lost = false;
+        announcedStep = null;
+        rescue.succeeded();
+        consecutiveTaskFailures = 0;
+        taskAttempts = 0;
+        nightPlan = true;
+        goal = new CitizenPlan.Goal(CitizenPlan.GoalType.REST, null, -1, null, why);
+        tasks.addAll(routine);
+        currentTask = tasks.pollFirst();
+        destination = currentTask.position == null ? null
+                : new net.minecraft.core.BlockPos(currentTask.position[0],
+                        currentTask.position[1], currentTask.position[2]);
+        self.getExecutor().reset(currentTask);
+        lastSkillProgressAt = Long.MIN_VALUE;
+        lastTaskStartedAt = level.getGameTime();
+        stuck.reset(level.getGameTime());
+        decisionReason = why;
+        workPriority = ai.minecivilization.work.WorkPriority.SURVIVAL;
+        status = Status.WORKING;
+        self.setDisplayState("WORKING", "SURVIVE_NIGHT", currentTask.type.toString());
+        addEvent(why);
+    }
+
+    private long nextPillarStepAt;
+    private final WaterEscape waterEscape = new WaterEscape();
+    /** Unreachable failures while underground, and when the count started. */
+    private int caveFailures;
+    private long caveFailuresSince;
+
+    /** Stop trying to walk out of a cave and cut a staircase to daylight instead. */
+    private void digOut(ServerLevel level, CitizenEntity self, long now, String why) {
+        net.minecraft.core.BlockPos home = HomeDestination.forCitizen(level, self);
+        if (home == null) home = ZoneManager.get(level).townCenter(level);
+        clearPlan(why + " — digging out", true);
+        currentTask = new CitizenPlan.Task(CitizenPlan.TaskType.ESCAPE, null, 1,
+                null, null, null, new int[]{home.getX(), home.getY(), home.getZ()});
+        self.getExecutor().reset(currentTask);
+        lastTaskStartedAt = now;
+        status = Status.WORKING;
+        decisionReason = why;
+        addEvent("digging a staircase to the surface");
+        LOGGER.info("[Citizen {}] {} — digging a staircase out", self.getName().getString(), why);
+    }
+    private int waterEscapes;
+    private long waterEscapeWindowStart;
+    /** Tasks in a row that completed on the tick they started. */
+    private int instantCompletions;
+
+    /**
+     * Dig down a pillar the citizen is stranded on.
+     *
+     * <p>Climbing towards a log in a treetop leaves a one-block column of dirt
+     * with the citizen on top, and the record of which blocks it placed is not
+     * kept across a reload. From up there every route home starts with a drop
+     * too long to take, so the planner found nothing and the rescue ladder
+     * failed rung after rung while the citizen stood in the canopy. The answer
+     * a player would give: dig the block you are standing on, drop one, repeat.</p>
+     *
+     * @return true while it is climbing down
+     */
+    private boolean climbDownPillar(ServerLevel level, CitizenEntity self, long now) {
+        if (now < nextPillarStepAt) return currentTask == null && nextPillarStepAt - now < 10;
+        boolean idleOrLost = currentTask == null || lost || walkingHome
+                || stuck.repeatedFailures() >= 2;
+        if (!idleOrLost || !self.onGround()) return false;
+        var feet = self.blockPosition();
+        var under = feet.below();
+        var state = level.getBlockState(under);
+        String id = ai.minecivilization.inventory.CitizenInventory.idOf(new net.minecraft.world.item.ItemStack(state.getBlock().asItem()));
+        boolean cheap = ai.minecivilization.navigation.ScaffoldMaterial.isExpendable(id)
+                || state.is(net.minecraft.world.level.block.Blocks.GRASS_BLOCK);
+        if (!cheap || level.getBlockEntity(under) != null
+                || ai.minecivilization.construction.ConstructionManager.get(level).protectsCell(under)) {
+            return false;
+        }
+        // A column top: nothing beside the block at its own level, so every
+        // step off it is a drop. (Only for a citizen that is idle, lost or
+        // failing — a worker on its own bridge is left alone.)
+        for (var side : net.minecraft.core.Direction.Plane.HORIZONTAL) {
+            var beside = under.relative(side);
+            if (!level.getBlockState(beside).getCollisionShape(level, beside).isEmpty()) return false;
+        }
+        // A floating block (placed to stand on, the column under it since
+        // mined) is still a way down — as long as the drop is a short one, or
+        // ends in water.
+        int drop = 0;
+        var probe = under.below();
+        while (drop < 16 && level.getBlockState(probe).getCollisionShape(level, probe).isEmpty()
+                && level.getFluidState(probe).isEmpty()) {
+            drop++;
+            probe = probe.below();
+        }
+        // Never down into water: a pillar standing in a pool is how citizens got
+        // back into the current they had just been pulled out of.
+        if (!level.getFluidState(probe).isEmpty()) return false;
+        // At most three hearts of fall damage, and only with health to spare.
+        if (drop > 6 || self.getHealth() < 20f) return false;
+        if (currentTask != null) clearPlan("climbing down a pillar", true);
+        var item = new net.minecraft.world.item.ItemStack(state.is(net.minecraft.world.level.block.Blocks.GRASS_BLOCK)
+                ? net.minecraft.world.item.Items.DIRT : state.getBlock().asItem());
+        level.removeBlock(under, false);
+        if (self.getInventory().insert(item) > 0) {
+            net.minecraft.world.level.block.Block.popResource(level, under, item);
+        }
+        self.forgetScaffold(under);
+        self.setBracedPlacement(false);
+        self.setTraversalSneak(false);
+        self.animateAction(ai.minecivilization.entity.WorkAnimation.MINE, under);
+        nextPillarStepAt = now + 8;
+        stuck.reset(now);
+        addEvent("climbing down a pillar");
+        return true;
+    }
+
+    /** Where the current stretch of travel started, and when. */
+    private net.minecraft.core.BlockPos travelAnchor;
+    private long travelAnchorAt;
+    /** Travel that has not left a two-block radius in this long is stuck. */
+    private static final int GOING_NOWHERE_TICKS = 900;
+
+    /**
+     * Movement that never moves.
+     *
+     * <p>The other stuck checks trust the running skill's progress clock, and
+     * a traversal that replans refreshes that clock every time — so a citizen
+     * could "make a way" on the same spot for an hour and look healthy. This
+     * one only looks at where the body is: walking or traversing for
+     * forty-five seconds without getting two blocks from where it started is
+     * stuck, whatever the skill believes.</p>
+     */
+    private boolean goingNowhere(CitizenEntity self, long now) {
+        var skill = self.getExecutor().activeSkillType();
+        boolean travelling = currentTask != null && !walkingHome && !lost
+                && (skill == ai.minecivilization.skills.SkillType.MOVE_TO
+                    || skill == ai.minecivilization.skills.SkillType.TRAVERSE);
+        var here = self.blockPosition();
+        if (!travelling || travelAnchor == null || travelAnchor.distSqr(here) > 4) {
+            travelAnchor = travelling ? here : null;
+            travelAnchorAt = now;
+            return false;
+        }
+        return now - travelAnchorAt >= GOING_NOWHERE_TICKS;
+    }
 
     /** Deadlocks broken in a row, so repeated ones escalate. */
     private int deadlocks;
@@ -453,6 +813,32 @@ public final class CitizenBrain {
      */
     private boolean breakDeadlock(ServerLevel level, CitizenEntity self, long now) {
         if (now < nextDeadlockCheckAt) return false;
+        if (goingNowhere(self, now)) {
+            // The destination is the problem: mark it so the next search picks
+            // a different tree, block or table instead of the same one.
+            if (destination != null) {
+                ai.minecivilization.navigation.UnreachableMemory.note(destination, now);
+            }
+            var target = self.getNavigator().currentTarget();
+            if (target != null) ai.minecivilization.navigation.UnreachableMemory.note(target, now);
+            travelAnchor = null;
+            deadlocks++;
+            nextDeadlockCheckAt = now + DEADLOCK_COOLDOWN;
+            String abandoned = currentTask == null ? "nothing" : currentTask.type.name();
+            ai.minecivilization.work.GlobalTaskPool.noteFailure(self, now);
+            if (currentTask != null) localWork.failed(currentTask, now);
+            clearPlan("travelling without getting anywhere", false);
+            self.setBracedPlacement(false);
+            self.setTraversalSneak(false);
+            self.setControlledDrop(false);
+            stuck.reset(now);
+            status = Status.IDLE;
+            nextLocalWorkAt = 0;
+            addEvent("dropped " + abandoned + " (going nowhere)");
+            LOGGER.info("[Citizen {}] dropped {} — {}s of travel without leaving the spot",
+                    self.getName().getString(), abandoned, GOING_NOWHERE_TICKS / 20);
+            return false;
+        }
         StuckDetector.Reason reason = stuck.reason(now);
         if (reason == StuckDetector.Reason.NONE) {
             deadlocks = 0;
@@ -476,6 +862,8 @@ public final class CitizenBrain {
         // Being rescued is allowed to look stuck: that ladder has its own
         // escalation and interrupting it would restart the rescue.
         if (walkingHome || lost) return false;
+        // Nor is sitting out the night in a shelter a deadlock.
+        if (currentTask != null && currentTask.type == CitizenPlan.TaskType.SHELTER) return false;
 
         deadlocks++;
         nextDeadlockCheckAt = now + DEADLOCK_COOLDOWN;
@@ -483,8 +871,18 @@ public final class CitizenBrain {
         String abandoned = currentTask == null ? "nothing" : currentTask.type.name();
         ai.minecivilization.work.GlobalTaskPool.noteFailure(self, now);
         ai.minecivilization.work.GlobalTaskPool.release(self);
-        if (currentTask != null) localWork.failed(currentTask, now);
+        if (currentTask != null) {
+            localWork.failed(currentTask, now);
+            // Whatever could not be finished here is not offered straight back.
+            impossible.put(taskKey(currentTask), now
+                    + (currentTask.type == CitizenPlan.TaskType.HUNT ? 6000 : IMPOSSIBLE_TICKS));
+        }
         clearPlan("deadlock: " + reason, false);
+        // Whatever pinned it — a braced pose on an old pillar, a sneak left on
+        // by a cancelled traversal — must not outlive the job it was for.
+        self.setBracedPlacement(false);
+        self.setTraversalSneak(false);
+        self.setControlledDrop(false);
         stuck.reset(now);
         consecutiveTaskFailures = 0;
         taskAttempts = 0;
@@ -647,9 +1045,11 @@ public final class CitizenBrain {
             case WAYPOINT -> {
                 int[] aim = ai.minecivilization.navigation.TravelLeg.aim(
                         at.getX(), at.getZ(), home.getX(), home.getZ(), 48);
-                int y = level.getHeight(
-                        net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING_NO_LEAVES,
-                        aim[0], aim[1]);
+                int y = level.isLoaded(new net.minecraft.core.BlockPos(aim[0], at.getY(), aim[1]))
+                        ? level.getHeight(
+                                net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING_NO_LEAVES,
+                                aim[0], aim[1])
+                        : at.getY();   // unloaded heightmaps read as the bottom of the world
                 yield move(new net.minecraft.core.BlockPos(aim[0], y, aim[1]), false);
             }
             case LOCAL_EXPLORE -> {
@@ -766,6 +1166,7 @@ public final class CitizenBrain {
         if (goal == null && queuedPlan != null) {
             CitizenPlan next = queuedPlan;
             queuedPlan = null;
+            if (boardFirst(self)) return;
             adoptPlan(self, next);
             return;
         }
@@ -822,6 +1223,13 @@ public final class CitizenBrain {
         // same wolf, torch spot or half-built wall — the single most visible
         // symptom of a colony with no dispatcher.
         var offer = ai.minecivilization.work.GlobalTaskPool.claim(level, self);
+        if (offer != null && isImpossible(offer.toPlan(), now)) {
+            // The board offered the very job this citizen just set aside. Bench
+            // that source for it and look again next time round.
+            ai.minecivilization.work.GlobalTaskPool.noteFailure(self, now);
+            ai.minecivilization.work.GlobalTaskPool.release(self);
+            offer = null;
+        }
         if (offer != null) {
             workPriority = offer.priority();
             decisionReason = offer.reason();
@@ -833,7 +1241,7 @@ public final class CitizenBrain {
         }
 
         CitizenPlan local = localWork.next(level, self);
-        if (local != null) {
+        if (local != null && !isImpossible(local, now)) {
             workPriority = ai.minecivilization.work.WorkPriority.RESOURCES;
             decisionReason = local.reasoningSummary;
             adoptPlan(self, local, true);
@@ -928,15 +1336,72 @@ public final class CitizenBrain {
             } else {
                 decisionRetryAt = 0;
             }
-            if (plan != null && plan.goal != null) {
+            if (plan != null && plan.goal != null
+                    && !isImpossible(plan, self.level().getGameTime())) {
                 queuedPlan = plan;
             }
         });
     }
 
+    /**
+     * The colony's own urgent work before a suggestion from the AI service.
+     *
+     * <p>The service knows one citizen's pack; the work board knows the colony
+     * — who asked for planks, which crop is ripe, which home needs a bed, where
+     * the herd was seen. Letting every service answer through meant the board's
+     * priorities were skipped most of the time: couriers never ran, herds were
+     * never fetched, homes waited while citizens made torches. Anything the
+     * board ranks at construction or above now goes first; the service keeps
+     * everything below that.</p>
+     *
+     * @return true when a board job was adopted instead
+     */
+    private boolean boardFirst(CitizenEntity self) {
+        if (!(self.level() instanceof ServerLevel level)) return false;
+        var offer = ai.minecivilization.work.GlobalTaskPool.claim(level, self,
+                ai.minecivilization.work.WorkPriority.CONSTRUCTION);
+        if (offer == null) return false;
+        if (isImpossible(offer.toPlan(), level.getGameTime())) {
+            ai.minecivilization.work.GlobalTaskPool.release(self);
+            return false;
+        }
+        workPriority = offer.priority();
+        decisionReason = offer.reason();
+        adoptPlan(self, offer.toPlan(), true);
+        return true;
+    }
+
     /** Take up a plan that is already in hand. */
     private void adoptPlan(CitizenEntity self, CitizenPlan plan) {
+        if (isImpossible(plan, self.level().getGameTime())) {
+            // Leave the citizen planless: advancePlan goes to the work board.
+            decisionRetryAt = self.level().getGameTime() + 100;
+            return;
+        }
         adoptPlan(self, plan, false);
+    }
+
+    /**
+     * Jobs that just failed because what they needed does not exist here —
+     * "task type|resource" to the game time they may be tried again.
+     *
+     * <p>Cognition does not see the failure in time: a hungry citizen was
+     * handed "go hunting" eighty times in two minutes in a valley with no
+     * animals, each answer already queued before the last hunt had failed.
+     * Nothing else got done. A failed search now keeps that job off the
+     * citizen for a minute, and the work board fills the gap.</p>
+     */
+    private final java.util.Map<String, Long> impossible = new java.util.HashMap<>();
+    private static final int IMPOSSIBLE_TICKS = 1200;
+
+    private static String taskKey(CitizenPlan.Task task) {
+        return task.type + "|" + (task.resource == null ? "" : task.resource);
+    }
+
+    private boolean isImpossible(CitizenPlan plan, long now) {
+        if (plan == null || plan.tasks == null || plan.tasks.isEmpty()) return false;
+        impossible.values().removeIf(until -> until <= now);
+        return impossible.containsKey(taskKey(plan.tasks.get(0)));
     }
 
     private void adoptPlan(CitizenEntity self, CitizenPlan plan, boolean local) {
@@ -966,6 +1431,11 @@ public final class CitizenBrain {
             return;
         }
         decisionRetryAt = 0;
+        if (currentTask == null && goal == null && tasks.isEmpty() && boardFirst(self)) return;
+        if (isImpossible(plan, self.level().getGameTime())) {
+            decisionRetryAt = self.level().getGameTime() + 100;
+            return;
+        }
         // A local plan may have been adopted but not started yet.  Treat its
         // queued tasks exactly like an active task so an AI response cannot
         // erase work between two server ticks.

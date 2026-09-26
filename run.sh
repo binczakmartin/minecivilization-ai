@@ -187,8 +187,30 @@ service_health() {
 
 start_service() {
   if service_health >/dev/null 2>&1; then
-    info "AI service already running at $AI_BASE_URL"
-    return 0
+    # A service left running from an earlier session keeps serving the code it
+    # was started with. Restart it when the source has changed since, or every
+    # fix to the decision policy silently never takes effect.
+    local pid started newest
+    # Every probe here is best-effort and tolerant: under `set -euo pipefail`
+    # a `find | head` whose find is cut short by SIGPIPE aborts the whole
+    # launcher silently.
+    pid="$(lsof -tiTCP:"$AI_PORT" -sTCP:LISTEN 2>/dev/null | head -n1 || true)"
+    if [[ -n "$pid" ]]; then
+      started="$(date -j -f "%a %b %d %T %Y" "$(ps -o lstart= -p "$pid" | xargs || true)" +%s 2>/dev/null \
+                 || date -d "$(ps -o lstart= -p "$pid" || true)" +%s 2>/dev/null || echo 0)"
+      newest="$(find "$ROOT/ai-service/src" -name '*.py' -newermt "@$started" 2>/dev/null | head -n1 || true)"
+      if [[ -n "$newest" && "$started" != 0 ]]; then
+        info "AI service code changed since it started — restarting it (pid $pid)"
+        kill "$pid" 2>/dev/null || true
+        sleep 1
+      else
+        info "AI service already running at $AI_BASE_URL"
+        return 0
+      fi
+    else
+      info "AI service already running at $AI_BASE_URL"
+      return 0
+    fi
   fi
   bootstrap_venv
   info "starting AI service on $AI_BASE_URL (token: ${AI_TOKEN:0:4}…)"

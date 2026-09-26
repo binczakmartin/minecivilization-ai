@@ -365,6 +365,16 @@ class CraftPlannerTest {
         assertEquals(STICK, plan.steps().get(plan.size() - 1).item);
     }
 
+    @Test
+    void emptyHandedSticksComeFromTreesNotBamboo() {
+        // A citizen in an oak forest was sent to find bamboo for its torch.
+        CraftPlan plan = CraftPlanner.plan(STICK, 4, Map.of(), RIVAL_RECIPES);
+
+        assertNotNull(plan);
+        assertTrue(plan.steps().stream().noneMatch(step -> BAMBOO.equals(step.item)),
+                "planned a bamboo run: " + plan.steps());
+    }
+
     /** Two ways to make a stick, as vanilla actually has. */
     private static final String BAMBOO = "minecraft:bamboo";
     private static final RecipeSource RIVAL_RECIPES = rivalRecipes();

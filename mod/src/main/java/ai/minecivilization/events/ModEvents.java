@@ -5,6 +5,7 @@ import ai.minecivilization.construction.CampLayout;
 import ai.minecivilization.construction.ConstructionManager;
 import ai.minecivilization.construction.ConstructionProject;
 import ai.minecivilization.architecture.HouseCatalog;
+import ai.minecivilization.architecture.ModularHouse;
 import ai.minecivilization.entity.CitizenEntity;
 import ai.minecivilization.entity.CitizenIndex;
 import ai.minecivilization.network.AiBridge;
@@ -107,6 +108,7 @@ public final class ModEvents {
         // felled canopies decay and planted crops grow.
         ai.minecivilization.colony.CitizenChunkLoader.tick(overworld);
         ColonyLife.tick(overworld);
+        ai.minecivilization.farming.FieldRegistry.tickSurvey(overworld);
         ai.minecivilization.work.ProductivityMonitor.tick(overworld);
         ai.minecivilization.telemetry.CitizenTracker.tick(overworld);
 
@@ -123,6 +125,7 @@ public final class ModEvents {
         // wants a fourth bedroom, and the old order never got past bedrooms.
         ai.minecivilization.colony.CivicPlanner.ensure(overworld, CitizenIndex.population());
         ensureStarterHouses(overworld);
+        ensureTownSquare(overworld);
         ai.minecivilization.colony.SignRegistry.get(overworld).prune(overworld);
     }
 
@@ -306,9 +309,23 @@ public final class ModEvents {
             if (animal instanceof net.minecraft.world.entity.animal.Wolf wolf) ai.minecivilization.livestock.ColonyWolves.attach(wolf);
         }
         if (!(event.getEntity() instanceof Monster monster)) return;
+        // Neutral mobs are neutral to citizens too. Endermen and zombified
+        // piglins are Monsters, so this hook used to hand them the same hunt
+        // goal as a zombie — and endermen, which never attack a villager in
+        // vanilla, were the second biggest killer of citizens. They still
+        // retaliate through their own hurt-by goal when a citizen strikes one.
+        if (!huntsCitizens(monster)) return;
 
         monster.targetSelector.addGoal(3, new NearestAttackableTargetGoal<>(
-                monster, CitizenEntity.class, true));
+                monster, CitizenEntity.class, 10, true, false,
+                citizen -> !(monster instanceof net.minecraft.world.entity.monster.Spider)
+                        || monster.getLightLevelDependentMagicValue() < 0.5F));
+    }
+
+    /** Whether a hostile mob should seek citizens out on its own. */
+    static boolean huntsCitizens(Monster monster) {
+        return !(monster instanceof net.minecraft.world.entity.NeutralMob)
+                && !(monster instanceof net.minecraft.world.entity.monster.piglin.AbstractPiglin);
     }
 
     @SubscribeEvent
@@ -416,69 +433,120 @@ public final class ModEvents {
         ConstructionManager manager = ConstructionManager.get(level);
         BlockPos anchor = housingAnchor(level, manager);
 
-        List<ConstructionProject> houses = new ArrayList<>();
-        List<ConstructionProject> unhomed = new ArrayList<>();  // houses owning no blocks yet
-        List<CampLayout.Rect> occupied = new ArrayList<>();     // everything fixed in place
-        for (ConstructionProject p : manager.all()) {
+        // 1) The large one-shot houses that never got a single block are
+        //    replaced by homes that grow in stages. Anything already started
+        //    stays: moving it would strand its blocks.
+        for (ConstructionProject p : new ArrayList<>(manager.all())) {
             HouseCatalog.ensureRegistered(level, p.blueprintId);
-            boolean house = HouseCatalog.isHouse(p.blueprintId);
-            if (house) houses.add(p);
-            if (house && p.placed.isEmpty() && p.ownedCells.isEmpty()) {
-                unhomed.add(p);
+            if (HouseCatalog.isHouse(p.blueprintId) && p.placed.isEmpty() && p.ownedCells.isEmpty()) {
+                manager.remove(p);
+            }
+        }
+
+        // 2) Plots: one per home, keyed by its origin, with its latest stage.
+        java.util.Map<String, ConstructionProject> latest = new java.util.LinkedHashMap<>();
+        List<CampLayout.Rect> occupied = new ArrayList<>();
+        int unfinishedHomes = 0;
+        for (ConstructionProject p : manager.all()) {
+            if (ModularHouse.isHome(p.blueprintId)) {
+                ConstructionManager.ensureBlueprint(level, p.blueprintId);
+                String plot = p.originX + "," + p.originZ;
+                ConstructionProject seen = latest.get(plot);
+                if (seen == null || ModularHouse.stageOf(p.blueprintId) > ModularHouse.stageOf(seen.blueprintId)) {
+                    latest.put(plot, p);
+                }
+                if (p.status != ConstructionProject.Status.COMPLETED
+                        && p.status != ConstructionProject.Status.FAILED) unfinishedHomes++;
             } else {
                 occupied.add(footprint(p));
             }
         }
-
-        int fulfilled = 0;   // houses being built or already standing
-        for (ConstructionProject p : houses) {
-            if (p.status != ConstructionProject.Status.FAILED) fulfilled++;
+        for (ConstructionProject p : latest.values()) {
+            occupied.add(new CampLayout.Rect(p.originX, p.originZ,
+                    ModularHouse.PLOT_WIDTH + 1, ModularHouse.PLOT_DEPTH + 1));
         }
 
-        // The next house's design decides how much room to leave for it.
-        Blueprint houseBlueprint = HouseCatalog.forColony(level, houses.size());
-        int houseW = houseBlueprint.footprintWidth();
-        int houseD = houseBlueprint.footprintDepth();
-
-        // 1) Leave unhomed houses alone when they already sit on a free camp
-        //    slot — re-running the check must never shuffle the row.
-        List<ConstructionProject> pending = new ArrayList<>();
-        for (ConstructionProject p : unhomed) {
-            CampLayout.Rect r = footprint(p);
-            if (CampLayout.isSlot(anchor.getX(), anchor.getZ(), r.x, r.z)
-                    && CampLayout.free(r, occupied)) {
-                occupied.add(r);
-            } else {
-                pending.add(p);
-            }
+        // 3) A finished stage earns the next one: the cabin gets a side room,
+        //    the room gets a floor on top. One at a time, so the builders
+        //    finish things instead of starting them.
+        for (ConstructionProject p : latest.values()) {
+            int stage = ModularHouse.stageOf(p.blueprintId);
+            if (p.status != ConstructionProject.Status.COMPLETED || stage >= ModularHouse.STAGES) continue;
+            if (unfinishedHomes >= 2) break;
+            String next = ModularHouse.id(ModularHouse.speciesOf(p.blueprintId), stage + 1);
+            ConstructionManager.ensureBlueprint(level, next);
+            String base = p.name.contains(" (") ? p.name.substring(0, p.name.indexOf(" (")) : p.name;
+            manager.createProject(base + " (" + ModularHouse.stageName(stage + 1) + ")", next,
+                    p.originX, p.originY, p.originZ, level.getGameTime());
+            unfinishedHomes++;
         }
 
-        // 2) Re-home the rest to the first free camp slot by the bed.
-        for (ConstructionProject p : pending) {
-            int slot = CampLayout.freeSlot(anchor.getX(), anchor.getZ(), houseW, houseD, occupied);
-            if (slot < 0) continue;   // row full: better where it is than jammed in
-            int x = CampLayout.slotX(anchor.getX(), slot);
-            int z = CampLayout.slotZ(anchor.getZ());
-            int originX = x - blueprintMinX(p);
-            int originZ = z - blueprintMinZ(p);
-            manager.relocate(p, originX, surfaceY(level, x, z, houseW, houseD), originZ);
-            occupied.add(footprint(p));
-        }
-
-        // 3) Plan one more house while need outgrows the camp.
-        // One house per two citizens, as before, but now actually allowed to
-        // keep up with a growing population.
+        // 4) A new plot while the colony needs more homes — only once the
+        //    homes already started are nearly done.
         int desired = Math.min(MAX_HOUSES, (population + 1) / 2);
-        if (fulfilled >= desired || houses.size() >= MAX_HOUSES) return;
-        int slot = CampLayout.freeSlot(anchor.getX(), anchor.getZ(), houseW, houseD, occupied);
+        if (latest.size() >= desired || unfinishedHomes >= 2) return;
+        int width = ModularHouse.PLOT_WIDTH + 1;
+        int depth = ModularHouse.PLOT_DEPTH + 1;
+        int slot = CampLayout.freeSlot(anchor.getX(), anchor.getZ(), width, depth, occupied);
         if (slot < 0) return;
         int x = CampLayout.slotX(anchor.getX(), slot);
         int z = CampLayout.slotZ(anchor.getZ());
-        int originX = x - houseBlueprint.minX;
-        int originZ = z - houseBlueprint.minZ;
-        manager.createProject(houseBlueprint.name + " " + (houses.size() + 1),
-                houseBlueprint.id, originX, surfaceY(level, x, z, houseW, houseD), originZ,
+        String id = ModularHouse.id(HouseCatalog.dominantSpecies(level), 1);
+        ConstructionManager.ensureBlueprint(level, id);
+        manager.createProject("House " + (latest.size() + 1) + " (cabin)", id,
+                x, surfaceY(level, x, z, ModularHouse.PLOT_WIDTH, ModularHouse.PLOT_DEPTH), z,
                 level.getGameTime());
+    }
+
+    /**
+     * A town square once the first home stands: benches, planters, a lamp.
+     * One per colony, on open, level ground near the centre, clear of every
+     * building plot.
+     */
+    private static void ensureTownSquare(ServerLevel level) {
+        ConstructionManager manager = ConstructionManager.get(level);
+        boolean homeDone = false;
+        for (ConstructionProject p : manager.all()) {
+            if (ai.minecivilization.architecture.TownSquare.isSquare(p.blueprintId)) return;
+            if (ModularHouse.isHome(p.blueprintId) && p.status == ConstructionProject.Status.COMPLETED) homeDone = true;
+        }
+        if (!homeDone) return;
+        BlockPos centre = ai.minecivilization.colony.ZoneManager.get(level).townCenter(level);
+        int size = ai.minecivilization.architecture.TownSquare.SIZE;
+        for (int r = 0; r <= 24; r += 3) {
+            for (int dx = -r; dx <= r; dx += 3) {
+                for (int dz = -r; dz <= r; dz += 3) {
+                    if (Math.max(Math.abs(dx), Math.abs(dz)) != r) continue;
+                    int x0 = centre.getX() + dx - size / 2;
+                    int z0 = centre.getZ() + dz - size / 2;
+                    int y = squareSite(level, manager, x0, z0, size);
+                    if (y == Integer.MIN_VALUE) continue;
+                    String id = ai.minecivilization.architecture.TownSquare.ID_PREFIX
+                            + HouseCatalog.dominantSpecies(level);
+                    ConstructionManager.ensureBlueprint(level, id);
+                    manager.createProject("Town square", id, x0, y, z0, level.getGameTime());
+                    return;
+                }
+            }
+        }
+    }
+
+    /** Ground height if this square is open, level and nobody's plot; MIN_VALUE otherwise. */
+    private static int squareSite(ServerLevel level, ConstructionManager manager, int x0, int z0, int size) {
+        int min = Integer.MAX_VALUE;
+        int max = Integer.MIN_VALUE;
+        for (int x = x0 - 1; x <= x0 + size; x++) {
+            for (int z = z0 - 1; z <= z0 + size; z++) {
+                if (!level.isLoaded(new BlockPos(x, 64, z))) return Integer.MIN_VALUE;
+                int y = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z);
+                BlockPos ground = new BlockPos(x, y - 1, z);
+                if (manager.inBuildingPlot(ground.above()) || manager.protectsCell(ground.above())) return Integer.MIN_VALUE;
+                if (!level.getFluidState(ground).isEmpty()) return Integer.MIN_VALUE;
+                min = Math.min(min, y);
+                max = Math.max(max, y);
+            }
+        }
+        return max - min <= 1 ? max : Integer.MIN_VALUE;
     }
 
     /**
@@ -536,6 +604,8 @@ public final class ModEvents {
         ColonyLife.reset();
         ai.minecivilization.construction.WorkClaimStore.clear();
         ai.minecivilization.work.GlobalTaskPool.clear();
+        ai.minecivilization.work.MaterialRequests.clear();
+        ai.minecivilization.farming.FieldRegistry.clear();
         ai.minecivilization.work.ColonyWork.reset();
         ai.minecivilization.work.ProductivityMonitor.reset();
         ai.minecivilization.telemetry.ColonyEventLog.clear();

@@ -20,6 +20,8 @@ public final class LightFarmSkill implements CitizenSkill {
             c.fail(SkillFailure.missing("colony lighting needs torches")); return SkillResult.FAILED;
         }
         spot = FarmLighting.torchSpot(c.level, crop);
+        if (spot != null && ai.minecivilization.construction.ConstructionManager.get(c.level)
+                .inBuildingPlot(spot)) spot = null;
         if (spot == null) { c.fail(SkillFailure.notFound("no safe torch support in this work area")); return SkillResult.FAILED; }
         var movement = SkillNavigation.approach(c, spot, 16, "light.walk");
         if (movement != SkillResult.COMPLETED) return movement;

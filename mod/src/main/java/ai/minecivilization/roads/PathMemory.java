@@ -168,8 +168,19 @@ public final class PathMemory extends SavedData {
                 nearest = i;
             }
         }
-        int next = Math.min(ordered.size() - 1, nearest + 1);
-        return ordered.get(next);
+        // A waypoint the citizen is already standing on is no step at all: the
+        // walk "arrives" at once and the rescue asks again, thousands of times.
+        // Take the first one further along that is both a real move and nearer
+        // the destination; at the end of the road there is none, and the
+        // caller walks the rest directly.
+        double here = from.distSqr(to);
+        for (int i = nearest + 1; i < ordered.size(); i++) {
+            BlockPos candidate = ordered.get(i);
+            if (candidate.distSqr(from) <= 16) continue;
+            if (candidate.distSqr(to) >= here) continue;
+            return candidate;
+        }
+        return null;
     }
 
     /** The route whose surface most deserves a citizen's attention right now. */

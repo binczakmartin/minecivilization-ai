@@ -113,6 +113,7 @@ public final class ExploreSkill implements CitizenSkill {
     private void survey(SkillContext context) {
         ServerLevel level = context.level;
         CitizenEntity citizen = context.citizen;
+        ai.minecivilization.livestock.AnimalSightings.glance(level, citizen);
         BlockPos at = citizen.blockPosition();
         LandmarkRegistry landmarks = LandmarkRegistry.get(level);
 
@@ -180,12 +181,16 @@ public final class ExploreSkill implements CitizenSkill {
         for (int distance = LEG_DISTANCE; distance <= MAX_DISTANCE; distance += 32) {
             int x = centre.getX() + (int) Math.round(Math.cos(bearing) * distance);
             int z = centre.getZ() + (int) Math.round(Math.sin(bearing) * distance);
+            if (!level.isLoaded(new BlockPos(x, at.getY(), z))) {
+                // Unloaded is exactly what "unexplored" means — go there. Its
+                // height is unknown until the chunk loads (the heightmap of an
+                // unloaded column reads as the bottom of the world, and
+                // explorers used to plan routes down to bedrock), so aim at
+                // our own height; the journey is walked in legs anyway.
+                return new BlockPos(x, at.getY(), z);
+            }
             int y = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z);
             BlockPos candidate = new BlockPos(x, y, z);
-            if (!level.isLoaded(candidate)) {
-                // Unloaded is exactly what "unexplored" means — go there.
-                return candidate;
-            }
             if (PlacementSafety.canStand(level, citizen, candidate)
                     && candidate.distSqr(at) > 32 * 32) {
                 return candidate;

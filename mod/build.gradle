@@ -54,7 +54,11 @@ minecraft {
             // keeps its world in run-server/world while the client keeps its
             // single-player worlds in run/saves. Sharing one directory made the
             // two quietly fight over configs and logs.
-            workingDir = layout.projectDirectory.dir('run-server')
+            // -PmcivServerDir=run-test points it at a throwaway folder (with its
+            // own port in server.properties) for automated checks, so a test
+            // can never touch the world of a server someone is playing on.
+            workingDir = layout.projectDirectory.dir(
+                    providers.gradleProperty('mcivServerDir').orElse('run-server').get())
             args '--nogui'
         }
 

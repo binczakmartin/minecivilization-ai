@@ -66,8 +66,10 @@ class ResourceFamilyTest {
     @Test
     void ordinaryItemsHaveNoSubstitutesAtAll() {
         assertFalse(ResourceFamily.hasSubstitutes("minecraft:diamond"));
-        assertEquals(List.of("minecraft:diamond"),
-                ResourceFamily.sourceBlocks("minecraft:diamond"));
+        // An ordinary block is its own source (diamond, an item, is found
+        // through its ore — see itemsThatAreNotBlocksAreFoundThroughWhatDropsThem).
+        assertEquals(List.of("minecraft:clay"),
+                ResourceFamily.sourceBlocks("minecraft:clay"));
         assertEquals(java.util.Set.of("minecraft:diamond"),
                 ResourceFamily.equivalentItems("minecraft:diamond"));
     }
@@ -86,5 +88,23 @@ class ResourceFamilyTest {
                 "minecraft:diamond", "minecraft:wheat")) {
             assertTrue(ResourceFamily.satisfies(item, item), item + " must satisfy itself");
         }
+    }
+
+    @Test
+    void itemsThatAreNotBlocksAreFoundThroughWhatDropsThem() {
+        // "No reachable minecraft:air" — the farmer was looking for a seed block.
+        assertEquals("minecraft:short_grass",
+                ResourceFamily.sourceBlocks("minecraft:wheat_seeds").get(0));
+        assertTrue(ResourceFamily.sourceBlocks("minecraft:raw_iron")
+                .contains("minecraft:deepslate_iron_ore"));
+        assertEquals(List.of("minecraft:gravel"), ResourceFamily.sourceBlocks("minecraft:flint"));
+    }
+
+    @Test
+    void saplingsComeFromAnyLeavesAndAnySaplingWillDo() {
+        var sources = ResourceFamily.sourceBlocks("minecraft:oak_sapling");
+        assertEquals("minecraft:oak_leaves", sources.get(0));
+        assertTrue(sources.contains("minecraft:acacia_leaves"), "a savanna has acacia, not oak");
+        assertTrue(ResourceFamily.satisfies("minecraft:oak_sapling", "minecraft:acacia_sapling"));
     }
 }

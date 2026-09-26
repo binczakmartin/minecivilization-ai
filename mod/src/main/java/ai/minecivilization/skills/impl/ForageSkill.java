@@ -43,6 +43,8 @@ public final class ForageSkill implements CitizenSkill {
     private static final double REACH_SQR = 16.0;
 
     private final Set<BlockPos> attempted = new HashSet<>();
+    /** Edible items carried when a food forage started; -1 until then. */
+    private int foodBaseline = -1;
     private BlockPos target;
     private int broken;
     private SpiralScan.Cursor scan;
@@ -61,6 +63,7 @@ public final class ForageSkill implements CitizenSkill {
     @Override
     public void start(SkillContext context) {
         attempted.clear();
+        foodBaseline = -1;
         target = null;
         broken = 0;
         scan = null;
@@ -73,7 +76,15 @@ public final class ForageSkill implements CitizenSkill {
         int quantity = context.params.quantity > 0 ? context.params.quantity : 1;
         CitizenInventory inventory = context.citizen.getInventory();
 
-        if (wanted != null && inventory.count(wanted) >= quantity) {
+        boolean forFood = Forageables.FOOD.equals(wanted);
+        if (forFood) {
+            // Count meals, not one item: whatever edible thing the bushes gave.
+            if (foodBaseline < 0) foodBaseline = foodCount(inventory);
+            if (foodCount(inventory) - foodBaseline >= Math.max(quantity, 4)) {
+                collectDrops(context);
+                return SkillResult.COMPLETED;
+            }
+        } else if (wanted != null && inventory.count(wanted) >= quantity) {
             collectDrops(context);
             return SkillResult.COMPLETED;
         }
@@ -81,7 +92,8 @@ public final class ForageSkill implements CitizenSkill {
             // Budget spent. Anything picked up along the way is still a gain,
             // so this only fails when the meadow gave up nothing at all.
             collectDrops(context);
-            if (wanted == null || inventory.count(wanted) > 0) return SkillResult.COMPLETED;
+            if (wanted == null || (forFood ? foodCount(inventory) > foodBaseline
+                    : inventory.count(wanted) > 0)) return SkillResult.COMPLETED;
             context.fail(SkillFailure.missing(
                     "broke " + broken + " plants without finding " + wanted));
             return SkillResult.FAILED;
@@ -140,6 +152,17 @@ public final class ForageSkill implements CitizenSkill {
     }
 
     // ------------------------------------------------------------------ helpers
+
+    private static int foodCount(CitizenInventory inventory) {
+        int food = 0;
+        for (int slot = 0; slot < inventory.size(); slot++) {
+            ItemStack stack = inventory.get(slot);
+            if (!stack.isEmpty() && stack.has(net.minecraft.core.component.DataComponents.FOOD)) {
+                food += stack.getCount();
+            }
+        }
+        return food;
+    }
 
     private boolean isForageable(SkillContext context, BlockPos pos) {
         if (ai.minecivilization.construction.ConstructionManager.get(context.level)

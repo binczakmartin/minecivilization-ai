@@ -26,6 +26,9 @@ import ai.minecivilization.skills.impl.MoveToSkill;
 import ai.minecivilization.skills.impl.PickupItemSkill;
 import ai.minecivilization.skills.impl.PlaceBlockSkill;
 import ai.minecivilization.skills.impl.PlantCropSkill;
+import ai.minecivilization.skills.impl.HandOverSkill;
+import ai.minecivilization.skills.impl.MakePathSkill;
+import ai.minecivilization.skills.impl.ShelterSkill;
 import ai.minecivilization.skills.impl.SleepSkill;
 import ai.minecivilization.skills.impl.SmeltItemSkill;
 import ai.minecivilization.skills.impl.TillSoilSkill;
@@ -76,6 +79,9 @@ public final class SkillRegistry {
         REGISTRY.put(SkillType.WITHDRAW_ITEM, WithdrawItemSkill::new);
         REGISTRY.put(SkillType.EAT, EatSkill::new);
         REGISTRY.put(SkillType.SLEEP, SleepSkill::new);
+        REGISTRY.put(SkillType.SHELTER, ShelterSkill::new);
+        REGISTRY.put(SkillType.HAND_OVER, HandOverSkill::new);
+        REGISTRY.put(SkillType.MAKE_PATH, MakePathSkill::new);
         REGISTRY.put(SkillType.BUILD_BLUEPRINT, BuildBlueprintSkill::new);
         REGISTRY.put(SkillType.DELIVER_ITEMS, DeliverItemsSkill::new);
     }

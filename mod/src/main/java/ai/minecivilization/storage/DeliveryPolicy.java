@@ -33,6 +33,11 @@ public final class DeliveryPolicy {
         if (itemId.equals("minecraft:bone")) return 8;
         if (itemId.equals("minecraft:wheat")) return 8;
         if (itemId.equals("minecraft:torch")) return 16;
+        // The portable workbench every citizen carries: depositing it only
+        // means crafting another one on the next job.
+        if (itemId.equals("minecraft:crafting_table")) return 1;
+        // Saplings are for planting, not for the warehouse.
+        if (itemId.endsWith("_sapling")) return 16;
         if (itemId.equals("minecraft:bucket") || itemId.equals("minecraft:water_bucket")) return 1;
         if (itemId.endsWith("_seeds") || itemId.equals("minecraft:sugar_cane")
                 || itemId.equals("minecraft:nether_wart")) return 4;

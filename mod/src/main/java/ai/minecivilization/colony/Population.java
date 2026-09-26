@@ -37,7 +37,9 @@ public final class Population {
      */
     public static int foodNeededFor(int population) {
         if (population <= 0) return 0;
-        return 64 + 24 * population;
+        // A few days' bread for everyone, not a granary: 448 in store for
+        // sixteen citizens was a bar the colony could never clear.
+        return 32 + 8 * population;
     }
 
     /** Beds the colony must own before the colony will grow again. */

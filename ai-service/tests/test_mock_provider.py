@@ -207,7 +207,8 @@ async def test_places_table_carried_in_inventory():
 async def test_placed_memory_prevents_a_second_table():
     """known_memories says the workstation already stands: skip to the tools."""
     p = MockProvider()
-    o = obs(inventory={"minecraft:oak_log": 16, "minecraft:oak_planks": 16},
+    o = obs(inventory={"minecraft:oak_log": 16, "minecraft:oak_planks": 16,
+                       "minecraft:wooden_sword": 1},
             known_memories=PLACED)
     d = Decision.model_validate((await p.generate_structured(payload(o))).data)
     assert d.tasks[0].type == TaskType.CRAFT
@@ -218,13 +219,24 @@ async def test_placed_memory_prevents_a_second_table():
 async def test_crafts_wooden_pickaxe_once_sticks_are_ready():
     p = MockProvider()
     o = obs(inventory={"minecraft:oak_log": 16, "minecraft:oak_planks": 16,
-                       "minecraft:stick": 4},
+                       "minecraft:stick": 4, "minecraft:wooden_sword": 1},
             known_memories=PLACED)
     d = Decision.model_validate((await p.generate_structured(payload(o))).data)
     assert d.goal.type == GoalType.CRAFT_ITEM
     assert d.tasks[0].type == TaskType.CRAFT
     assert d.tasks[0].resource == "minecraft:wooden_pickaxe"
     assert d.tasks[0].quantity == 1
+
+
+async def test_an_unarmed_citizen_makes_a_sword_before_its_tools():
+    """The first night comes before the shovel is needed."""
+    p = MockProvider()
+    o = obs(inventory={"minecraft:oak_log": 16, "minecraft:oak_planks": 16,
+                       "minecraft:stick": 4},
+            known_memories=PLACED)
+    d = Decision.model_validate((await p.generate_structured(payload(o))).data)
+    assert d.tasks[0].type == TaskType.CRAFT
+    assert d.tasks[0].resource == "minecraft:wooden_sword"
 
 
 async def test_miner_mines_cobble_from_stone_after_wooden_tools():

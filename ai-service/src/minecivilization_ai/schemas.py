@@ -58,6 +58,8 @@ class TaskType(str, Enum):
     SIGN = "SIGN"            # put up a signpost naming a place
     ROADWORK = "ROADWORK"    # lay, light or widen a stretch of the colony's roads
     EXPLORE = "EXPLORE"      # survey unknown ground and bring back what is there
+    SHELTER = "SHELTER"      # wall in for the night; take the walls down at dawn
+    HANDOVER = "HANDOVER"    # a courier hands a co-worker the materials it asked for
 
 
 class SkillType(str, Enum):
@@ -94,6 +96,9 @@ class SkillType(str, Enum):
     WITHDRAW_ITEM = "WITHDRAW_ITEM"
     EAT = "EAT"
     SLEEP = "SLEEP"
+    SHELTER = "SHELTER"
+    HAND_OVER = "HAND_OVER"
+    MAKE_PATH = "MAKE_PATH"
     BUILD_BLUEPRINT = "BUILD_BLUEPRINT"
     DELIVER_ITEMS = "DELIVER_ITEMS"
 

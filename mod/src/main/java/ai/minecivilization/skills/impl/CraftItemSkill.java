@@ -12,6 +12,7 @@ import ai.minecivilization.skills.SkillResult;
 import ai.minecivilization.skills.SkillType;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
 import net.minecraft.world.item.crafting.CraftingInput;
 import net.minecraft.world.item.crafting.CraftingRecipe;
 import net.minecraft.world.item.crafting.Ingredient;
@@ -58,6 +59,12 @@ public final class CraftItemSkill implements CitizenSkill {
 
     @Override
     public SkillResult tick(SkillContext context) {
+        SkillResult result = craft(context);
+        if (result != SkillResult.RUNNING) pickUpPortableTable(context);
+        return result;
+    }
+
+    private SkillResult craft(SkillContext context) {
         String target = context.params.resource;
         if (target == null) {
             context.fail(new SkillFailure("INVALID_TASK", "CRAFT without resource", false));
@@ -109,19 +116,50 @@ public final class CraftItemSkill implements CitizenSkill {
 
     // ------------------------------------------------------------------ station
 
-    /** @return RUNNING = searching/walking, COMPLETED = ready to craft, FAILED = abort. */
+    /** A workbench this close is used where it stands rather than setting one down. */
+    private static final int NEARBY_TABLE = 6;
+    /** Farther than this, a remembered table is not worth walking to. */
+    private static final int FARTHEST_TABLE = 32;
+
+    /**
+     * Get to a workbench.
+     *
+     * <p>In order of preference: a table a few steps away; the citizen's own
+     * table, set down beside it (made on the spot from planks or a log if it
+     * is not carrying one); and only then the long walk to whichever table the
+     * colony remembers. The old order — always walk to the colony's table —
+     * failed 246 times in one session with "no route", because that table was
+     * across a river or up a cliff from wherever the citizen happened to be.
+     * A player carries a workbench; so does a citizen now.</p>
+     *
+     * @return RUNNING = searching/walking, COMPLETED = ready to craft, FAILED = abort.
+     */
     private SkillResult ensureStation(SkillContext context) {
         context.citizen.clearWorkAnimation();
         BlockPos station = context.get("pos", (BlockPos) null);
         if (station == null) {
-            station = BlockScanner.find(context, Blocks.CRAFTING_TABLE);
+            station = nearbyTable(context);
+            if (station == null) station = setDownPortableTable(context);
             if (station == null) {
-                if (BlockScanner.done(context)) {
-                    context.fail(SkillFailure.notFound(
-                            "no crafting table within sight — this recipe needs a 3x3 grid"));
+                station = BlockScanner.find(context, Blocks.CRAFTING_TABLE);
+                if (station == null) {
+                    if (BlockScanner.done(context)) {
+                        context.fail(SkillFailure.notFound(
+                                "no crafting table within sight, none carried and no planks "
+                                        + "to make one — this recipe needs a 3x3 grid"));
+                        return SkillResult.FAILED;
+                    }
+                    return SkillResult.RUNNING;
+                }
+                if (station.distSqr(context.citizen.blockPosition()) > FARTHEST_TABLE * FARTHEST_TABLE) {
+                    // A table a hundred blocks off is not a workbench, it is an
+                    // expedition — and usually one with no route. Fail cheaply;
+                    // the executor makes the citizen its own table next time.
+                    BlockScanner.releaseStation(context);
+                    context.fail(SkillFailure.notFound("no workbench within "
+                            + FARTHEST_TABLE + " blocks and no wood to make one"));
                     return SkillResult.FAILED;
                 }
-                return SkillResult.RUNNING;
             }
             context.put("pos", station);
         }
@@ -129,6 +167,7 @@ public final class CraftItemSkill implements CitizenSkill {
         if (!context.level.getBlockState(station).is(Blocks.CRAFTING_TABLE)) {
             // table was broken: search again from scratch
             context.data.remove("pos");
+            context.data.remove("portable.pos");
             BlockScanner.reset(context);
             return SkillResult.RUNNING;
         }
@@ -136,7 +175,141 @@ public final class CraftItemSkill implements CitizenSkill {
         // Walk there, and make a way if walking will not do: a citizen standing
         // a few blocks from its own workbench should not report it unreachable
         // because a fence is in between.
-        return SkillNavigation.approach(context, station, REACH_SQR, "craft.walk");
+        SkillResult arrival = SkillNavigation.approach(context, station, REACH_SQR, "craft.walk");
+        if (arrival == SkillResult.FAILED && context.get("portable.pos", (BlockPos) null) == null) {
+            // The far table cannot be reached. That is a reason to use our own,
+            // not a reason to give up on the craft.
+            BlockPos portable = setDownPortableTable(context);
+            if (portable != null) {
+                context.failure = null;
+                BlockScanner.releaseStation(context);
+                context.put("pos", portable);
+                return SkillResult.RUNNING;
+            }
+        }
+        return arrival;
+    }
+
+    /** A crafting table within a few blocks, at roughly the citizen's height. */
+    private static BlockPos nearbyTable(SkillContext context) {
+        BlockPos feet = context.citizen.blockPosition();
+        BlockPos best = null;
+        double bestDist = Double.MAX_VALUE;
+        for (BlockPos pos : BlockPos.betweenClosed(feet.offset(-NEARBY_TABLE, -2, -NEARBY_TABLE),
+                feet.offset(NEARBY_TABLE, 2, NEARBY_TABLE))) {
+            if (!context.level.getBlockState(pos).is(Blocks.CRAFTING_TABLE)) continue;
+            double d = pos.distSqr(feet);
+            if (d < bestDist) {
+                bestDist = d;
+                best = pos.immutable();
+            }
+        }
+        return best;
+    }
+
+    /**
+     * Put the citizen's own workbench down next to it, making one first if it
+     * has the wood. Returns where it went, or null when that is not possible.
+     */
+    private static BlockPos setDownPortableTable(SkillContext context) {
+        CitizenInventory inventory = context.citizen.getInventory();
+        if (inventory.count("minecraft:crafting_table") <= 0 && !makeTable(context, inventory)) {
+            return null;
+        }
+        BlockPos spot = tableSpot(context);
+        if (spot == null) return null;
+        if (inventory.extract("minecraft:crafting_table", 1) != 1) return null;
+        if (!context.level.setBlock(spot, Blocks.CRAFTING_TABLE.defaultBlockState(), 3)) {
+            inventory.insert(new ItemStack(Items.CRAFTING_TABLE));
+            return null;
+        }
+        context.citizen.animateAction(WorkAnimation.PLACE, spot);
+        context.put("portable.pos", spot);
+        return spot;
+    }
+
+    /** Two-by-two crafting, no table needed: log → planks → table. */
+    private static boolean makeTable(SkillContext context, CitizenInventory inventory) {
+        if (plankCount(inventory) < 4) {
+            String log = null;
+            for (String species : ai.minecivilization.architecture.Palette.SPECIES) {
+                if (inventory.count("minecraft:" + species + "_log") > 0) {
+                    log = species;
+                    break;
+                }
+            }
+            if (log == null) return false;
+            if (!craftSimple(context, inventory, "minecraft:" + log + "_planks")) return false;
+        }
+        return plankCount(inventory) >= 4
+                && craftSimple(context, inventory, "minecraft:crafting_table");
+    }
+
+    private static int plankCount(CitizenInventory inventory) {
+        int planks = 0;
+        for (int slot = 0; slot < inventory.size(); slot++) {
+            ItemStack stack = inventory.get(slot);
+            if (!stack.isEmpty() && stack.is(net.minecraft.tags.ItemTags.PLANKS)) {
+                planks += stack.getCount();
+            }
+        }
+        return planks;
+    }
+
+    /** One craft of a small recipe from the pack, all or nothing. */
+    private static boolean craftSimple(SkillContext context, CitizenInventory inventory,
+                                       String target) {
+        for (RecipeHolder<CraftingRecipe> holder
+                : context.level.getRecipeManager().getAllRecipesFor(RecipeType.CRAFTING)) {
+            CraftingRecipe recipe = holder.value();
+            if (needsTable(recipe)) continue;
+            ItemStack result;
+            try {
+                result = recipe.getResultItem(context.level.registryAccess());
+            } catch (RuntimeException ex) {
+                continue;
+            }
+            if (result == null || result.isEmpty()
+                    || !CitizenInventory.idOf(result).equals(target)) continue;
+            Plan plan = planConsumption(inventory, recipe.getIngredients());
+            if (plan == null || !canInsert(inventory, result)) continue;
+            consume(inventory, plan.reserved());
+            inventory.insert(result.copy());
+            return true;
+        }
+        return false;
+    }
+
+    /** Solid ground beside the citizen with room for a table on it. */
+    private static BlockPos tableSpot(SkillContext context) {
+        BlockPos feet = context.citizen.blockPosition();
+        var manager = ai.minecivilization.construction.ConstructionManager.get(context.level);
+        for (int dy : new int[]{0, -1, 1}) {
+            for (int[] d : new int[][]{{1, 0}, {-1, 0}, {0, 1}, {0, -1}, {1, 1}, {-1, -1}, {1, -1}, {-1, 1}}) {
+                BlockPos pos = feet.offset(d[0], dy, d[1]);
+                var state = context.level.getBlockState(pos);
+                if (!state.canBeReplaced() || !context.level.getFluidState(pos).isEmpty()) continue;
+                if (!context.level.getBlockState(pos.below())
+                        .isFaceSturdy(context.level, pos.below(), net.minecraft.core.Direction.UP)) {
+                    continue;
+                }
+                if (manager.protectsCell(pos)) continue;
+                return pos;
+            }
+        }
+        return null;
+    }
+
+    /** Take the workbench we set down back into the pack. */
+    private static void pickUpPortableTable(SkillContext context) {
+        BlockPos pos = context.get("portable.pos", (BlockPos) null);
+        if (pos == null) return;
+        context.data.remove("portable.pos");
+        if (!context.level.getBlockState(pos).is(Blocks.CRAFTING_TABLE)) return;
+        ItemStack table = new ItemStack(Items.CRAFTING_TABLE);
+        if (!canInsert(context.citizen.getInventory(), table)) return;   // leave it for the colony
+        context.level.removeBlock(pos, false);
+        context.citizen.getInventory().insert(table);
     }
 
     // ------------------------------------------------------------------ crafting
@@ -318,6 +491,7 @@ public final class CraftItemSkill implements CitizenSkill {
     @Override
     public void cancel(SkillContext context) {
         context.navigator.stop();
+        pickUpPortableTable(context);
         // Hand the workbench back. The claim would lapse on its own, but a
         // minute of a station nobody is standing at is a minute the colony
         // queues behind it.

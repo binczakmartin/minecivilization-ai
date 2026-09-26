@@ -155,8 +155,11 @@ public final class SurfaceEscapeSkill implements CitizenSkill {
         for (BlockPos cell : new BlockPos[]{feet, feet.above()}) {
             BlockState state = level.getBlockState(cell);
             if (state.isAir()) continue;
+            // Grass, torches — and water: a swimmer passes through it. Counting
+            // water as something to cut sent the staircase "around" it again
+            // and again from the same spot, forever, with nothing ever cut.
             if (state.getCollisionShape(level, cell).isEmpty()
-                    && state.getFluidState().isEmpty()) continue;   // grass, torches
+                    && !state.getFluidState().is(net.minecraft.tags.FluidTags.LAVA)) continue;
             return cell;
         }
         return null;

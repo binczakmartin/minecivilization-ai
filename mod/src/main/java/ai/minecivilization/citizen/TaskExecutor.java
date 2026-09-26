@@ -68,6 +68,8 @@ public final class TaskExecutor {
     private CitizenSkill activeSkill;
     private Phase phase = Phase.CHECK;
     private int findAttempts;
+    /** Crops cut in this harvest task; the whole ripe patch is brought in, within reason. */
+    private int harvestedHere;
     /** Bounded recoveries for blocks/drops another worker invalidated. */
     private int recoveryFailures;
     private boolean initialized;
@@ -78,9 +80,17 @@ public final class TaskExecutor {
      * terrain is only modified when the world genuinely blocks the way.
      */
     private boolean terrainEscalated;
+    /** Making the citizen's own workbench before a recipe that needs one. */
+    private TaskExecutor tableRunner;
+    /** Whether this craft has already decided about a workbench. */
+    private boolean tableChecked;
+    /** This gather has already been sent to a remembered source once. */
+    private boolean usedRemembered;
+    /** A HUNT that found no game has turned into a forage for edible plants. */
+    private boolean foragingForFood;
 
     /** Widest a block search will look before the citizen tries something else. */
-    private static final int MAX_SEARCH_RADIUS = 48;
+    private static final int MAX_SEARCH_RADIUS = 96;
     /** Searches attempted before the goal is abandoned rather than rescanned. */
     private static final int MAX_FIND_ATTEMPTS = 3;
     /** Contention/drop failures allowed without resetting the phase timeout forever. */
@@ -129,6 +139,10 @@ public final class TaskExecutor {
      * so position tells you nothing.</p>
      */
     public long skillProgressAt() {
+        if (tableRunner != null) {
+            long inner = tableRunner.skillProgressAt();
+            if (inner != Long.MIN_VALUE) return inner;
+        }
         if (craftRunner != null) {
             long inner = craftRunner.skillProgressAt();
             if (inner != Long.MIN_VALUE) return inner;
@@ -137,6 +151,10 @@ public final class TaskExecutor {
     }
 
     public SkillType activeSkillType() {
+        if (tableRunner != null) {
+            SkillType inner = tableRunner.activeSkillType();
+            if (inner != null) return inner;
+        }
         if (craftRunner != null) {
             SkillType inner = craftRunner.activeSkillType();
             if (inner != null) return inner;
@@ -151,13 +169,18 @@ public final class TaskExecutor {
         this.ctx = null;
         this.phase = initialPhase(newTask);
         this.findAttempts = 0;
+        this.harvestedHere = 0;
         this.recoveryFailures = 0;
         this.initialized = false;
         this.terrainEscalated = false;
+        this.foragingForFood = false;
+        this.usedRemembered = false;
         this.craftPlan = null;
         this.craftStepIndex = 0;
         this.craftReplans = 0;
         this.craftSubTask = null;
+        this.tableRunner = null;
+        this.tableChecked = false;
     }
 
     /**
@@ -289,8 +312,24 @@ public final class TaskExecutor {
             });
             case DECORATE -> single(level, "minecraft:torch".equals(params.resource) ? SkillType.LIGHT_FARM : SkillType.DECORATE, p -> {
             });
-            case HUNT -> single(level, SkillType.HUNT, p -> {
-            });
+            case HUNT -> {
+                if (foragingForFood) {
+                    yield single(level, SkillType.FORAGE, p -> p.resource =
+                            ai.minecivilization.forestry.Forageables.FOOD);
+                }
+                Outcome hunted = single(level, SkillType.HUNT, p -> {
+                });
+                // No game about is not the end of the meal. Berries, melons and
+                // glow berries feed a citizen too; being handed the same empty
+                // hunt again is how one starved to zero in the last session.
+                if (hunted.status == Status.FAILED && hunted.failure != null
+                        && "TARGET_NOT_FOUND".equals(hunted.failure.code)) {
+                    foragingForFood = true;
+                    initialized = false;
+                    yield Outcome.running(SkillType.FORAGE, "no game about: foraging instead");
+                }
+                yield hunted;
+            }
             case MINE_SHAFT -> single(level, SkillType.DIG_MINE, p -> {
             });
             // The last rung of the rescue ladder. It carries the destination it
@@ -302,8 +341,17 @@ public final class TaskExecutor {
             });
             // Road work is ordinary block placement with a different reason, so
             // it reuses the placement machinery rather than duplicating it.
-            case ROADWORK -> place(level, self);
+            // A trodden path is dug with a shovel, not placed.
+            case ROADWORK -> "minecraft:dirt_path".equals(task.resource)
+                    ? single(level, SkillType.MAKE_PATH, p -> {
+                    })
+                    : place(level, self);
             case EXPLORE -> single(level, SkillType.EXPLORE, p -> {
+            });
+            case HANDOVER -> single(level, SkillType.HAND_OVER, p -> {
+            });
+            case SHELTER -> single(level, SkillType.SHELTER, p -> {
+                if ("dismantle".equals(task.target)) p.extra.put("shelter.mode", "dismantle");
             });
             case INSPECT -> done();
         };
@@ -448,6 +496,38 @@ public final class TaskExecutor {
             if (craftPlan.isSatisfied()) return done();
         }
 
+        // A workbench first, when the recipe needs one and none is at hand.
+        // Otherwise the craft walks to whatever table the colony knows —
+        // across a river, up a cliff — and 185 crafts in one session died on
+        // "no route". One log is a table, and a carried table goes anywhere.
+        if (!tableChecked) {
+            tableChecked = true;
+            boolean needsTable = false;
+            for (CraftPlan.Step s : craftPlan.steps()) {
+                if (s.method == Production.Method.CRAFT && s.needsWorkstation) needsTable = true;
+            }
+            if (needsTable && !"minecraft:crafting_table".equals(params.resource)
+                    && !workbenchAtHand(level, self)) {
+                tableRunner = new TaskExecutor();
+                tableRunner.reset(new CitizenPlan.Task(CitizenPlan.TaskType.CRAFT,
+                        "minecraft:crafting_table", 1, null, null, null, null));
+            }
+        }
+        if (tableRunner != null) {
+            Outcome made = tableRunner.step(level, self);
+            if (made.status == Status.RUNNING) {
+                return Outcome.running(made.activeSkill, "own workbench first — " + made.progressLabel);
+            }
+            tableRunner.cancel();
+            tableRunner = null;
+            if (made.status == Status.COMPLETED) {
+                // The pack changed: plan the real craft again from what is in it.
+                craftPlan = null;
+                return Outcome.running(SkillType.IDLE, "workbench in the pack");
+            }
+            // Could not make one: carry on with the plan and the colony's tables.
+        }
+
         if (craftStepIndex >= craftPlan.size()) {
             // The plan ran out without producing the goal: the world drifted
             // (a tree was taken, a drop was lost). Re-plan once from reality.
@@ -543,7 +623,9 @@ public final class TaskExecutor {
                     "GATHER without resource", false));
         }
         int qty = params.quantity > 0 ? params.quantity : 1;
-        int have = countTowards(self, resource);
+        boolean exact = "exact".equals(task.target);
+        if (exact) params.extra.put("exact", "true");
+        int have = exact ? self.getInventory().count(resource) : countTowards(self, resource);
 
         switch (phase) {
             case CHECK -> {
@@ -552,7 +634,9 @@ public final class TaskExecutor {
                 ctx.params.extra.remove("radius");
                 if (params.position != null) {
                     BlockPos known = new BlockPos(params.position[0], params.position[1], params.position[2]);
-                    if (usableKnownTarget(level, known, resource)) {
+                    // Unloaded means "far away, but believed": walk there on
+                    // trust, and the source is checked on arrival like any other.
+                    if (!level.isLoaded(known) || usableKnownTarget(level, known, resource)) {
                         if (params.block == null) params.block = sourceBlock(resource);
                         aimAtTreeBase(level);
                         phase = Phase.GATHER_MOVE;
@@ -582,8 +666,25 @@ public final class TaskExecutor {
                     // past that, every retry rescans the identical cube from
                     // the identical spot. Give up and let the brain choose
                     // something else — that loop used to burn eighteen minutes.
-                    int radius = Math.min(MAX_SEARCH_RADIUS, 24 + findAttempts * 8);
+                    // Double each time: a colony that has cleared every tree
+                    // within 48 blocks still has forest at 80, and adding eight
+                    // blocks a try never got there before giving up.
+                    int radius = Math.min(MAX_SEARCH_RADIUS, 24 << Math.min(findAttempts, 2));
                     if (findAttempts > MAX_FIND_ATTEMPTS) {
+                        // Nothing in sight. Before giving up, ask what the
+                        // colony remembers: a grove an explorer passed last
+                        // week is still a grove. Colonies that had cut down
+                        // every tree within 48 blocks otherwise could never
+                        // make another tool.
+                        BlockPos known = rememberedSource(level, self, resource);
+                        if (known != null && !usedRemembered) {
+                            usedRemembered = true;
+                            params.position = new int[]{known.getX(), known.getY(), known.getZ()};
+                            params.block = null;
+                            phase = Phase.CHECK;
+                            return Outcome.running(SkillType.MOVE_TO,
+                                    "heading for " + resource + " the colony knows of");
+                        }
                         return Outcome.failed(f != null ? f : SkillFailure.notFound(resource));
                     }
                     ctx.params.extra.put("radius", String.valueOf(radius));
@@ -606,6 +707,11 @@ public final class TaskExecutor {
                         // the resource exists but the way there does not — make one
                         terrainEscalated = true;
                         return beginPhase(SkillType.TRAVERSE);
+                    }
+                    if (f != null && "TARGET_UNREACHABLE".equals(f.code) && params.position != null) {
+                        ai.minecivilization.navigation.UnreachableMemory.note(new BlockPos(
+                                params.position[0], params.position[1], params.position[2]),
+                                level.getGameTime());
                     }
                     return Outcome.failed(f);
                 }
@@ -639,7 +745,7 @@ public final class TaskExecutor {
                     SkillFailure pickupFailure = ctx.failure;
                     activeSkill = null;
                     ctx.failure = null;
-                    if (countTowards(self, resource) >= qty) {
+                    if ((exact ? self.getInventory().count(resource) : countTowards(self, resource)) >= qty) {
                         recoveryFailures = 0;
                         phase = Phase.DONE;
                         return done();
@@ -705,6 +811,46 @@ public final class TaskExecutor {
         return total;
     }
 
+    /** A workbench in the pack, or one close enough to be used where it stands. */
+    private static boolean workbenchAtHand(ServerLevel level, CitizenEntity self) {
+        if (self.getInventory().count("minecraft:crafting_table") > 0) return true;
+        BlockPos table = ai.minecivilization.colony.LandmarkRegistry.get(level).nearest(
+                ai.minecivilization.colony.LandmarkKind.CRAFTING_TABLE, self.blockPosition());
+        return table != null && table.distSqr(self.blockPosition()) <= 16 * 16
+                && level.isLoaded(table)
+                && level.getBlockState(table).is(net.minecraft.world.level.block.Blocks.CRAFTING_TABLE);
+    }
+
+    /** Farthest a remembered resource is worth walking to. */
+    private static final int REMEMBERED_RANGE = 160;
+
+    /** The nearest source of {@code resource} any citizen has seen, if still there. */
+    private static BlockPos rememberedSource(ServerLevel level, CitizenEntity self, String resource) {
+        var sources = ai.minecivilization.forestry.ResourceFamily.sourceBlocks(resource);
+        BlockPos here = self.blockPosition();
+        BlockPos best = null;
+        // A grove a hundred blocks out is a day trip, not a night one.
+        int range = ai.minecivilization.citizen.NightPolicy.shelterTime(level.getDayTime(),
+                level.isThundering()) ? (int) ai.minecivilization.citizen.NightPolicy.NIGHT_RANGE
+                : REMEMBERED_RANGE;
+        double bestDist = (double) range * range;
+        for (CitizenEntity citizen : ai.minecivilization.entity.CitizenIndex.all()) {
+            for (var entry : citizen.knownResources().entrySet()) {
+                if (!sources.contains(entry.getKey())) continue;
+                BlockPos pos = entry.getValue();
+                double d = pos.distSqr(here);
+                if (d >= bestDist || d < 48.0 * 48.0) continue;   // near ones were just searched
+                if (level.isLoaded(pos) && !sources.contains(net.minecraftforge.registries
+                        .ForgeRegistries.BLOCKS.getKey(level.getBlockState(pos).getBlock()).toString())) {
+                    continue;   // gone since it was seen
+                }
+                best = pos;
+                bestDist = d;
+            }
+        }
+        return best;
+    }
+
     private boolean usableKnownTarget(ServerLevel level, BlockPos pos, String resource) {
         if (!level.isLoaded(pos) || level.getBlockEntity(pos) != null) return false;
         if (!new ai.minecivilization.navigation.LevelBlockView(level).diggable(pos)) return false;
@@ -743,7 +889,10 @@ public final class TaskExecutor {
     // ------------------------------------------------------------------ HARVEST
 
     private Outcome harvest(ServerLevel level, CitizenEntity self) {
-        if (task.resource != null && params.quantity > 0
+        // "Bring in this crop" is about the crop, not about the pack: holding a
+        // sheaf already used to complete it on the spot, 320 times an hour,
+        // while the field it named stood ripe.
+        if (task.position == null && task.resource != null && params.quantity > 0
                 && self.getInventory().count(task.resource) >= params.quantity) {
             return done();
         }
@@ -751,6 +900,18 @@ public final class TaskExecutor {
         if (activeSkill == null) {
             switch (phase) {
                 case HARVEST_FIND -> {
+                    // The colony knows where its fields are: go to the nearest
+                    // ripe crop on record before searching the neighbourhood.
+                    BlockPos known = ai.minecivilization.farming.FieldRegistry.nearestRipe(level,
+                            self.blockPosition(), 128);
+                    if (known != null) {
+                        params.position = new int[]{known.getX(), known.getY(), known.getZ()};
+                        var key = net.minecraftforge.registries.ForgeRegistries.BLOCKS
+                                .getKey(level.getBlockState(known).getBlock());
+                        if (key != null) params.block = key.toString();
+                        phase = Phase.HARVEST_MOVE;
+                        return beginPhase(moveSkill());
+                    }
                     params.extra.put("maxAge", "true");
                     return beginFindPhase(SkillType.FIND_BLOCK);
                 }
@@ -804,6 +965,12 @@ public final class TaskExecutor {
         SkillFailure f = ctx.failure;
         ctx.failure = null;
         activeSkill = null;
+        // The crop is cut; if its drops are already in the pack (citizens pick
+        // up what lands at their feet) there is simply nothing left to pick
+        // up. That used to fail the whole harvest after the work was done.
+        if (r == SkillResult.FAILED && phase == Phase.HARVEST_PICKUP && isNothingFound(f)) {
+            r = SkillResult.COMPLETED;
+        }
         if (r == SkillResult.FAILED) {
             if (f != null && ("CROP_GONE".equals(f.code) || "BLOCK_ALREADY_MINED".equals(f.code))) {
                 phase = Phase.HARVEST_FIND;
@@ -861,6 +1028,22 @@ public final class TaskExecutor {
                 int wanted = task.quantity > 0 ? task.quantity : 1;
                 boolean enough = task.resource != null
                         && self.getInventory().count(task.resource) >= wanted;
+                // A farmer does not cut one stalk and walk off: while more of
+                // the field stands ripe close by, keep going.
+                BlockPos nextRipe = ++harvestedHere < 32 && hasRoom(self.getInventory())
+                        ? ai.minecivilization.farming.FieldRegistry.nearestRipe(level, self.blockPosition(), 8)
+                        : null;
+                if (enough && nextRipe != null) {
+                    String seed = ai.minecivilization.farming.Crops.seedFor(params.block);
+                    if (seed != null && params.position != null
+                            && self.getInventory().containsAtLeast(seed, 1)) {
+                        BlockPos cut = new BlockPos(params.position[0], params.position[1], params.position[2]);
+                        replantQuietly(level, self, cut, seed);
+                    }
+                    params.position = new int[]{nextRipe.getX(), nextRipe.getY(), nextRipe.getZ()};
+                    phase = Phase.HARVEST_MOVE;
+                    return beginPhase(moveSkill());
+                }
                 if (!enough) {
                     // One harvested plant used to complete the whole task. If a
                     // field yields one carrot at a time, that produced a fresh
@@ -910,6 +1093,27 @@ public final class TaskExecutor {
     }
 
     /** A search that came back empty, as opposed to one that went wrong. */
+    private static boolean hasRoom(ai.minecivilization.inventory.CitizenInventory inventory) {
+        for (int slot = 0; slot < inventory.size(); slot++) {
+            if (inventory.get(slot).isEmpty()) return true;
+        }
+        return false;
+    }
+
+    /** Put a seed back where a crop was just cut, as a farmer does in passing. */
+    private void replantQuietly(ServerLevel level, CitizenEntity self, BlockPos cut, String seed) {
+        if (params.block == null || !level.getBlockState(cut).isAir()
+                || !level.getBlockState(cut.below()).is(net.minecraft.world.level.block.Blocks.FARMLAND)) {
+            return;
+        }
+        var block = net.minecraftforge.registries.ForgeRegistries.BLOCKS
+                .getValue(net.minecraft.resources.ResourceLocation.parse(params.block));
+        if (!(block instanceof net.minecraft.world.level.block.CropBlock)) return;
+        if (self.getInventory().extract(seed, 1) < 1) return;
+        level.setBlock(cut, block.defaultBlockState(), 3);
+        ai.minecivilization.farming.FieldRegistry.add(level, cut);
+    }
+
     private static boolean isNothingFound(SkillFailure failure) {
         return failure != null && "TARGET_NOT_FOUND".equals(failure.code);
     }
@@ -981,6 +1185,10 @@ public final class TaskExecutor {
         }
         if (craftRunner != null) {
             craftRunner.cancel();
+        }
+        if (tableRunner != null) {
+            tableRunner.cancel();
+            tableRunner = null;
         }
         activeSkill = null;
         task = null;

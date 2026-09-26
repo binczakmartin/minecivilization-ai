@@ -68,10 +68,22 @@ public final class Loadout {
      * flag keeps the nice-to-haves out of the way until the stores exist to
      * fill them from.</p>
      */
+    private static final List<Need> FIRST = List.of(
+            // A workbench in the pack, before anything else. Every tool and
+            // weapon is a three-by-three recipe, and walking to the colony's
+            // one table — across a river, up a cliff, through a crowd — was the
+            // single largest source of failed work: in one session 246 of 260
+            // craft attempts died on "no route to the crafting table". One log
+            // makes a table, and a carried table goes down wherever it is
+            // needed and comes back up afterwards.
+            new Need("minecraft:crafting_table", 1, Source.CRAFT, false),
+            // A weapon next, whatever the trade. Citizens were being killed on
+            // their first night by mobs they had no means to answer, while
+            // their trade kit (a shepherd's iron shears, say) was still being
+            // chased ahead of it.
+            new Need("minecraft:wooden_sword", 1, Source.CRAFT, false));
+
     private static final List<Need> UNIVERSAL = List.of(
-            // A weapon first. Citizens were being killed by mobs they had no
-            // means to answer, which no amount of clever work scheduling fixes.
-            new Need("minecraft:wooden_sword", 1, Source.CRAFT, false),
             new Need("minecraft:wooden_axe", 1, Source.CRAFT, false),
             new Need("minecraft:wooden_pickaxe", 1, Source.CRAFT, false),
             // Light is safety: a lit workplace does not spawn what kills you.
@@ -92,7 +104,12 @@ public final class Loadout {
      * axes it owns.</p>
      */
     public static List<Need> forProfession(@Nullable String profession) {
-        List<Need> kit = new ArrayList<>(specialised(profession));
+        List<Need> kit = new ArrayList<>(FIRST);
+        for (Need special : specialised(profession)) {
+            if (kit.stream().noneMatch(need -> need.itemId().equals(special.itemId()))) {
+                kit.add(special);
+            }
+        }
         for (Need universal : UNIVERSAL) {
             if (kit.stream().noneMatch(need -> need.itemId().equals(universal.itemId()))) {
                 kit.add(universal);
@@ -107,12 +124,15 @@ public final class Loadout {
             case "SHEPHERD", "RANCHER", "BREEDER" -> List.of(
                     // Shears are the only way to get wool without killing the
                     // flock, and wool is what beds — and therefore growth —
-                    // are made of.
-                    new Need("minecraft:shears", 1, Source.CRAFT, false),
+                    // are made of. A spare, though: they cost iron, and a
+                    // day-one shepherd that treats them as essential spends
+                    // its first night searching for iron ore unarmed.
+                    new Need("minecraft:shears", 1, Source.CRAFT, true),
                     // Animals follow food. Without a lure a shepherd cannot
-                    // lead anything into a pen or persuade a pair to breed, so
-                    // every livestock job it was given failed on arrival.
-                    new Need("minecraft:wheat", 4, Source.WITHDRAW, false),
+                    // lead anything into a pen or persuade a pair to breed.
+                    // Also a spare: wheat only exists once a field does, and an
+                    // unobtainable essential benches the whole kit.
+                    new Need("minecraft:wheat", 4, Source.WITHDRAW, true),
                     new Need("minecraft:wheat_seeds", 4, Source.GATHER, true),
                     new Need("minecraft:carrot", 4, Source.WITHDRAW, true),
                     // Fencing, so a herded animal stays herded.
@@ -128,11 +148,12 @@ public final class Loadout {
                     // it is already digging, how the torches get made.
                     new Need("minecraft:oak_planks", 8, Source.WITHDRAW, true));
 
+            // No saplings in the kit: they come off the canopy of every tree
+            // felled, and the forest job plants whatever is carried. Asking
+            // for four here outranked the planting, so a lumberjack holding
+            // two went off breaking leaves for more instead of planting them.
             case "LUMBERJACK", "FORESTER" -> List.of(
-                    new Need("minecraft:stone_axe", 1, Source.CRAFT, true),
-                    // Put the forest back: saplings come off the canopy the
-                    // job just felled, so this costs the colony nothing.
-                    new Need("minecraft:oak_sapling", 4, Source.GATHER, true));
+                    new Need("minecraft:stone_axe", 1, Source.CRAFT, true));
 
             case "FARMER" -> List.of(
                     new Need("minecraft:wooden_hoe", 1, Source.CRAFT, false),
@@ -145,8 +166,6 @@ public final class Loadout {
                     new Need("minecraft:torch", 8, Source.CRAFT, true));
 
             case "CRAFTER", "SMITH", "ENGINEER" -> List.of(
-                    // Carrying a workbench means never queueing for one.
-                    new Need("minecraft:crafting_table", 1, Source.CRAFT, false),
                     new Need("minecraft:oak_planks", 12, Source.WITHDRAW, true),
                     new Need("minecraft:furnace", 1, Source.CRAFT, true));
 
@@ -179,16 +198,27 @@ public final class Loadout {
     @Nullable
     public static Need nextMissing(@Nullable String profession, Map<String, Integer> carried,
                                    boolean includeSpares) {
+        return nextMissing(profession, carried, includeSpares, need -> true);
+    }
+
+    /**
+     * @param obtainable whether the colony can get this thing at all right now;
+     *                   a need it cannot is skipped rather than chased
+     */
+    @Nullable
+    public static Need nextMissing(@Nullable String profession, Map<String, Integer> carried,
+                                   boolean includeSpares,
+                                   java.util.function.Predicate<Need> obtainable) {
         List<Need> kit = forProfession(profession);
         // Essentials across the whole kit first, then spares.
         for (Need need : kit) {
             if (need.spare()) continue;
-            if (!satisfied(need, carried)) return need;
+            if (!satisfied(need, carried) && obtainable.test(need)) return need;
         }
         if (!includeSpares) return null;
         for (Need need : kit) {
             if (!need.spare()) continue;
-            if (!satisfied(need, carried)) return need;
+            if (!satisfied(need, carried) && obtainable.test(need)) return need;
         }
         return null;
     }
@@ -203,6 +233,13 @@ public final class Loadout {
     public static boolean satisfied(Need need, Map<String, Integer> carried) {
         if (carried == null) return false;
         int have = carried.getOrDefault(need.itemId(), 0);
+        // Any sapling will do: the forest grows whatever the land grows.
+        if (need.itemId().endsWith("_sapling")) {
+            have = 0;
+            for (var entry : carried.entrySet()) {
+                if (entry.getKey().endsWith("_sapling")) have += entry.getValue();
+            }
+        }
         if (have >= need.quantity()) return true;
 
         String upgrade = betterThan(need.itemId());
@@ -225,6 +262,12 @@ public final class Loadout {
             }
         }
         return null;
+    }
+
+    /** True for kit that is made of iron and so needs ingots first. */
+    public static boolean needsIron(String itemId) {
+        return itemId != null && (itemId.equals("minecraft:shears") || itemId.equals("minecraft:bucket")
+                || itemId.contains("iron_"));
     }
 
     /** Tool materials, worst to best. */

@@ -357,9 +357,15 @@ def _mock_decision(payload: dict[str, Any]) -> dict[str, Any]:
         # or no hoe — a citizen that cannot break ground cannot start a field,
         # and sending it to farm anyway produced a hundred and thirty identical
         # "no hoe" failures while it slowly starved.
-        if food_reserve < 8 or not has_hoe:
-            return _hunt(name, "nothing to eat, and no way to grow any: it is hunt or starve")
-        return _harvest(name, "hungry, and carrying nothing to eat")
+        # Farming first. Hunting was the answer to every empty larder, and in a
+        # valley with no animals it sent the whole colony foraging bare grass
+        # all afternoon while the wheat it had sown stood ripe and unharvested.
+        if has_hoe:
+            return _harvest(name, "hungry: work the fields")
+        if planks >= 2 and sticks >= 2:
+            return _craft(name, "minecraft:wooden_hoe", 1,
+                          "a hoe turns seeds into bread; hunting feeds one meal")
+        return _hunt(name, "nothing to eat, and no way to grow any yet")
 
     # 4. Wood first: nothing builds without it. A citizen with a stocked
     #    warehouse behind it fetches rather than fells — the craft planner
@@ -387,7 +393,17 @@ def _mock_decision(payload: dict[str, Any]) -> dict[str, Any]:
             return _craft(name, "minecraft:crafting_table", 1,
                           "the workstation unlocks every tool recipe")
 
-    # 8. Bootstrap: sticks, then the wooden tool set (all need the placed table).
+    # 8. Bootstrap: sticks, then a weapon, then the wooden tool set (all need
+    #    the table). The sword comes first: the first night arrives before the
+    #    shovel is needed, and an unarmed colony lost seven of twelve citizens
+    #    in its first three minutes of darkness.
+    if not armed and (planks >= 4 or (planks >= 2 and sticks >= 1)):
+        # The craft resolves its own recipe tree, so the stick is made on the way.
+        if cobble >= 2:
+            return _craft(name, "minecraft:stone_sword", 1,
+                          "a weapon before the first night")
+        return _craft(name, "minecraft:wooden_sword", 1,
+                      "a weapon before the first night")
     if not (has_wooden_pick and has_wooden_axe and has_wooden_shovel):
         if sticks < 2 and planks >= 5:
             return _craft(name, "minecraft:stick", 4, "tool handles")
@@ -511,7 +527,9 @@ def _mock_decision(payload: dict[str, Any]) -> dict[str, Any]:
     #     routine trade work, so letting everyone do it meant lumberjacks and
     #     miners downing tools to make torches for as long as they held a log.
     if profession in ("BUILDER", "CRAFTER", "LOGISTICS", "UNASSIGNED"):
-        if torches < 8 and (coal >= 1 or (furnace_placed and logs >= 2)) and sticks >= 1:
+        # Coal from the mine, not charcoal from the forest: smelting logs for
+        # torches took a quarter of the colony's day.
+        if torches < 8 and coal >= 1 and sticks >= 1:
             return _craft(name, "minecraft:torch", 16,
                           "an unlit colony breeds monsters in its own streets")
         if torches >= 8:

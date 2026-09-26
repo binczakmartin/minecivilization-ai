@@ -234,10 +234,31 @@ public final class CraftPlanner {
         List<Production> ranked = new ArrayList<>(candidates);
         ranked.sort(Comparator
                 .comparingInt((Production p) -> payableNow(p, pools) ? 0 : 1)
+                // Between recipes that both need work, the one made of common
+                // stuff first. Sticks from planks and sticks from bamboo tie on
+                // every other count, and the recipe book's order sent citizens
+                // in an oak forest looking for bamboo.
+                .thenComparingInt(p -> usesRareMaterial(p) ? 1 : 0)
                 .thenComparingInt(p -> p.method.ordinal())
                 .thenComparingInt(p -> p.inputs.size())
                 .thenComparing(p -> p.sourceBlock == null ? "" : p.sourceBlock));
         return ranked;
+    }
+
+    /** Materials most of the world does not have within walking distance. */
+    private static boolean isRare(String item) {
+        return item.contains("bamboo") || item.contains("crimson") || item.contains("warped")
+                || item.contains("blackstone") || item.contains("nether") || item.contains("prismarine");
+    }
+
+    /** True when some ingredient slot can only be filled with a rare material. */
+    private static boolean usesRareMaterial(Production production) {
+        for (Production.Need need : production.inputs) {
+            if (!need.options.isEmpty() && need.options.stream().allMatch(CraftPlanner::isRare)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** Every ingredient slot is covered by stock on hand, with no further production. */

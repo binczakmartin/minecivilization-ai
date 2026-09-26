@@ -44,6 +44,11 @@ public final class LocalWorkPlanner {
         return new Task(TaskType.GATHER, resource, Math.max(quantity, WORTHWHILE_HAUL),
                 null, source, null, null);
     }
+    /** A haul on top of what is already carried, so it can never "finish" before starting. */
+    private Task gatherTask(CitizenEntity citizen, String resource) {
+        return gatherTask(resource, carried(citizen, resource) + WORTHWHILE_HAUL);
+    }
+
     private boolean isBlocked(Task task, long now) {
         return blockedUntil.getOrDefault(key(task), 0L) > now;
     }
@@ -54,6 +59,11 @@ public final class LocalWorkPlanner {
     }
     public CitizenPlan lighting(ServerLevel level, CitizenEntity citizen) {
         if (level.getGameTime() < nextLightingCheck) return null;
+        // Lighting is for torches the colony has, not a reason to smelt logs
+        // into charcoal for a quarter of the day.
+        var carried = citizen.getInventory();
+        if (carried.count("minecraft:torch") == 0 && carried.count("minecraft:coal") == 0
+                && carried.count("minecraft:charcoal") == 0) return null;
         nextLightingCheck = level.getGameTime() + 40;
         var crop = ai.minecivilization.colony.ColonyLighting.find(level, citizen.blockPosition());
         if (crop == null) return null;
@@ -225,6 +235,12 @@ public final class LocalWorkPlanner {
         for (ConstructionProject project : ConstructionManager.get(level).all()) {
             if (project.status == ConstructionProject.Status.COMPLETED
                     || project.status == ConstructionProject.Status.FAILED) continue;
+            // Only a project this citizen can actually put blocks on. Offering
+            // every unfinished project sent builders to fail on "need oak_log"
+            // and then to fetch one log, over and over.
+            if (!ai.minecivilization.work.ConstructionSupply.anyMaterialOnHand(level, project, citizen)) {
+                continue;
+            }
             Task build = new Task(TaskType.BUILD, null, -1, "micro", null, project.id, null);
             if (!isBlocked(build, level.getGameTime())) {
                 return plan(build, "Advance an active colony construction project");
@@ -237,7 +253,7 @@ public final class LocalWorkPlanner {
         String[] remembered = {"minecraft:oak_log", "minecraft:cobblestone", "minecraft:dirt"};
         for (int i = 0; i < remembered.length; i++) {
             String resource = remembered[Math.floorMod(rotation + i, remembered.length)];
-            if (citizen.getInventory().count(resource) >= 32) continue;
+            if (carried(citizen, resource) >= 32) continue;
             Task known = knownGather(level, citizen, resource);
             if (known != null && !isBlocked(known, level.getGameTime())) {
                 return plan(known, "Use a resource location already discovered nearby");
@@ -279,7 +295,7 @@ public final class LocalWorkPlanner {
         String[] resources = {"minecraft:oak_log", "minecraft:cobblestone", "minecraft:dirt"};
         for (int i = 0; i < resources.length; i++) {
             String resource = resources[Math.floorMod(rotation + i + citizen.getId(), resources.length)];
-            if (inv.count(resource) < 32) candidates.add(gatherTask(resource, 1));
+            if (carried(citizen, resource) < 32) candidates.add(gatherTask(citizen, resource));
         }
         for (Task t : candidates) {
             if (isBlocked(t, level.getGameTime())) continue;
@@ -293,12 +309,12 @@ public final class LocalWorkPlanner {
         // container or civic property through the mining skill.
         String[] emergency = {
                 "minecraft:oak_log", "minecraft:cobblestone", "minecraft:dirt",
-                "minecraft:stone", "minecraft:oak_planks", "minecraft:gravel",
+                "minecraft:stone", "minecraft:gravel",
                 "minecraft:sand", "minecraft:iron_ore", "minecraft:coal_ore"
         };
         for (int i = 0; i < emergency.length; i++) {
             String resource = emergency[Math.floorMod(rotation + i, emergency.length)];
-            Task maintenance = gatherTask(resource, 1);
+            Task maintenance = gatherTask(citizen, resource);
             if (!isBlocked(maintenance, level.getGameTime())) {
                 return plan(maintenance, "Keep gathering useful material while waiting for work");
             }
@@ -320,10 +336,24 @@ public final class LocalWorkPlanner {
             if (!sources.contains(entry.getKey()) || !level.isLoaded(pos)
                     || pos.distSqr(citizen.blockPosition()) > 64 * 64) continue;
             if (!new ai.minecivilization.navigation.LevelBlockView(level).diggable(pos)) continue;
-            return new Task(TaskType.GATHER, resource, 1, null, entry.getKey(), null,
+            // A haul worth the walk, counted the way the gather will count
+            // it. "Fetch one log" finished instantly for anyone already holding
+            // a log of any species, and each instant success reset the failure
+            // counters that would otherwise have broken the loop.
+            return new Task(TaskType.GATHER, resource,
+                    carried(citizen, resource) + WORTHWHILE_HAUL, null, entry.getKey(), null,
                     new int[]{pos.getX(), pos.getY(), pos.getZ()});
         }
         return null;
+    }
+
+    /** What the citizen holds towards {@code resource}, substitutes included. */
+    private static int carried(CitizenEntity citizen, String resource) {
+        int total = 0;
+        for (String id : ai.minecivilization.forestry.ResourceFamily.equivalentItems(resource)) {
+            total += citizen.getInventory().count(id);
+        }
+        return total;
     }
 
     private BlockPos patrolTarget(ServerLevel level, CitizenEntity citizen) {

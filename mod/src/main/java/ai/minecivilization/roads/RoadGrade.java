@@ -17,13 +17,15 @@ public enum RoadGrade {
     /** Footprints. Remembered, but nothing has been built. */
     TRACK("track", 0),
     /** Obstacles removed and holes filled: walkable without climbing. */
-    CLEARED("cleared path", 8),
+    // A route walked a handful of times is worth a path: waiting for
+    // twenty-four trips before touching it meant roads were hardly ever made.
+    CLEARED("cleared path", 3),
     /** A surface laid down, so it reads as a road and does not erode into mud. */
-    PAVED("paved road", 24),
+    PAVED("paved road", 8),
     /** Torches along it, because an unlit road at night is where citizens die. */
-    LIT("lit road", 48),
+    LIT("lit road", 20),
     /** Signed at both ends, so it is part of the colony's map. */
-    SIGNPOSTED("signposted road", 80);
+    SIGNPOSTED("signposted road", 40);
 
     private final String label;
     /** Trips along the route before it deserves this grade. */

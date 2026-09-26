@@ -79,8 +79,56 @@ public final class ResourceFamily {
             }
             return blocks;
         }
+        List<String> dropped = DROP_SOURCES.get(itemId);
+        if (dropped != null) return dropped;
+        // Saplings fall from leaves: their own species first, then any tree —
+        // a savanna colony has acacia leaves, not oak.
+        if (itemId.endsWith("_sapling")) {
+            List<String> blocks = new ArrayList<>();
+            blocks.add(itemId.substring(0, itemId.length() - "_sapling".length()) + "_leaves");
+            for (String species : WOOD_SPECIES) {
+                String leaves = "minecraft:" + species + "_leaves";
+                if (!blocks.contains(leaves)) blocks.add(leaves);
+            }
+            return blocks;
+        }
         return List.of(itemId);
     }
+
+    /**
+     * Items that are not blocks at all, and the blocks that drop them.
+     *
+     * <p>Without this a farmer sent for wheat seeds searched the world for a
+     * block called {@code minecraft:wheat_seeds} — which does not exist, so the
+     * registry handed back air — and failed with "no reachable minecraft:air"
+     * every time. Seeds come out of grass, flint out of gravel, raw iron out
+     * of iron ore.</p>
+     */
+    private static final java.util.Map<String, List<String>> DROP_SOURCES = java.util.Map.ofEntries(
+            java.util.Map.entry("minecraft:wheat_seeds",
+                    List.of("minecraft:short_grass", "minecraft:tall_grass", "minecraft:fern")),
+            java.util.Map.entry("minecraft:flint", List.of("minecraft:gravel")),
+            java.util.Map.entry("minecraft:apple",
+                    List.of("minecraft:oak_leaves", "minecraft:dark_oak_leaves")),
+            java.util.Map.entry("minecraft:raw_iron",
+                    List.of("minecraft:iron_ore", "minecraft:deepslate_iron_ore")),
+            java.util.Map.entry("minecraft:raw_copper",
+                    List.of("minecraft:copper_ore", "minecraft:deepslate_copper_ore")),
+            java.util.Map.entry("minecraft:raw_gold",
+                    List.of("minecraft:gold_ore", "minecraft:deepslate_gold_ore")),
+            java.util.Map.entry("minecraft:coal",
+                    List.of("minecraft:coal_ore", "minecraft:deepslate_coal_ore")),
+            java.util.Map.entry("minecraft:diamond",
+                    List.of("minecraft:diamond_ore", "minecraft:deepslate_diamond_ore")),
+            java.util.Map.entry("minecraft:redstone",
+                    List.of("minecraft:redstone_ore", "minecraft:deepslate_redstone_ore")),
+            java.util.Map.entry("minecraft:lapis_lazuli",
+                    List.of("minecraft:lapis_ore", "minecraft:deepslate_lapis_ore")),
+            java.util.Map.entry("minecraft:clay_ball", List.of("minecraft:clay")),
+            java.util.Map.entry("minecraft:string", List.of("minecraft:cobweb")),
+            java.util.Map.entry("minecraft:sweet_berries", List.of("minecraft:sweet_berry_bush")),
+            java.util.Map.entry("minecraft:glow_berries", List.of("minecraft:cave_vines")),
+            java.util.Map.entry("minecraft:snowball", List.of("minecraft:snow_block")));
 
     /**
      * Items that count towards "I have enough of this".
@@ -109,6 +157,13 @@ public final class ResourceFamily {
         // torch, however much charcoal it had burned.
         if (FUEL_ITEMS.contains(itemId)) {
             return new LinkedHashSet<>(FUEL_ITEMS);
+        }
+        // Any sapling grows a tree.
+        if (itemId.endsWith("_sapling")) {
+            Set<String> items = new LinkedHashSet<>();
+            items.add(itemId);
+            for (String species : WOOD_SPECIES) items.add("minecraft:" + species + "_sapling");
+            return items;
         }
         return Set.of(itemId);
     }

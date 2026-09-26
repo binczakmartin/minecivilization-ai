@@ -114,6 +114,16 @@ class ThreatAssessmentTest {
     }
 
     @Test
+    void aPeacefulEndermanIsNeitherFoughtNorFled() {
+        // Unarmed or hurt used to mean "run from anything hostile", endermen
+        // included — they are not hostile until provoked.
+        assertEquals(Response.IGNORE, CombatPolicy.assess(true, ThreatKind.NEUTRAL, sqr(4),
+                RADIUS, LEASH, false, 1.0f, false, false));
+        assertEquals(Response.IGNORE, CombatPolicy.assess(true, ThreatKind.NEUTRAL, sqr(4),
+                RADIUS, LEASH, false, 0.2f, false, true));
+    }
+
+    @Test
     void unwinnableThingsAreAvoidedAtRange() {
         assertEquals(Response.FLEE, assess(ThreatKind.DEADLY, 20));
         assertEquals(Response.IGNORE, assess(ThreatKind.DEADLY, 40));
